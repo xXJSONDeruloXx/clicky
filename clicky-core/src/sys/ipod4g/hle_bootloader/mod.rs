@@ -65,8 +65,14 @@ pub(super) fn run_hle_bootloader(
 
     // inject fake sysinfo_t into fastram.
     // TODO: look into how this pointer changes between iPod models
+    const SYSINFO_TAG: u32 = 0x4001_7f18;
     const SYSINFO_PTR: u32 = 0x4001_7f1c;
     const SYSINFO_LOC: u32 = 0x4000_ff18;
+    // Some firmware (including iPodLinux) checks both the fixed tag and
+    // the pointed-to sysinfo struct before trusting the hardware revision.
+    ipod.devices
+        .w32(SYSINFO_TAG, u32::from_le_bytes(*b"IsyS"))
+        .unwrap();
     ipod.devices.w32(SYSINFO_PTR, SYSINFO_LOC).unwrap(); // pointer to sysinfo
     ipod.devices.fastram.bulk_write(
         SYSINFO_LOC - 0x4000_0000,
