@@ -278,6 +278,12 @@ impl Pcf5060xImpl {
         let adcdat1;
         let adcdat2;
         match adcmux {
+            0b0000 => {
+                // Rockbox may poll ADC status before selecting a channel during
+                // early power-management init. Report a ready, zeroed sample.
+                adcdat1 = 0;
+                adcdat2 = 0;
+            }
             0b0001 => {
                 // BATVOLT, subtractor
                 adcdat1 = 0;
@@ -299,7 +305,10 @@ impl Pcf5060xImpl {
                 adcdat2 = 0;
             }
             _ => {
-                return Err(Unimplemented);
+                // Unknown channel selection. Keep Rockbox boot moving with a
+                // benign ready/zero sample until the ADC model is expanded.
+                adcdat1 = 0;
+                adcdat2 = 0;
             }
         }
 
