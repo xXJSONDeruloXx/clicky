@@ -87,6 +87,9 @@ enum IdeCmd {
     WriteDMA = 0xca,
     WriteDMANoRetry = 0xcb,
 
+    Recalibrate = 0x10,
+    ReadNativeMaxAddress = 0xf8,
+    SetMaxAddress = 0xf9,
     InitializeDriveParameters = 0x91,
 
     Sleep = 0x99,
@@ -255,7 +258,9 @@ impl IdeDrive {
 
             iobuf: IdeIoBuf::empty(),
             reg: IdeRegs {
-                status: *0u8.set_bit(reg::STATUS::DRDY, true),
+                status: *0u8
+                    .set_bit(reg::STATUS::DRDY, true)
+                    .set_bit(reg::STATUS::DSC, true),
                 ..IdeRegs::default()
             },
             cfg: IdeDriveConfig {
@@ -683,8 +688,48 @@ impl IdeDrive {
                 Ok(())
             }
 
+            Ok(Recalibrate) => {
+                (self.reg.status)
+                    .set_bit(reg::STATUS::BSY, false)
+                    .set_bit(reg::STATUS::DRDY, true)
+                    .set_bit(reg::STATUS::DSC, true)
+                    .set_bit(reg::STATUS::DRQ, false);
+                self.irq.assert();
+                Ok(())
+            }
+
+            Ok(ReadNativeMaxAddress) => {
+                let max_lba = ((self.blockdev.len() / 512).saturating_sub(1)).min(0x0fff_ffff);
+                self.reg.lba0_sector_no = max_lba as u8;
+                self.reg.lba1_cyl_lo = (max_lba >> 8) as u8;
+                self.reg.lba2_cyl_hi = (max_lba >> 16) as u8;
+                self.reg.lba3_dev_head =
+                    (self.reg.lba3_dev_head & !0x0f) | ((max_lba >> 24) as u8 & 0x0f);
+                (self.reg.status)
+                    .set_bit(reg::STATUS::BSY, false)
+                    .set_bit(reg::STATUS::DRDY, true)
+                    .set_bit(reg::STATUS::DSC, true)
+                    .set_bit(reg::STATUS::DRQ, false);
+                self.irq.assert();
+                Ok(())
+            }
+
+            Ok(SetMaxAddress) => {
+                (self.reg.status)
+                    .set_bit(reg::STATUS::BSY, false)
+                    .set_bit(reg::STATUS::DRDY, true)
+                    .set_bit(reg::STATUS::DSC, true)
+                    .set_bit(reg::STATUS::DRQ, false);
+                self.irq.assert();
+                Ok(())
+            }
+
             Ok(InitializeDriveParameters) => {
-                (self.reg.status).set_bit(reg::STATUS::BSY, false);
+                (self.reg.status)
+                    .set_bit(reg::STATUS::BSY, false)
+                    .set_bit(reg::STATUS::DRDY, true)
+                    .set_bit(reg::STATUS::DSC, true)
+                    .set_bit(reg::STATUS::DRQ, false);
                 self.irq.assert();
                 Ok(())
             }
