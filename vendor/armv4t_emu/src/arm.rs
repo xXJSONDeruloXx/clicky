@@ -498,17 +498,18 @@ impl Cpu {
                         self.reg[rn] = post_addr;
                     }
 
-                    for i in 0..16 {
+                    let mut transfer_idx = 0;
+                    for _ in 0..16 {
                         if rem == 0 {
                             break;
                         }
                         let r = rem.trailing_zeros() as Reg;
-                        let idx_addr = addr.wrapping_add((i + pre_incr) * 4);
+                        let idx_addr = addr.wrapping_add((transfer_idx + pre_incr) * 4);
                         if l == 0 {
                             // store
                             let val = if r == reg::PC {
                                 pc.wrapping_add(12)
-                            } else if r == rn && w == 1 && i == 0 {
+                            } else if r == rn && w == 1 && transfer_idx == 0 {
                                 orig_base
                             } else {
                                 self.reg[r]
@@ -523,14 +524,16 @@ impl Cpu {
                             }
                         };
                         rem -= 1u32 << r;
+                        transfer_idx += 1;
                     }
                 } else {
-                    for i in 0..16 {
+                    let mut transfer_idx = 0;
+                    for _ in 0..16 {
                         if rem == 0 {
                             break;
                         }
                         let r = rem.trailing_zeros() as Reg;
-                        let idx_addr = addr.wrapping_add((i + pre_incr) * 4);
+                        let idx_addr = addr.wrapping_add((transfer_idx + pre_incr) * 4);
                         if l == 0 {
                             // store
                             let val = self.reg.get(0, r);
@@ -541,6 +544,7 @@ impl Cpu {
                             self.reg.set(0, r, val);
                         };
                         rem -= 1u32 << r;
+                        transfer_idx += 1;
                     }
                 }
             }
