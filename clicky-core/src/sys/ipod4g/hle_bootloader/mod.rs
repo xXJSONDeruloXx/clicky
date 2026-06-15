@@ -4,7 +4,8 @@ use armv4t_emu::{reg, Mode as ArmMode};
 use std::io;
 use thiserror::Error;
 
-use crate::memory::Memory;
+use crate::devices::platform::pp::common::CpuId;
+use crate::memory::{armv4t_adaptor::MemoryAdapter, Memory};
 
 use super::Ipod4g;
 
@@ -59,6 +60,30 @@ pub(super) fn run_hle_bootloader(
     );
     ipod.cpu.reg_set(ArmMode::User, reg::CPSR, 0xd3); // supervisor mode
     ipod.cop = ipod.cpu;
+
+    // Let the COP execute the same early firmware/kernel entry as real hardware
+    // until it parks itself via COP_CTRL. This seeds the COP memory-controller
+    // mapping and leaves its PC at the post-wake path without racing the CPU
+    // through the rest of OS init.
+    for _ in 0..10_000 {
+        if !ipod.devices.cpucon.is_cpu_running(CpuId::Cop) {
+            break;
+        }
+
+        ipod.devices.cpuid.set_cpuid(CpuId::Cop);
+        ipod.devices.memcon.set_cpuid(CpuId::Cop);
+        ipod.devices.mailbox.set_cpuid(CpuId::Cop);
+
+        let mut mem = MemoryAdapter::new(&mut ipod.devices);
+        ipod.cop.step(&mut mem);
+        if let Some((access, e)) = mem.exception.take() {
+            warn!("COP HLE preflight memory exception: {:?}: {:?}", access, e);
+        }
+    }
+
+    ipod.devices.cpuid.set_cpuid(CpuId::Cpu);
+    ipod.devices.memcon.set_cpuid(CpuId::Cpu);
+    ipod.devices.mailbox.set_cpuid(CpuId::Cpu);
 
     // inject some HLE CPU state
     ipod.cpu.reg_set(ArmMode::Irq, reg::SP, 0x40017bfc);

@@ -260,21 +260,15 @@ impl Ipod4g {
             ]
             .iter_mut()
             {
-                if status.irq {
+                if status.irq && core.irq_enable() {
                     devices.cpucon.wake_on_interrupt(*cpuid);
                     core.exception(Exception::Interrupt);
-
-                    if core.irq_enable() {
-                        self.irq_pending.clear();
-                    }
+                    self.irq_pending.clear();
                 }
-                if status.fiq {
+                if status.fiq && core.fiq_enable() {
                     devices.cpucon.wake_on_interrupt(*cpuid);
                     core.exception(Exception::FastInterrupt);
-
-                    if core.fiq_enable() {
-                        self.irq_pending.clear();
-                    }
+                    self.irq_pending.clear();
                 }
             }
         }
