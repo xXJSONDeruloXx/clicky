@@ -271,6 +271,18 @@ impl IdeDrive {
         }
     }
 
+    fn pulse_irq(&mut self) {
+        info!(
+            target: "IDE",
+            "pulse_irq state={:?} remaining={} status={:#04x}",
+            self.state,
+            self.remaining_sectors,
+            self.reg.status,
+        );
+        self.irq.clear();
+        self.irq.assert();
+    }
+
     /// Handles LBA/CHS offset translation, returning the offset into the
     /// blockdev (in blocks, _not bytes_).
     ///
@@ -319,6 +331,13 @@ impl IdeDrive {
         if self.iobuf.is_done_transfer() {
             // check if there are no more sectors remaining
             self.remaining_sectors -= 1; // TODO: this varies under `ReadMultiple`
+            info!(
+                target: "IDE",
+                "read sector complete remaining={} state={:?} status={:#04x}",
+                self.remaining_sectors,
+                self.state,
+                self.reg.status,
+            );
             if self.remaining_sectors == 0 {
                 self.state = IdeDriveState::Idle;
                 (self.reg.status)
@@ -326,7 +345,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::DRQ, false)
                     .set_bit(reg::STATUS::BSY, false);
 
-                self.irq.assert();
+                self.pulse_irq();
                 self.dmarq.clear();
             } else {
                 // the next sector needs to be loaded
@@ -351,7 +370,7 @@ impl IdeDrive {
 
                     // DMA only fires a single IRQ at the end of the transfer
                     if !self.cfg.transfer_mode.is_dma() {
-                        self.irq.assert();
+                        self.pulse_irq();
                     }
 
                     Ok(())
@@ -403,7 +422,7 @@ impl IdeDrive {
 
                 // DMA only fires a single IRQ at the end of the transfer
                 if !self.cfg.transfer_mode.is_dma() {
-                    self.irq.assert();
+                    self.pulse_irq();
                 }
 
                 // check if there are no more sectors remaining
@@ -414,7 +433,7 @@ impl IdeDrive {
                         .set_bit(reg::STATUS::DRDY, true)
                         .set_bit(reg::STATUS::DRQ, false);
 
-                    self.irq.assert();
+                    self.pulse_irq();
                     self.dmarq.clear();
                 }
 
@@ -469,7 +488,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::BSY, false)
                     .set_bit(reg::STATUS::DRQ, true);
 
-                self.irq.assert();
+                self.pulse_irq();
 
                 Ok(())
             }
@@ -545,7 +564,7 @@ impl IdeDrive {
                         .set_bit(reg::STATUS::DRDY, true)
                         .set_bit(reg::STATUS::DRQ, true);
 
-                    // TODO: fire interrupt?
+                    self.pulse_irq();
 
                     Ok(())
                 })?;
@@ -626,7 +645,7 @@ impl IdeDrive {
                         .set_bit(reg::STATUS::DRDY, false)
                         .set_bit(reg::STATUS::DRQ, true);
 
-                    // TODO: fire interrupt?
+                    self.pulse_irq();
 
                     Ok(())
                 })?;
@@ -684,7 +703,7 @@ impl IdeDrive {
                 // just assert the irq and go on our merry way
                 (self.reg.status).set_bit(reg::STATUS::BSY, false);
 
-                self.irq.assert();
+                self.pulse_irq();
                 Ok(())
             }
 
@@ -694,7 +713,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::DRDY, true)
                     .set_bit(reg::STATUS::DSC, true)
                     .set_bit(reg::STATUS::DRQ, false);
-                self.irq.assert();
+                self.pulse_irq();
                 Ok(())
             }
 
@@ -710,7 +729,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::DRDY, true)
                     .set_bit(reg::STATUS::DSC, true)
                     .set_bit(reg::STATUS::DRQ, false);
-                self.irq.assert();
+                self.pulse_irq();
                 Ok(())
             }
 
@@ -720,7 +739,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::DRDY, true)
                     .set_bit(reg::STATUS::DSC, true)
                     .set_bit(reg::STATUS::DRQ, false);
-                self.irq.assert();
+                self.pulse_irq();
                 Ok(())
             }
 
@@ -730,7 +749,7 @@ impl IdeDrive {
                     .set_bit(reg::STATUS::DRDY, true)
                     .set_bit(reg::STATUS::DSC, true)
                     .set_bit(reg::STATUS::DRQ, false);
-                self.irq.assert();
+                self.pulse_irq();
                 Ok(())
             }
 
@@ -848,6 +867,15 @@ impl IdeController {
         };
 
         if let Some(ide) = ide.as_mut() {
+            info!(
+                target: "IDE",
+                "clear_irq({}) state={:?} remaining={} status={:#04x} asserted={}",
+                idx,
+                ide.state,
+                ide.remaining_sectors,
+                ide.reg.status,
+                ide.irq.is_asserting(),
+            );
             ide.irq.clear()
         }
     }
@@ -915,10 +943,30 @@ impl IdeController {
             CylinderHi | Lba2 => Ok(ide.reg.lba2_cyl_hi),
             DeviceHead | Lba3 => Ok(ide.reg.lba3_dev_head),
             Status | Command => {
+                info!(
+                    target: "IDE",
+                    "read {:?} ack IRQ state={:?} remaining={} status={:#04x} asserted={}",
+                    reg,
+                    ide.state,
+                    ide.remaining_sectors,
+                    ide.reg.status,
+                    ide.irq.is_asserting(),
+                );
                 ide.irq.clear(); // ack IRQ
                 Ok(ide.reg.status)
             }
-            AltStatus | DevControl => Ok(ide.reg.status),
+            AltStatus | DevControl => {
+                info!(
+                    target: "IDE",
+                    "read {:?} no-ack state={:?} remaining={} status={:#04x} asserted={}",
+                    reg,
+                    ide.state,
+                    ide.remaining_sectors,
+                    ide.reg.status,
+                    ide.irq.is_asserting(),
+                );
+                Ok(ide.reg.status)
+            }
             DataLatch => Err(Unimplemented),
         }
     }
@@ -946,8 +994,12 @@ impl IdeController {
             CylinderLo | Lba1 => Ok(ide.reg.lba1_cyl_lo = val),
             CylinderHi | Lba2 => Ok(ide.reg.lba2_cyl_hi = val),
             DeviceHead | Lba3 => unreachable!("should be handled above"),
-            Command | Status => ide.exec_cmd(val),
+            Command | Status => {
+                info!(target: "IDE", "write {:?}={:#04x} selected={} state={:?} remaining={} status={:#04x}", reg, val, self.selected_device, ide.state, ide.remaining_sectors, ide.reg.status);
+                ide.exec_cmd(val)
+            }
             DevControl | AltStatus => {
+                info!(target: "IDE", "write {:?}={:#04x} selected={} state={:?} remaining={} status={:#04x}", reg, val, self.selected_device, ide.state, ide.remaining_sectors, ide.reg.status);
                 ide.reg.srst = val.get_bit(2);
                 ide.reg.nein = val.get_bit(1);
                 Ok(())

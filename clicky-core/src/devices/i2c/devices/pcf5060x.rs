@@ -278,20 +278,9 @@ impl Pcf5060xImpl {
         let adcdat1;
         let adcdat2;
         match adcmux {
-            0b0000 => {
-                // Rockbox may poll ADC status before selecting a channel during
-                // early power-management init. Report a ready, zeroed sample.
-                adcdat1 = 0;
-                adcdat2 = 0;
-            }
-            0b0001 => {
-                // BATVOLT, subtractor
-                adcdat1 = 0;
-                adcdat2 = 0;
-            }
-            0b0011 => {
-                // ADCIN1, subtractor
-                adcdat1 = 0;
+            0b0000 | 0b0001 | 0b0010 | 0b0011 => {
+                // Battery and ADCIN1 paths; report about 4.0V.
+                adcdat1 = 682;
                 adcdat2 = 0;
             }
             0b0101 => {
@@ -305,8 +294,6 @@ impl Pcf5060xImpl {
                 adcdat2 = 0;
             }
             _ => {
-                // Unknown channel selection. Keep Rockbox boot moving with a
-                // benign ready/zero sample until the ADC model is expanded.
                 adcdat1 = 0;
                 adcdat2 = 0;
             }
@@ -315,7 +302,7 @@ impl Pcf5060xImpl {
         use Reg::*;
         match reg {
             ADCS1__ => Err(StubRead(Info, adcdat1 >> 2 & 0xFF)),
-            ADCS2__ => Err(StubRead(Info, adcrdy | (adcdat1 << 8) & 0x3)),
+            ADCS2__ => Err(StubRead(Info, adcrdy | (adcdat1 & 0x3))),
             ADCS3__ => Err(StubRead(Info, adcdat2 >> 2 & 0xFF)),
             _ => Err(Unimplemented),
         }

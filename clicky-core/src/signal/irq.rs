@@ -41,7 +41,7 @@ impl Pending {
     /// `check_pending`.
     #[inline]
     pub fn clear(&self) -> bool {
-        self.trigger.check()
+        self.trigger.check_and_clear()
     }
 }
 

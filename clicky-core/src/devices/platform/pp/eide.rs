@@ -168,7 +168,7 @@ impl Memory for EIDECon {
             0x01c => Ok(self.ide1_cfg.secondary_timing[1] = val),
             0x028 => {
                 self.ide0_cfg._config = val;
-                if !val.get_bit(4) {
+                if val.get_bit(3) || val.get_bit(4) {
                     self.ide.clear_irq(IdeIdx::IDE0)
                 }
                 Err(StubWrite(Debug, ()))

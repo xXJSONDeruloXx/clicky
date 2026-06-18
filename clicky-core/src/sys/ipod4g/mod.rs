@@ -250,26 +250,26 @@ impl Ipod4g {
         }
 
         if self.irq_pending.check() {
-            use armv4t_emu::Exception;
+            self.irq_pending.clear();
+        }
 
-            let (cpu_status, cop_status) = devices.intcon.interrupt_status();
+        use armv4t_emu::Exception;
 
-            for (core, cpuid, status) in [
-                (&mut self.cpu, CpuId::Cpu, cpu_status),
-                (&mut self.cop, CpuId::Cop, cop_status),
-            ]
-            .iter_mut()
-            {
-                if status.irq && core.irq_enable() {
-                    devices.cpucon.wake_on_interrupt(*cpuid);
-                    core.exception(Exception::Interrupt);
-                    self.irq_pending.clear();
-                }
-                if status.fiq && core.fiq_enable() {
-                    devices.cpucon.wake_on_interrupt(*cpuid);
-                    core.exception(Exception::FastInterrupt);
-                    self.irq_pending.clear();
-                }
+        let (cpu_status, cop_status) = devices.intcon.interrupt_status();
+
+        for (core, cpuid, status) in [
+            (&mut self.cpu, CpuId::Cpu, cpu_status),
+            (&mut self.cop, CpuId::Cop, cop_status),
+        ]
+        .iter_mut()
+        {
+            if status.irq && core.irq_enable() {
+                devices.cpucon.wake_on_interrupt(*cpuid);
+                core.exception(Exception::Interrupt);
+            }
+            if status.fiq && core.fiq_enable() {
+                devices.cpucon.wake_on_interrupt(*cpuid);
+                core.exception(Exception::FastInterrupt);
             }
         }
 
