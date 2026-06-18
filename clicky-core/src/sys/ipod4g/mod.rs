@@ -67,6 +67,36 @@ pub struct Ipod4g {
     i2c_changed: signal::Trigger,
 
     executor: Executor,
+
+    // Optional hang-watchdog used for bring-up diagnostics. Inert unless the
+    // `CLICKY_WATCHDOG_MS` env var is set at construction time.
+    watchdog: Option<Watchdog>,
+}
+
+/// Bring-up diagnostic watchdog. If the guest spends more than `threshold_ms`
+/// of wall-clock time inside `step()` without any progress observable by the
+/// caller (e.g. new IRQ, DMA, or MMIO), the watchdog logs the PC and register
+/// state of both cores. It only ever logs once per stall, then resets.
+#[derive(Debug)]
+struct Watchdog {
+    threshold: std::time::Duration,
+    last_progress: std::time::Instant,
+    last_cpu_pc: u32,
+    last_cop_pc: u32,
+    fired: bool,
+}
+
+impl Watchdog {
+    fn from_env() -> Option<Watchdog> {
+        let ms: u64 = std::env::var("CLICKY_WATCHDOG_MS").ok()?.parse().ok()?;
+        Some(Watchdog {
+            threshold: std::time::Duration::from_millis(ms),
+            last_progress: std::time::Instant::now(),
+            last_cpu_pc: 0,
+            last_cop_pc: 0,
+            fired: false,
+        })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -110,6 +140,8 @@ impl Ipod4g {
             i2c_changed: i2c_changed.clone(),
 
             executor,
+
+            watchdog: Watchdog::from_env(),
         };
 
         // connect HDD
@@ -155,6 +187,46 @@ impl Ipod4g {
         Ok(sys)
     }
 
+    /// Hang-watchdog probe. Called every `step()`. When enabled via the
+    /// `CLICKY_WATCHDOG_MS` env var, it records the guest PCs and, if the same
+    /// PC pair persists past the configured threshold, logs a one-shot
+    /// diagnostic with both cores' register state. Inert otherwise.
+    fn watchdog_observe(&mut self) {
+        let Some(w) = self.watchdog.as_mut() else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        let cpu_pc = self.cpu.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::PC);
+        let cop_pc = self.cop.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::PC);
+
+        if cpu_pc != w.last_cpu_pc || cop_pc != w.last_cop_pc {
+            w.last_cpu_pc = cpu_pc;
+            w.last_cop_pc = cop_pc;
+            w.last_progress = now;
+            w.fired = false;
+            return;
+        }
+
+        if !w.fired && now.duration_since(w.last_progress) >= w.threshold {
+            w.fired = true;
+            let dump_regs = |name: &str, cpu: &Cpu| -> String {
+                let mode = armv4t_emu::Mode::User;
+                let r: Vec<u32> = (0..16u8)
+                    .map(|i| cpu.reg_get(mode, i))
+                    .collect();
+                let cpsr = cpu.reg_get(mode, armv4t_emu::reg::CPSR);
+                format!(
+                    "{} pc={:#010x} sp={:#010x} lr={:#010x} cpsr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                    name, r[15], r[13], r[14], cpsr, r[0], r[1], r[2], r[3]
+                )
+            };
+            error!("WATCHDOG: guest appears hung. {}", dump_regs("CPU", &self.cpu));
+            error!("WATCHDOG: {}", dump_regs("COP", &self.cop));
+            w.last_progress = now;
+        }
+    }
+
     /// Run the system for a single CPU instruction, returning `true` if the
     /// system is still running, or `false` upon reaching some sort of "graceful
     /// exit" condition (e.g: power-off).
@@ -168,6 +240,8 @@ impl Ipod4g {
         }
 
         // TODO: if neither CPU is running, efficiently block until the next IRQ
+
+        self.watchdog_observe();
 
         let devices = &mut self.devices;
         for (cpu, cpuid) in [(&mut self.cpu, CpuId::Cpu), (&mut self.cop, CpuId::Cop)].iter_mut() {
