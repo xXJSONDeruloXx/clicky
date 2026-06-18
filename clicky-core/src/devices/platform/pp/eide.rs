@@ -20,6 +20,9 @@ struct IdeDriveCfg {
 pub struct EIDECon {
     ide0_cfg: IdeDriveCfg,
     ide1_cfg: IdeDriveCfg,
+    ide_irq: irq::Sender,
+    ide_irq_latched: bool,
+    ide_irq_was_asserted: bool,
     ide: IdeController,
 
     // NOTE: since no pp devices ever used two IDE devices at once, I have no idea if the DMA is
@@ -38,11 +41,16 @@ pub struct EIDECon {
 pub struct DmaErr;
 
 impl EIDECon {
-    pub fn new(irq: irq::Sender, dmarq: irq::Sender) -> EIDECon {
+    pub fn new(mut ide_irq: irq::Sender, dmarq: irq::Sender) -> EIDECon {
+        ide_irq.clear();
+        let (ata_irq_tx, _ata_irq_rx) = irq::new(irq::Pending::new(), "IDE ATA");
         EIDECon {
             ide0_cfg: Default::default(),
             ide1_cfg: Default::default(),
-            ide: IdeController::new(irq, dmarq),
+            ide_irq,
+            ide_irq_latched: false,
+            ide_irq_was_asserted: false,
+            ide: IdeController::new(ata_irq_tx, dmarq),
 
             dma_control: 0,
             dma_length: 0,
@@ -53,6 +61,20 @@ impl EIDECon {
 
     pub fn as_ide(&mut self) -> &mut IdeController {
         &mut self.ide
+    }
+
+    pub fn update_irq_latch(&mut self) {
+        let asserted = self.ide.irq_state(IdeIdx::IDE0);
+        if asserted && !self.ide_irq_was_asserted {
+            self.ide_irq_latched = true;
+        }
+        self.ide_irq_was_asserted = asserted;
+
+        if self.ide_irq_latched {
+            self.ide_irq.assert();
+        } else {
+            self.ide_irq.clear();
+        }
     }
 
     pub fn do_dma(&mut self) -> Result<(crate::memory::MemAccessKind, u32), DmaErr> {
@@ -130,8 +152,8 @@ impl Memory for EIDECon {
                 let val = *self.ide0_cfg._config
                     // rockbox seems to use bit 3 to check for IDE0 irq when
                     // waiting for a DMA transfer to finish
-                    .set_bit(3, self.ide.irq_state(IdeIdx::IDE0))
-                    .set_bit(4, self.ide.irq_state(IdeIdx::IDE0));
+                    .set_bit(3, self.ide_irq_latched)
+                    .set_bit(4, self.ide_irq_latched);
                 Err(StubRead(Debug, val))
             }
             0x02c => Err(Unimplemented),
@@ -169,7 +191,11 @@ impl Memory for EIDECon {
             0x028 => {
                 self.ide0_cfg._config = val;
                 if val.get_bit(3) || val.get_bit(4) {
-                    self.ide.clear_irq(IdeIdx::IDE0)
+                    // Ack the PP EIDE interrupt latch, not the ATA device's
+                    // INTRQ line. ATA INTRQ remains asserted until the guest
+                    // reads task-file Status, matching real IDE semantics.
+                    self.ide_irq_latched = false;
+                    self.ide_irq.clear();
                 }
                 Err(StubWrite(Debug, ()))
             }

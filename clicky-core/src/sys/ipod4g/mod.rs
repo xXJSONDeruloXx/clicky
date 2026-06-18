@@ -253,6 +253,8 @@ impl Ipod4g {
             self.irq_pending.clear();
         }
 
+        devices.eidecon.update_irq_latch();
+
         use armv4t_emu::Exception;
 
         let (cpu_status, cop_status) = devices.intcon.interrupt_status();

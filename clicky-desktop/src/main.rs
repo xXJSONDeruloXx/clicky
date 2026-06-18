@@ -45,6 +45,10 @@ struct Args {
     #[structopt(long)]
     hdd: BlockCfg,
 
+    /// Automatically select ZeroSlackr from the iPodLoader menu.
+    #[structopt(long)]
+    autorun_zeroslackr: bool,
+
     /// Spawn a GDB server at system startup.
     ///
     /// Format: `-g <port/path>[,on-fatal-err[,and-on-start]]`
@@ -99,6 +103,7 @@ fn main() -> DynResult<()> {
         .init();
 
     let args = Args::from_args();
+    let autorun_zeroslackr = args.autorun_zeroslackr;
 
     let hdd: Box<dyn BlockDev> = match args.hdd {
         BlockCfg::Null { len } => Box::new(block::backend::Null::new(len)),
@@ -231,6 +236,7 @@ fn main() -> DynResult<()> {
                 update_fb,
                 controls,
                 kill_ui_rx,
+                autorun_zeroslackr,
             );
         } else {
             info!("No GUI selected, running in headless mode!");
