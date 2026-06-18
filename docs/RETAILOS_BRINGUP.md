@@ -1,6 +1,7 @@
 # RetailOS bring-up notes
 
 This is a scratch journal for the Apple RetailOS path in `clicky`.
+See also: `docs/DISCORD_RESEARCH.md` for the broader Discord + linked-resource notes.
 
 ## Input firmware
 
