@@ -6,7 +6,7 @@ AS	=$(CROSS)as
 CC	=$(CROSS)gcc
 OBJDUMP =$(CROSS)objdump
 CFLAGS	=-Wall -O0 -ffreestanding -fomit-frame-pointer -march=armv4t -g
-LDFLAGS =-Wl,-Tarm_elf_40.x -nostartfiles
+LDFLAGS =-Wl,-Tarm_elf_40.x -nostdlib -nostartfiles
 OBJCOPY	=$(CROSS)objcopy 
 HOSTCC	=gcc
 HOSTCFLAGS =-Wall -O2
@@ -19,7 +19,7 @@ default: make_fw loader.bin
 %.o: %.S %.c
 
 loader: startup.o loader.o tools.o tux.o happymac.o
-	$(CC) $(LDFLAGS) -o $@ startup.o loader.o tools.o tux.o happymac.o
+	$(CC) $(LDFLAGS) -o $@ startup.o loader.o tools.o tux.o happymac.o -lgcc
 
 loader.objdump: loader
 	$(OBJDUMP) -ld --prefix-addresses loader > loader.objdump
