@@ -108,6 +108,7 @@ Since these projects are open source, is should be possible to trace through the
     -   **Goals:**
         -   Boot _another_ actual OS on the iPod
         -   Fill in the gaps between the hardware Rockbox uses, and the hardware iPod Linux uses
+    -   [x] Validate the iPodLinux bootloader path (ipodloader + ipodloader2 smoke tests)
 
 Stage 3 will involve running closed-source Apple software, notably, the original iPod RetailOS:
 
@@ -121,6 +122,7 @@ Stage 3 will involve running closed-source Apple software, notably, the original
     -   i.e: _the big money goal_
     -   Hopefully, by getting two other OSs up and running, RetailOS will "just work"
     -   Realistically, those Apple engineers probably did some fancy/janky stuff, and things will be very broken
+    -   Research notes: [docs/RETAILOS_BRINGUP.md](docs/RETAILOS_BRINGUP.md)
     -   **Goals:**
         -   Get an actual working emulated iPod up and running!
         -   Play some authentic Brick Breaker!
