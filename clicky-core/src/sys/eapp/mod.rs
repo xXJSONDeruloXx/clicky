@@ -130,6 +130,9 @@ pub struct Eapp {
     dumped_requests: HashSet<u32>,
     /// Per-(module, ordinal) call counters, to find render-critical imports.
     import_call_counts: HashMap<(String, u32), u64>,
+    /// Optional inclusive frame window in which to log every OpenGLES call
+    /// with full args + return address, for reverse-engineering the GL stream.
+    gl_trace_frames: Option<(u64, u64)>,
     halted: bool,
 }
 
@@ -260,6 +263,7 @@ impl Eapp {
             staged_files: HashMap::new(),
             dumped_requests: HashSet::new(),
             import_call_counts: HashMap::new(),
+            gl_trace_frames: None,
             halted: false,
         })
     }
@@ -308,6 +312,76 @@ impl Eapp {
             rendered.push_str(&format!("\n    {}:{} = {}", module, ordinal, count));
         }
         info!(target: "EAPP", "top {} imports by call count:{}", limit, rendered);
+    }
+
+    /// Set an inclusive frame window in which to log every OpenGLES call with
+    /// full args + return address. Used for Option A diagnostics.
+    pub fn set_gl_trace_window(&mut self, start: u64, end: u64) {
+        self.gl_trace_frames = Some((start, end));
+    }
+
+    /// Scan guest work RAM for large contiguous non-zero regions and report
+    /// any whose size is plausible for a framebuffer (e.g. 320*240*2 = 153600
+    /// bytes for RGB565, or *4 = 307200 for RGBA8888). Also samples the first
+    /// nonzero word of each large region so we can recognise texture data.
+    pub fn scan_for_framebuffer(&self) {
+        const BLOCK: usize = 256;
+        let size = WORK_RAM_SIZE;
+        let mut buf = vec![0u8; size];
+        self.bus.work_ram.bulk_read(0, &mut buf);
+
+        let is_nonzero = |win: &[u8]| win.iter().any(|&b| b != 0);
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < size {
+            // find next nonzero 256B block
+            if !is_nonzero(&buf[i..i + BLOCK]) {
+                i += BLOCK;
+                continue;
+            }
+            let start = i;
+            while i < size && is_nonzero(&buf[i..i + BLOCK]) {
+                i += BLOCK;
+            }
+            regions.push((start, i - start));
+        }
+
+        // Only report regions >= ~1KB; sort by size desc.
+        regions.retain(|&(_, len)| len >= 1024);
+        regions.sort_by(|a, b| b.1.cmp(&a.1));
+
+        info!(
+            target: "EAPP",
+            "work-ram nonzero regions (>=1KB): {} found; top 12 by size:",
+            regions.len()
+        );
+        for &(off, len) in regions.iter().take(12) {
+            let addr = WORK_RAM_BASE + off as u32;
+            // sample first 4 nonzero words
+            let mut sample = String::new();
+            let mut taken = 0;
+            let mut j = off;
+            while j + 4 <= off + len && taken < 4 {
+                let w = u32::from_le_bytes([buf[j], buf[j + 1], buf[j + 2], buf[j + 3]]);
+                if w != 0 {
+                    sample.push_str(&format!(" {:#010x}", w));
+                    taken += 1;
+                }
+                j += 4;
+            }
+            // framebuffer-size hint
+            let fb_hint = match len {
+                153600 => " == 320*240*2 (RGB565)",
+                307200 => " == 320*240*4 (RGBA8888)",
+                76800 => " == 320*240*1 (A8)",
+                _ => "",
+            };
+            info!(
+                target: "EAPP",
+                "  {:#010x} len={}{} sample:{}",
+                addr, len, fb_hint, sample
+            );
+        }
     }
 
     pub fn step(&mut self) -> FatalMemResult<()> {
@@ -365,6 +439,25 @@ impl Eapp {
 
         let key = (import.module.clone(), import.ordinal);
         *self.import_call_counts.entry(key.clone()).or_insert(0u64) += 1;
+
+        let in_gl_trace = self
+            .gl_trace_frames
+            .map(|(s, e)| self.frame_counter >= s && self.frame_counter <= e)
+            .unwrap_or(false);
+        if in_gl_trace && import.module == "OpenGLES" {
+            info!(
+                target: "EAPP_GL",
+                "frame {} GL:{} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                self.frame_counter,
+                import.ordinal,
+                lr,
+                args[0],
+                args[1],
+                args[2],
+                args[3]
+            );
+        }
+
         if self.logged_imports.insert(key.clone()) {
             info!(
                 target: "EAPP_IMPORT",
@@ -409,9 +502,49 @@ impl Eapp {
         Ok(())
     }
 
-    fn handle_open_gl_import(&mut self, _ordinal: u32, _args: [u32; 4]) -> u32 {
+    fn handle_open_gl_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        // Decode likely present/swap surface handles for diagnostic purposes.
+        // Observed once-per-frame ordinals: 157, 158, 165. The handle in r0
+        // (e.g. 0x0003f001) is logged with any guest memory it might point at.
+        if matches!(ordinal, 157 | 158 | 165) {
+            let handle = args[0];
+            info!(
+                target: "EAPP_GL",
+                "GL:{} surface handle r0={:#010x} (r1={:#010x} r2={:#010x} r3={:#010x})",
+                ordinal, handle, args[1], args[2], args[3]
+            );
+            self.decode_surface_handle(ordinal, handle);
+        }
         self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
         0
+    }
+
+    /// Best-effort decode of a GL surface/swap handle. We do not yet know the
+    /// exact encoding, so we try several interpretations and log each result.
+    fn decode_surface_handle(&mut self, ordinal: u32, handle: u32) {
+        // Interpretation 1: direct guest pointer into work RAM.
+        if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle) {
+            info!(
+                target: "EAPP_GL",
+                "GL:{} handle {:#010x} is a work-ram pointer; first 8 words:",
+                ordinal, handle
+            );
+            for off in (0..32).step_by(4) {
+                let v = self
+                    .read_guest_u32(handle.wrapping_add(off))
+                    .unwrap_or(0xdeadbeef);
+                info!(target: "EAPP_GL", "  +{:#04x}: {:#010x}", off, v);
+            }
+        }
+        // Interpretation 2: small-integer name indexing a GL object table.
+        // The high bits of 0x0003f001 may encode type; low bits an index.
+        let idx = handle & 0xffff;
+        let tag = handle >> 16;
+        info!(
+            target: "EAPP_GL",
+            "GL:{} handle {:#010x} as name: tag={:#06x} idx={}",
+            ordinal, handle, tag, idx
+        );
     }
 
     fn handle_misc_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {

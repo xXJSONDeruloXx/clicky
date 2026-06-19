@@ -124,6 +124,7 @@ fn main() -> DynResult<()> {
         .filter(None, log::LevelFilter::Error)
         .filter(Some("clicky"), log::LevelFilter::Trace)
         .filter(Some("EAPP_IMPORT"), log::LevelFilter::Info)
+        .filter(Some("EAPP_GL"), log::LevelFilter::Info)
         .filter(Some("EAPP"), log::LevelFilter::Info)
         .filter(Some("armv4t_emu"), log::LevelFilter::Warn)
         .parse_filters(&std::env::var("RUST_LOG").unwrap_or_default())
@@ -131,6 +132,14 @@ fn main() -> DynResult<()> {
 
     let args = Args::from_args();
     let mut system = Eapp::from_bundle_dir(&args.bundle_dir)?;
+    if let Ok(spec) = std::env::var("EAPP_GL_TRACE") {
+        if let Some((s, e)) = spec.split_once('-') {
+            if let (Ok(start), Ok(end)) = (s.parse(), e.parse()) {
+                system.set_gl_trace_window(start, end);
+                info!(target: "EAPP", "GL trace window enabled for frames {}..={}", start, end);
+            }
+        }
+    }
     let title = format!("{} [eapp]", system.title());
 
     if args.headless {
@@ -139,6 +148,9 @@ fn main() -> DynResult<()> {
             None => system.run(),
         };
         system.log_top_imports(25);
+        if std::env::var("EAPP_RAMSCAN").is_ok() {
+            system.scan_for_framebuffer();
+        }
         if let Err(err) = result {
             return Err(format!("fatal eapp error: {:#010x?}", err).into());
         }

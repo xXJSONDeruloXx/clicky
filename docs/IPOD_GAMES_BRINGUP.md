@@ -308,31 +308,139 @@ In order:
 1. ~~Make `AsyncFileIO:3` actually load file bytes into a guest buffer the
    resource layer points at~~ **Done.** The guest's own resource parsers now
    receive real file bytes.
-2. Implement the handful of `OpenGLES` ordinals needed to blit a texture:
-   texture upload, texcoord/vertex setup, draw, and a real framebuffer the game
-   writes into instead of our green fill. (This is now the active blocker.)
+2. ~~Implement the handful of `OpenGLES` ordinals needed to blit a texture~~
+   **Option A diagnostic completed; Option B now scoped.** See below.
 
-   Per-call frequency (5,000,000-cycle headless run, ~561 frames) narrows this
-   down considerably. The render-critical ordinals are:
-   - once-per-frame (~560 calls, matches `InputEvents:0`):
-     - `OpenGLES:157`, `OpenGLES:158`, `OpenGLES:165` — frame begin / present / swap.
-       `OpenGLES:158` is the most likely present/swap (carries a surface handle
-       like `0x0003f001` in `r0`).
-   - per-quad draw cluster (~2238 calls each, ≈ 4× frames):
-     - `OpenGLES:125`, `OpenGLES:37`, `OpenGLES:159`, `OpenGLES:175`
-   - very high frequency (likely state setters / clears):
-     - `OpenGLES:40` (5302), `OpenGLES:137` (5035), `OpenGLES:169` (4474),
-       `OpenGLES:36` (2797)
+---
 
-   Plausible shortcut worth investigating before committing to a full software
-   GL ES renderer: if `OpenGLES:158` is present and the surface handle resolves
-   to a known guest framebuffer address, we may be able to blit that surface
-   directly to the host window instead of emulating the full fixed-function
-   pipeline.
+## Option A diagnostic findings
 
-Step 1 unblocks step 2.
+### A.1 Surface-blit shortcut: not viable
 
-This is the current meaningful checkpoint for the direct-runtime path.
+- Work-RAM scan after 5M cycles: **no region matching 320×240×2 (153600 B
+  RGB565) or ×4 (307200 B RGBA8888)** exists. Largest region = 102 KB.
+- The "surface handle" `0x0003f001` in `OpenGLES:158 r0` is a **constant
+  token** built as `1 + 0x3F000` in guest code — a capability bitmask, not an
+  address.
+- The frame loop writes no pixels into guest RAM because GL is stubbed. Nothing
+  to blit.
+
+### A.2 OpenGLES is standard GL ES 1.1
+
+The API uses Apple’s own ordinal numbering but the format constants are
+standard:
+
+```
+GL_ALPHA      = 0x1906  (_a8   assets: font bitmaps, UI alpha masks)
+GL_RGB        = 0x1907  (_565  assets: full-screen backgrounds)
+GL_RGBA       = 0x1908  (_5551 / _4444 assets: sprites, logos)
+GL_TEXTURE_2D = 0x0DE1
+GL_FIXED      = 0x140C  (vertex element type: 16.16 fixed-point)
+GL_QUADS      = 0x0007  (draw primitive confirmed from disassembly)
+```
+
+### A.3 Confirmed ordinal → GL function mapping
+
+| Ordinal   | Function                 | Key args / evidence |
+|-----------|--------------------------|---------------------|
+| `GL:4`    | glTexParameteri / bind   | r0=GL_TEXTURE_2D; called once/texture before upload |
+| `GL:12`   | glClear (init only)      | r0=0x4000=GL_COLOR_BUFFER_BIT |
+| `GL:13`   | glClearColor (init only) | r0,r1,r2,r3 = 0,0,0,1.0 (black) |
+| `GL:37`   | **glDrawArrays** ✓       | disasm confirmed: mode=GL_QUADS(7), first=0, count=4 |
+| `GL:40`   | enableClientArray        | r0=array_index |
+| `GL:45`   | createTexture / initObj  | r0=tex_name, r1=descriptor_ptr, r2=width, r3=height; once/texture |
+| `GL:99`   | **glTexImage2D** ✓       | r0=GL_TEXTURE_2D, r1=level=0, r2=GL_RGB/RGBA/ALPHA, r3=width; once/texture |
+| `GL:125`  | prepareDraw              | r0=0, r1=1, r2=0, r3=state_ptr |
+| `GL:137`  | setVertexArrayFormat     | r0=array_idx, r1=components, r2=GL_FIXED, r3=stride, stack:ptr |
+| `GL:157`  | **submitFrame**          | r0=0, r1=0, r2=5, r3=ptr; LAST call in aux |
+| `GL:158`  | **presentFrame / swap**  | r0=0x3f001 (token), r2=work_ram_ptr; FIRST call in aux |
+| `GL:159`  | bindTexture + vtxSetup   | r0=GL_tex_name (small int), r1=vtx_buf_ptr, r2=float |
+| `GL:165`  | beginFrame / bindContext | r0=ctx, r1=ptr, r2=vtx_buf_ptr; once/frame after present |
+| `GL:169`  | setPosition / translate  | r0=ctx, r1=x_float, r2=y_float, r3=0; screen-space coords |
+| `GL:175`  | bindDrawState            | r0,r1,r2=static state ptrs |
+| `GL:36`   | postDraw cleanup         | r0=1 or 2 |
+
+### A.4 Texture dimensions from upload calls
+
+GL:99 (glTexImage2D) called once per asset during loading phase (frame 2):
+
+```
+320 × 240  GL_RGB    screenBG_565.pix   (full-screen background)
+ 50 ×  50  GL_RGBA   eaLogo / small sprite
+250 × 162  GL_RGBA   tetrisLogoT and similar
+784 ×  20  GL_ALPHA  font-strip atlas ×3 variants (wide, thin, 1-bpp)
+```
+
+The `.pix` header is approximately 72 bytes before the raw pixel data
+(153672 − 320×240×2 = 72 for the screenBG). The guest parses this header
+itself after receiving bytes via `AsyncFileIO:3`.
+
+### A.5 Per-frame GL call sequence (steady-state, ~4 quads/frame)
+
+Double-buffered render loop confirmed from frame-40 GL trace:
+
+```
+aux(frame N):
+  GL:158  — presentFrame(token=0x3f001, 1, vtx_buf_ptr)
+             display frame N-1; FIRST call in aux
+  GL:165  — beginFrame(ctx, ptr, vtx_buf_ptr)
+
+  [repeated ×4 per frame:]
+    GL:169  — setPosition(ctx, x, y, 0)    [x/y = screen-space float coords]
+    GL:159  — bindTexture(tex_id, vtx_buf, size)
+    GL:137  — setArrayFmt(0, 4, GL_FIXED, stride, ptr)  [position: XYZW]
+    GL:40   — enableArray(0)
+    GL:137  — setArrayFmt(1, 2, GL_FIXED, stride, ptr)  [texcoord: ST]
+    GL:40   — enableArray(1)
+    GL:175  — bindDrawState(state_ptr, vtx_arr_ptr, ctx_ptr)
+    GL:125  — prepareDraw(0, 1, 0, state_ptr)
+    GL:37   — glDrawArrays(GL_QUADS=7, first=0, count=4)   ← DRAW
+    GL:36   — postDraw(1 or 2)
+
+  GL:157  — submitFrame(0, 0, 5, ptr)
+             commit frame N for presentation; LAST call in aux
+```
+
+### A.6 Key facts for Option B
+
+- Vertex format: **GL_FIXED (16.16 fixed-point)**, not floats.
+  4-component position (XYZW), 2-component texcoord (ST).
+- Texture names are small integers (3, 14, 19, 27, ...) allocated sequentially.
+- All texture pixel data is already in guest work RAM (delivered by
+  `AsyncFileIO:3` to `[req+0x14]` buffers). The guest parsed .pix headers and
+  the raw pixel data is at a known offset within those buffers.
+- `GL:175`, `GL:125`, `GL:36` can be no-op stubs initially.
+- `GL:12`, `GL:13` (clear/clearcolor) are init-only (2 calls total);
+  can fill host framebuffer black on beginFrame instead.
+
+---
+
+## Option B: minimum viable GL ES subset (now the active milestone)
+
+Not "implement all of GL ES 1.1" — implement exactly these ordinals:
+
+**Priority 1** — required for any pixels:
+
+1. `GL:45 + GL:4 + GL:99` — texture upload. Build a host-side texture cache
+   keyed by GL name. Formats: GL_RGB/GL_RGBA/GL_ALPHA; dimensions from GL:99.
+2. `GL:169` — setPosition(x, y). Track current sprite position.
+3. `GL:159` — bindTexture + setVertexBuffer. Route to texture cache entry.
+4. `GL:37`  — drawArrays. Rasterize: sample texture using GL_FIXED texcoords,
+   write pixels to a 320×240 host framebuffer.
+5. `GL:158` — presentFrame. Blit host framebuffer to minifb window.
+
+**Priority 2** — correct quad geometry:
+
+6. `GL:137 + GL:40` — vertex/texcoord array format + pointer. Decode GL_FIXED
+   arrays: 4-component XYZW position, 2-component ST texcoord.
+7. `GL:157` — submitFrame. Mark frame ready for next present.
+8. `GL:165` — beginFrame. Clear host framebuffer.
+
+**Priority 3** — correctness polish (not needed for first pixels):
+
+- `GL:175`, `GL:125`, `GL:36` — stub as no-op
+- Correct alpha-blending for `_a8` / `_4444` / `_5551` textures
+- Save-data read/write (empty = new game, playable without it)
 
 ### Milestone 2: minimal runtime services
 
@@ -361,12 +469,23 @@ Success bar:
 ## Open questions
 
 - what exactly is the `eapp` header contract beyond the obvious first words?
-- how are imports resolved at runtime?
-- is `OpenGLES` a literal GL-style API, a command buffer, or just Apple naming?
+  *(partially answered: entry/init/aux confirmed; words 6-7 at offsets 0x1c/0x20
+  are still zero across all titles, unknown purpose)*
+- how are imports resolved at runtime? *(answered: patched literal tables; stubs
+  at `stubs_addr` do `ldr pc, [lit]`; we patch the lit to our trampolines)*
+- ~~is `OpenGLES` a literal GL-style API, a command buffer, or just Apple naming?~~
+  **Answered:** it is standard GL ES 1.1 with Apple's proprietary ordinal
+  numbering. Standard format constants (GL_RGBA=0x1908, GL_FIXED=0x140C etc.)
+  are confirmed.
 - how much of the `*.sinf` / DRM story is already bypassed by the supplied
-  firmware and bundles?
+  firmware and bundles? *(still unknown; games run without DRM checks so far)*
 - which services are pure userspace runtime ABI vs which ones implicitly depend
-  on RetailOS kernel behavior?
+  on RetailOS kernel behavior? *(still unknown; GL/IO seem pure userspace)*
+- what is the exact `.pix` file header format? *(72-byte header before raw
+  pixels; structure not yet decoded — not needed since guest parses it itself)*
+- what does `GL:157` r2=5 mean? *(unknown; could be quad count or a flags field)*
+- what exactly does `GL:165` bind? *(context + vertex buffer ptr, but the
+  double-ptr indirection via static globals is not fully traced)*
 
 ## Working rule for this branch
 
