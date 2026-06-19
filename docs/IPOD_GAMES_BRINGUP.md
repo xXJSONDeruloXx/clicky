@@ -163,14 +163,37 @@ python3 scripts/games/ipod_games_probe.py games /path/to/Games_RO
 
 ### Milestone 1: loader spike
 
-Create a minimal game-runner path that can:
+Implemented in this branch:
 
-- mount a single game bundle
-- parse the `eapp` header
-- map code/data into ARM memory at the expected base address
-- provide a fake working directory / file API view for bundle assets and save
-  files
-- log unresolved runtime imports immediately
+- `clicky-core/src/sys/eapp/mod.rs`
+  - minimal single-core `eapp` runner
+  - parses the `eapp` header and import-module chain
+  - maps the executable at file VMA `0x18000000`
+  - provides scratch/work RAM at `0x10000000`
+  - patches import literal tables to synthetic HLE trampolines
+  - logs runtime import calls with module + ordinal + register args
+- `clicky-desktop/src/bin/eapp.rs`
+  - experimental desktop runner for a single `Games_RO/<id>` bundle
+  - minifb window with basic key bindings
+  - headless mode for quick import/bring-up tracing
+
+Example usage:
+
+```bash
+cargo run -p clicky-desktop --bin eapp -- /path/to/Games_RO/66666
+cargo run -p clicky-desktop --bin eapp -- /path/to/Games_RO/66666 --headless --cycles 200000
+```
+
+Current observed behavior for **Tetris**:
+
+- the binary loads and begins executing native ARM code from the parsed entrypoint
+- the runner reaches the first runtime import
+- first observed import is `miscTBD:0`
+- current evidence suggests `miscTBD:0` behaves like a small allocation helper
+- execution still crashes shortly afterward because more runtime semantics are
+  missing, but this is already past static loading and into real guest code
+
+This is the first meaningful checkpoint for the direct-runtime path.
 
 ### Milestone 2: minimal runtime services
 
