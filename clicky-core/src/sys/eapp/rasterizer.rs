@@ -17,6 +17,7 @@ pub enum TextureFormat {
     Rgb565,
     Rgba5551,
     Rgba4444,
+    Rgba8888,
     A8,
 }
 
@@ -55,6 +56,7 @@ pub fn decode_texture_pixels(
         TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => {
             width * height * 2
         }
+        TextureFormat::Rgba8888 => width * height * 4,
         TextureFormat::A8 => width * height,
     };
     assert_eq!(raw.len(), expected);
@@ -105,6 +107,10 @@ pub fn decode_texture_pixels(
                     (a as u16 * 255 / 15) as u8,
                 )
             })
+            .collect(),
+        TextureFormat::Rgba8888 => raw
+            .chunks_exact(4)
+            .map(|chunk| Rgba8::rgba(chunk[0], chunk[1], chunk[2], chunk[3]))
             .collect(),
         TextureFormat::A8 => raw
             .iter()
@@ -230,6 +236,55 @@ pub fn rasterize_triangle(
     coverage
 }
 
+pub fn rasterize_solid_quad(
+    fb: &mut [Rgba8],
+    fb_width: usize,
+    fb_height: usize,
+    color: Rgba8,
+    positions: &[(f32, f32); 4],
+) -> u64 {
+    if color.a == 0 {
+        return 0;
+    }
+    let min_x = positions
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let min_y = positions
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let max_x = positions
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min((fb_width - 1) as f32) as i32;
+    let max_y = positions
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min((fb_height - 1) as f32) as i32;
+    if min_x > max_x || min_y > max_y {
+        return 0;
+    }
+
+    let mut coverage = 0u64;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let idx = y as usize * fb_width + x as usize;
+            fb[idx] = blend_src_over(fb[idx], color);
+            coverage += 1;
+        }
+    }
+    coverage
+}
+
 pub fn rasterize_quad(
     fb: &mut [Rgba8],
     fb_width: usize,
@@ -272,4 +327,21 @@ pub fn framebuffer_to_ppm(path: &std::path::Path, fb: &[Rgba8], width: usize, he
         out.push(px.b);
     }
     std::fs::write(path, out).expect("write ppm");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_rgba8888_preserves_channel_order() {
+        let tex = Texture::from_bytes(
+            &[0x11, 0x22, 0x33, 0x44],
+            1,
+            1,
+            TextureFormat::Rgba8888,
+            Rgba8::rgba(255, 255, 255, 255),
+        );
+        assert_eq!(tex.pixels[0], Rgba8::rgba(0x11, 0x22, 0x33, 0x44));
+    }
 }

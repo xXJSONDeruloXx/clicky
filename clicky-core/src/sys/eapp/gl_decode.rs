@@ -12,6 +12,7 @@ use super::{
 pub fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize {
     let bytes_per_pixel = match format {
         TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
+        TextureFormat::Rgba8888 => 4,
         TextureFormat::A8 => 1,
     };
     width * height * bytes_per_pixel
@@ -29,6 +30,7 @@ pub fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFo
         (0x1907, 0x8363) => Some(TextureFormat::Rgb565),
         (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
         (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
+        (0x1908, 0x1401) => Some(TextureFormat::Rgba8888),
         (0x1906, 0x1401) => Some(TextureFormat::A8),
         _ => None,
     }

@@ -173,7 +173,22 @@ One decoded example:
 
 ---
 
-## 7. Lifecycle Model
+## 7. miscTBD:9 Runtime Time API (Tetris evidence)
+
+`miscTBD:9` is confirmed, for Tetris, to be a pointer-writing monotonic-time API:
+
+- guest passes an output pointer in `r0`;
+- the runtime writes an advancing time value through that pointer;
+- the call returns the pointer value (`r0`) in the observed path;
+- Tetris calls it with `r0=app_object+4` and `r0=app_object+8`, then computes frame delta from the two pointed values.
+
+Keep this ordinal name conservative. The exact universal ABI name is not proven. Observed units are microseconds: Tetris compares the resulting values against guest thresholds `4_000_000` and `2_000_000`, and splash/menu progression timing matches that scale once the HLE writes host monotonic microseconds.
+
+The old zero/no-write behavior made guest execution continue while time-dependent progression remained stuck; this is distinct from input handling.
+
+---
+
+## 8. Lifecycle Model
 
 ```
 entry()            → game initialization
@@ -183,7 +198,7 @@ aux(app_obj)       → recurring callback (frame-like in Tetris; not universally
 
 ---
 
-## 8. Implementation Priority
+## 9. Implementation Priority
 
 ### Tier 1: First Pixels
 1. `Ordinal45State` + `Ordinal4State` + `GL:99` — texture upload path
@@ -206,7 +221,7 @@ aux(app_obj)       → recurring callback (frame-like in Tetris; not universally
 
 ---
 
-## 9. HLE Implementation Guide
+## 10. HLE Implementation Guide
 
 ### Do
 - Preserve native ARM execution
@@ -223,7 +238,7 @@ aux(app_obj)       → recurring callback (frame-like in Tetris; not universally
 
 ---
 
-## 10. Research Instrumentation
+## 11. Research Instrumentation
 
 ### Import Trace Format
 ```

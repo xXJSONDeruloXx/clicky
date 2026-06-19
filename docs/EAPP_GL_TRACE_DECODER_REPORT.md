@@ -426,7 +426,7 @@ Observed ordering supports neutral lifecycle labels:
 - `165`: surface/setup state (immediately after 158, before draws)
 - `157`: candidate frame present/end (always last surface ordinal, after all steady-state draws)
 
-Continuous mode (`CLICKY_GL_LIVE_CONTINUOUS=1`) now avoids the one-shot repeated-signature heuristic. It assembles frames from the observed 158→157 lifecycle, keeps an active internal buffer separate from completed/presented buffers, presents only completed 4-draw frames, and discards transitional/incomplete candidates. Gate B publishes only the completed presented buffer under the render-state mutex, so the eapp window does not read a partially rendered frame.
+Continuous mode (`CLICKY_GL_LIVE_CONTINUOUS=1`) now avoids the one-shot repeated-signature heuristic. It assembles frames from the observed 158→157 lifecycle, keeps an active internal buffer separate from completed/presented buffers, and publishes only completed non-empty frames. Gate B copies the completed presented buffer under the render-state mutex, so the eapp window does not read a partially rendered frame. The earlier four-draw-only presentation gate was a temporary splash-validation guard; once guest time advanced, it hid legitimate 3-draw loading/splash frames and later 29-draw menu/loading frames by pinning the window to the last 4-draw splash frame.
 
 Headless continuous validation with Gate B enabled:
 ```text
@@ -440,9 +440,9 @@ Detected transitional anomalies are bounded and reported:
 - frame 2 had draws outside active 158→157 and a 10-draw transitional candidate, discarded;
 - steady frames repeat identically; first stable presented hash remains `0x55462dde9fead727`.
 
-Runtime progression root cause (Tetris splash hang): `miscTBD:9` is a monotonic-time out-pointer API, not a no-op/status return. The aux frame callback calls it with `r0=app_object+4` and `r0=app_object+8`, then computes `delta = [app+8] - [app+4]`. With the old handler (`return args[0]`, no write), `[app+4]`, `[app+8]`, and the splash timeout timestamps stayed zero indefinitely while guest frames and async callbacks continued. Guest constants at `0x180256c0/0x180256c4` are `4_000_000` and `2_000_000`, confirming microsecond tick units.
+Runtime progression root cause (Tetris splash hang): `miscTBD:9` is confirmed, for Tetris, to write an advancing monotonic time value through the pointer in `r0`. A universal semantic name for the ordinal is still unproven, so keep the label conservative: "pointer-writing monotonic-time API" rather than a global ABI name. The aux frame callback calls it with `r0=app_object+4` and `r0=app_object+8`, then computes `delta = [app+8] - [app+4]`. With the old handler (`return args[0]`, no write), `[app+4]`, `[app+8]`, and the splash timeout timestamps stayed zero indefinitely while guest frames and async callbacks continued. Guest constants at `0x180256c0/0x180256c4` are `4_000_000` and `2_000_000`; observed behavior matches microsecond units.
 
-`miscTBD:9` now writes host monotonic microseconds through `r0`. With `CLICKY_STARTUP_PROGRESS_TRACE=1`, bounded diagnostics include module/ordinal, args, return value, host monotonic time, pointed value before/after, and whether guest time advanced. The same trace records per-frame framebuffer hash, candidate time values, pending async request count, callback count, and first hash-change frame.
+`miscTBD:9` now writes host monotonic microseconds through `r0`. This is a runtime-behavior recovery, not an arbitrary delay or state-forcing shortcut. With `CLICKY_STARTUP_PROGRESS_TRACE=1`, bounded diagnostics include module/ordinal, args, return value, host monotonic time, pointed value before/after, and whether guest time advanced. The same trace records per-frame framebuffer hash, candidate time values, pending async request count, callback count, and first hash-change frame.
 
 Post-fix evidence with live rendering enabled:
 ```text
@@ -453,6 +453,30 @@ startup_progress frame=193 fb_hash changed to 0xe48b120366ee7539 app_time_curren
 Async startup I/O evidence: 51 `AsyncFileIO:3` requests were resolved, 51 callbacks were queued, 51 callbacks were dispatched, and `pending_async=0` before the visual transition. The common callback at `0x1801fc68` consumes request fields `[0x08]`, `[0x20]`, and `[0x24]`; the observed callback path does not depend on the `0xffffffff` diagnostic fields at `[0x28..0x30]`.
 
 After time starts advancing, Tetris legitimately emits non-4-draw completed frames (3-draw splash/loading phase, then 29-draw menu/loading frames). Continuous Gate B now publishes any completed non-empty 158→157 frame; rasterization behavior is unchanged. This prevents the window from staying pinned to the last 4-draw splash frame after the guest has progressed.
+
+External behavioral reference (direct Nano 3G hardware observation, not an emulator-forcing rule):
+1. initial splash appears;
+2. legal/EULA-like text is visible during startup;
+3. a loading bar progressively fills left-to-right;
+4. the main menu then slides into place;
+5. in the main-menu composition, the Tetris logo is at the upper-left/top area;
+6. the current EA-logo placement and some other emulator-rendered elements are not yet confirmed accurate.
+
+Startup visual-accuracy capture/classification after the time fix and live-renderer extensions (`CLICKY_STARTUP_CAPTURE_DIR=/tmp/tetris_startup_capture_verified`, `CLICKY_GL_LIVE_CONTINUOUS=1`, `CLICKY_GL_GATE_B=1`, `CLICKY_GL_PRESENT_VFLIP=1`):
+
+```text
+guest frame 2:     10 draws, transitional double-composition, presented hash 0x46bffc2ca3d18ba0
+guest frames 3-35: 4 draws [0x13,0xe,0x1b,0x3], per-frame fade/light overlay hashes
+guest frames 36-192: 3 draws [0x13,0xe,0x1b], stable splash/loading hold, hash 0x55462dde9fead727
+guest frame 193+: 29 draws, menu/loading composition, hash 0x014afe9414f068b1 in the bounded capture
+```
+
+Evidence-backed live-renderer fixes from that capture:
+
+- `GL_RGBA` + `GL_UNSIGNED_BYTE` (`0x1908/0x1401`) is supported as `Rgba8888`, which resolves the `battery_8888.pix` upload instead of logging it unsupported.
+- UV sub-rects now match the smallest decoded upload that contains the UV extents after exact-dimension matching fails. This renders atlas-backed A8 strips such as `menus_a8.pix` instead of skipping them solely because the draw covers a sub-region like `308x34` inside a `320x99` upload.
+- Array definitions carry a material epoch. UV/color decoding only uses arrays from the current ordinal-159 material epoch, preventing stale slot-1 arrays from being interpreted as texcoords or colors after a later bind only redefines array 0.
+- Handle `0x3` 4-component `GL_FIXED` slot-1 arrays are rendered as conservative solid-color quads. This recovers the observed startup fade/light overlay and several solid menu-transition fills without treating unrelated pointer-like handles as solid colors.
 
 Optional dumping: `CLICKY_GL_DUMP_FRAMES=N` writes the first N completed presented frames to `/tmp/tetris_live_frame_XXXX.ppm`.
 
@@ -465,5 +489,6 @@ handle-to-upload mapping remains open.
 - exact descriptor/object → handle write/load path for `Ordinal45`/`Ordinal4`/`Ordinal99` → `Ordinal159`
 - draw 1 secondary `137` seq `11` role
 - draw 4 secondary `137` seq `44` role beyond the identity/tint interpretation
-- whether the `handle 3` overlay is fade, tint, clear-replacement, or post-process rather than a normal textured quad
+- pointer-like handles `0x100e38e0` and `0x100e5260`: after epoch filtering they no longer reuse stale UV/color arrays, but their array-0-only/menu text or glyph path is still unresolved
+- legal/EULA-like text and full menu text are still not represented in rendered pixels; do not synthesize them without resolving the live ABI evidence
 - whether the generated replay textures correspond to the real game art (they do not attempt to)

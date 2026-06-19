@@ -1,7 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -160,6 +162,57 @@ impl StartupProgressTrace {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StartupArtifactCapture {
+    enabled: bool,
+    dir: PathBuf,
+    manifest_path: PathBuf,
+    periodic_interval: u64,
+    max_frames: u64,
+    max_dumps: u64,
+    manifest_rows: u64,
+    dump_count: u64,
+    last_hash: Option<u64>,
+}
+
+impl StartupArtifactCapture {
+    fn from_env() -> StartupArtifactCapture {
+        let enabled = std::env::var_os("CLICKY_STARTUP_CAPTURE_DIR").is_some();
+        let dir = std::env::var_os("CLICKY_STARTUP_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/clicky_tetris_startup_capture"));
+        let manifest_path = dir.join("manifest.tsv");
+        let periodic_interval = std::env::var_os("CLICKY_STARTUP_CAPTURE_PERIOD")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let max_frames = std::env::var_os("CLICKY_STARTUP_CAPTURE_MAX_FRAMES")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(1200);
+        let max_dumps = std::env::var_os("CLICKY_STARTUP_CAPTURE_MAX_DUMPS")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(400);
+        if enabled {
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(
+                &manifest_path,
+                "guest_frame\thost_us\tguest_time_current\tguest_time_delta\tdraw_count\thandles\tinternal_hash\tpresented_hash\tdump_reason\tpath\n",
+            );
+        }
+        StartupArtifactCapture {
+            enabled,
+            dir,
+            manifest_path,
+            periodic_interval,
+            max_frames,
+            max_dumps,
+            manifest_rows: 0,
+            dump_count: 0,
+            last_hash: None,
+        }
+    }
+}
+
 pub struct Eapp {
     cpu: Cpu,
     bus: EappBus,
@@ -188,6 +241,8 @@ pub struct Eapp {
     /// Per-frame import counters used by the optional startup-progress trace.
     frame_import_counts: HashMap<(String, u32), u64>,
     startup_progress: StartupProgressTrace,
+    startup_capture: StartupArtifactCapture,
+    startup_signature_reports: HashSet<String>,
     host_start: Instant,
     misc9_time_diag_count: u64,
     misc9_last_pointed_value: Option<u32>,
@@ -340,6 +395,8 @@ impl Eapp {
             import_call_counts: HashMap::new(),
             frame_import_counts: HashMap::new(),
             startup_progress: StartupProgressTrace::from_env(),
+            startup_capture: StartupArtifactCapture::from_env(),
+            startup_signature_reports: HashSet::new(),
             host_start: Instant::now(),
             misc9_time_diag_count: 0,
             misc9_last_pointed_value: None,
@@ -1029,7 +1086,9 @@ impl Eapp {
         // last 4-draw splash frame.
         let should_present = completed.draw_count > 0;
         self.live_log_completed_frame(&completed, should_present);
+        self.live_log_signature_detail(&completed);
         if should_present {
+            self.capture_startup_completed_frame(&completed);
             self.live_dump_completed_frame();
             if self.live_gl.as_ref().map(|lg| lg.gate_b).unwrap_or(false) {
                 self.live_present_completed_to_window();
@@ -1080,7 +1139,8 @@ impl Eapp {
         };
 
         let index = self.live_gl.as_ref().map(|l| l.uploads.len()).unwrap_or(0);
-        let upload = LiveGlState::build_upload(
+        let backing = self.file_backing_for_addr(source_ptr);
+        let mut upload = LiveGlState::build_upload(
             index,
             target,
             width,
@@ -1090,10 +1150,26 @@ impl Eapp {
             source_ptr,
             &payload,
         );
+        if let Some(backing) = backing {
+            upload.source_file_offset = Some(source_ptr.saturating_sub(backing.base_addr));
+            upload.source_file = Some(backing.path);
+        }
         info!(
             target: "EAPP_GL",
-            "live_upload idx={} {}x{} format={:?} src_fmt={:#x} pix_type={:#x} src_ptr={:#010x} bytes={}",
-            index, width, height, upload.format, source_format, pixel_type, source_ptr, payload.len()
+            "live_upload idx={} {}x{} format={:?} src_fmt={:#x} pix_type={:#x} src_ptr={:#010x} bytes={} file={} file_off={}",
+            index,
+            width,
+            height,
+            upload.format,
+            source_format,
+            pixel_type,
+            source_ptr,
+            payload.len(),
+            upload.source_file.as_deref().unwrap_or("<unknown>"),
+            upload
+                .source_file_offset
+                .map(|off| format!("{}", off))
+                .unwrap_or_else(|| "<unknown>".to_string())
         );
         if let Some(lg) = self.live_gl.as_mut() {
             lg.uploads.push(upload);
@@ -1115,15 +1191,16 @@ impl Eapp {
             "live_array idx={} comps={} format={:#x} stride={} ptr={:#010x} valid={}",
             array_index, component_count, format, stride, guest_ptr, valid
         );
-        let def = live_gl::LiveArrayDef {
-            array_index,
-            component_count,
-            format,
-            stride,
-            guest_ptr,
-            valid,
-        };
         if let Some(lg) = self.live_gl.as_mut() {
+            let def = live_gl::LiveArrayDef {
+                array_index,
+                component_count,
+                format,
+                stride,
+                guest_ptr,
+                valid,
+                material_epoch: lg.current_material_epoch,
+            };
             lg.arrays.insert(array_index, def);
         }
     }
@@ -1156,6 +1233,7 @@ impl Eapp {
         if let Some(lg) = self.live_gl.as_mut() {
             lg.current_handle = handle;
             lg.current_state_ptr = state_ptr;
+            lg.current_material_epoch = lg.current_material_epoch.wrapping_add(1);
         }
         info!(
             target: "EAPP_GL",
@@ -1188,11 +1266,24 @@ impl Eapp {
             }
         }
 
-        let (handle, state_ptr, translation, pos_def, uv_def, pos_enabled, uv_enabled, draw_index) = {
+        let (
+            handle,
+            state_ptr,
+            translation,
+            pos_def,
+            uv_def,
+            pos_enabled,
+            uv_enabled,
+            enabled_arrays,
+            draw_index,
+            material_epoch,
+        ) = {
             let lg = match self.live_gl.as_ref() {
                 Some(lg) => lg,
                 None => return,
             };
+            let mut enabled_arrays: Vec<u32> = lg.enabled_arrays.iter().copied().collect();
+            enabled_arrays.sort_unstable();
             (
                 lg.current_handle,
                 lg.current_state_ptr,
@@ -1201,9 +1292,12 @@ impl Eapp {
                 lg.arrays.get(&1).cloned(),
                 lg.enabled_arrays.contains(&0),
                 lg.enabled_arrays.contains(&1),
+                enabled_arrays,
                 lg.draws.len(),
+                lg.current_material_epoch,
             )
         };
+        let state_words = self.read_guest_words(state_ptr, 16);
 
         let positions = match self.live_decode_positions(&pos_def, pos_enabled, translation) {
             Some(p) => p,
@@ -1216,6 +1310,11 @@ impl Eapp {
                     positions: [(0.0, 0.0); 4],
                     uvs: [(0.0, 0.0); 4],
                     has_uv: false,
+                    solid_color: None,
+                    position_array: pos_def.clone(),
+                    uv_array: uv_def.clone(),
+                    enabled_arrays: enabled_arrays.clone(),
+                    state_words,
                     bounds: (0.0, 0.0, 0.0, 0.0),
                     coverage: 0,
                     selected_upload: None,
@@ -1232,9 +1331,16 @@ impl Eapp {
             }
         };
 
-        let (uvs, has_uv) = self.live_decode_uvs(&uv_def, uv_enabled);
+        let (uvs, has_uv) = self
+            .live_decode_uvs(&uv_def, uv_enabled, material_epoch)
+            .unwrap_or(([(0.0, 0.0); 4], false));
+        let solid_color = if has_uv || handle != 0x3 {
+            None
+        } else {
+            self.live_decode_solid_color(&uv_def, uv_enabled, material_epoch)
+        };
 
-        let record = match self.live_gl.as_mut() {
+        let mut record = match self.live_gl.as_mut() {
             Some(lg) => lg.rasterize_draw(
                 draw_index,
                 handle,
@@ -1243,9 +1349,14 @@ impl Eapp {
                 positions,
                 uvs,
                 has_uv,
+                solid_color,
             ),
             None => return,
         };
+        record.position_array = pos_def.clone();
+        record.uv_array = uv_def.clone();
+        record.enabled_arrays = enabled_arrays;
+        record.state_words = state_words;
 
         if let Some(reason) = record.skipped_reason.clone() {
             if let Some(lg) = self.live_gl.as_mut() {
@@ -1262,6 +1373,13 @@ impl Eapp {
                 "draw{} rasterized handle={:#x} inferred_upload={} dim={:?} bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
                 draw_index + 1, handle, sel, record.inferred_dim, record.bounds.0, record.bounds.1,
                 record.bounds.2, record.bounds.3, record.coverage
+            );
+        } else if let Some(color) = record.solid_color {
+            info!(
+                target: "EAPP_GL",
+                "draw{} rasterized solid handle={:#x} color=rgba({},{},{},{}) bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
+                draw_index + 1, handle, color.r, color.g, color.b, color.a, record.bounds.0,
+                record.bounds.1, record.bounds.2, record.bounds.3, record.coverage
             );
         }
         self.live_finalize_draw(Some(record));
@@ -1288,31 +1406,76 @@ impl Eapp {
         ])
     }
 
-    /// Decode the 4-vertex UV array (array 1, GL_FIXED). Returns default UVs
-    /// with has_uv=false if not usable.
+    /// Decode the 4-vertex UV array (array 1, GL_FIXED). Tetris also binds
+    /// 4-component arrays in slot 1 for color/tint-like data; those are not
+    /// texture coordinates. Epoch matching avoids reusing stale client arrays
+    /// after a later material bind that only redefines array 0.
     fn live_decode_uvs(
         &mut self,
         def: &Option<live_gl::LiveArrayDef>,
         enabled: bool,
-    ) -> ([(f32, f32); 4], bool) {
-        let Some(def) = def.as_ref() else {
-            return ([(0.0, 0.0); 4], false);
+        material_epoch: u64,
+    ) -> Option<([(f32, f32); 4], bool)> {
+        let def = def.as_ref()?;
+        if !enabled
+            || !def.valid
+            || def.material_epoch != material_epoch
+            || def.format != live_gl::GL_FIXED
+            || def.component_count != 2
+        {
+            return None;
+        }
+        let pts = self.read_fixed_array(def.guest_ptr, def.component_count as usize, 4)?;
+        Some((
+            [
+                (pts[0].0, pts[0].1),
+                (pts[1].0, pts[1].1),
+                (pts[2].0, pts[2].1),
+                (pts[3].0, pts[3].1),
+            ],
+            true,
+        ))
+    }
+
+    /// Decode a 4-component GL_FIXED color/tint array as a conservative solid
+    /// color. Tetris uses this shape for handle-3 fade/fill quads that do not
+    /// provide a 2-component texcoord array. We average the four vertex colors;
+    /// observed startup quads use uniform values.
+    fn live_decode_solid_color(
+        &mut self,
+        def: &Option<live_gl::LiveArrayDef>,
+        enabled: bool,
+        material_epoch: u64,
+    ) -> Option<Rgba8> {
+        let def = def.as_ref()?;
+        if !enabled
+            || !def.valid
+            || def.material_epoch != material_epoch
+            || def.format != live_gl::GL_FIXED
+            || def.component_count != 4
+        {
+            return None;
+        }
+        let stride = if def.stride == 0 {
+            def.component_count as usize * 4
+        } else {
+            def.stride as usize
         };
-        if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count < 2 {
-            return ([(0.0, 0.0); 4], false);
+        let mut acc = [0.0f32; 4];
+        for vertex in 0..4usize {
+            let base = def.guest_ptr.wrapping_add((vertex * stride) as u32);
+            for (component, slot) in acc.iter_mut().enumerate() {
+                let word = self.read_guest_u32(base.wrapping_add((component * 4) as u32))?;
+                *slot += decode_fixed_16_16(word).clamp(0.0, 1.0);
+            }
         }
-        match self.read_fixed_array(def.guest_ptr, def.component_count as usize, 4) {
-            Some(pts) => (
-                [
-                    (pts[0].0, pts[0].1),
-                    (pts[1].0, pts[1].1),
-                    (pts[2].0, pts[2].1),
-                    (pts[3].0, pts[3].1),
-                ],
-                true,
-            ),
-            None => ([(0.0, 0.0); 4], false),
-        }
+        let to_u8 = |v: f32| ((v / 4.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+        Some(Rgba8::rgba(
+            to_u8(acc[0]),
+            to_u8(acc[1]),
+            to_u8(acc[2]),
+            to_u8(acc[3]),
+        ))
     }
 
     /// Reset per-draw translation, increment the draw counter, and capture the
@@ -1451,6 +1614,152 @@ impl Eapp {
                 frame.presented_hash
             );
         }
+    }
+
+    /// Emit a bounded, detailed draw report the first time a completed-frame
+    /// signature appears. This is for visual-accuracy triage, not rendering.
+    fn live_log_signature_detail(&mut self, frame: &live_gl::CompletedFrame) {
+        let key = frame
+            .handle_signature
+            .iter()
+            .map(|h| format!("{:#x}", h))
+            .collect::<Vec<_>>()
+            .join(",");
+        let key = format!("draws={} [{}]", frame.draw_count, key);
+        if !self.startup_signature_reports.insert(key.clone()) {
+            return;
+        }
+        let Some(lg) = self.live_gl.as_ref() else {
+            return;
+        };
+        info!(
+            target: "EAPP_GL",
+            "frame_signature_detail guest_frame={} completed_idx={} {} internal={:#018x} presented={:#018x}",
+            self.frame_counter,
+            frame.index,
+            key,
+            frame.internal_hash,
+            frame.presented_hash
+        );
+        for draw in &lg.draws {
+            let pos = array_summary(draw.position_array.as_ref());
+            let uv = array_summary(draw.uv_array.as_ref());
+            let upload = draw
+                .selected_upload
+                .and_then(|idx| lg.uploads.get(idx).map(|u| upload_summary(u)))
+                .unwrap_or_else(|| "upload=<none>".to_string());
+            let state_words = draw
+                .state_words
+                .iter()
+                .take(12)
+                .map(|w| format!("{:#010x}", w))
+                .collect::<Vec<_>>()
+                .join(",");
+            let uvs = draw
+                .uvs
+                .iter()
+                .map(|(u, v)| format!("({:.1},{:.1})", u, v))
+                .collect::<Vec<_>>()
+                .join(",");
+            let color = draw
+                .solid_color
+                .map(|c| format!("solid=rgba({},{},{},{})", c.r, c.g, c.b, c.a))
+                .unwrap_or_else(|| "solid=<none>".to_string());
+            info!(
+                target: "EAPP_GL",
+                "draw_detail guest_frame={} draw={} handle={:#x} state_ptr={:#010x} enabled={:?} pos_arr={} uv_arr={} translation=({:.2},{:.2}) bounds=({:.1},{:.1})-({:.1},{:.1}) uvs=[{}] inferred_dim={:?} {} {} coverage={} status={} state_words=[{}]",
+                self.frame_counter,
+                draw.draw_index + 1,
+                draw.handle,
+                draw.state_ptr,
+                draw.enabled_arrays,
+                pos,
+                uv,
+                draw.translation.0,
+                draw.translation.1,
+                draw.bounds.0,
+                draw.bounds.1,
+                draw.bounds.2,
+                draw.bounds.3,
+                uvs,
+                draw.inferred_dim,
+                upload,
+                color,
+                draw.coverage,
+                draw.skipped_reason.as_deref().unwrap_or("rasterized"),
+                state_words
+            );
+        }
+    }
+
+    /// Optional startup capture (`CLICKY_STARTUP_CAPTURE_DIR=/tmp/...`). Writes
+    /// a chronological TSV manifest for completed frames, and dumps PPMs for
+    /// every presented framebuffer hash change plus periodic samples.
+    fn capture_startup_completed_frame(&mut self, frame: &live_gl::CompletedFrame) {
+        if !self.startup_capture.enabled {
+            return;
+        }
+        if self.startup_capture.manifest_rows >= self.startup_capture.max_frames {
+            return;
+        }
+        let host_us = self.host_start.elapsed().as_micros() as u64;
+        let guest_time_current = self
+            .read_guest_u32(self.app_object.wrapping_add(4))
+            .unwrap_or(0);
+        let guest_time_delta = self
+            .read_guest_u32(self.app_object.wrapping_add(8))
+            .unwrap_or(0);
+        let hash_changed = self.startup_capture.last_hash != Some(frame.presented_hash);
+        let periodic = self.frame_counter % self.startup_capture.periodic_interval == 0;
+        let reason = if hash_changed {
+            "hash_change"
+        } else if periodic {
+            "periodic"
+        } else {
+            ""
+        };
+
+        let mut output_path = String::new();
+        if !reason.is_empty() && self.startup_capture.dump_count < self.startup_capture.max_dumps {
+            let filename = format!(
+                "startup_g{:06}_host{:012}_hash{:016x}.ppm",
+                self.frame_counter, host_us, frame.presented_hash
+            );
+            let path = self.startup_capture.dir.join(filename);
+            if let Some(fb) = self.live_gl.as_ref().map(|lg| lg.presented_buffer.clone()) {
+                framebuffer_to_ppm(&path, &fb, live_gl::FB_WIDTH, live_gl::FB_HEIGHT);
+                output_path = path.display().to_string();
+                self.startup_capture.dump_count += 1;
+            }
+        }
+        let handles = frame
+            .handle_signature
+            .iter()
+            .map(|h| format!("{:#x}", h))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{}\t{}\n",
+            self.frame_counter,
+            host_us,
+            guest_time_current,
+            guest_time_delta,
+            frame.draw_count,
+            handles,
+            frame.internal_hash,
+            frame.presented_hash,
+            reason,
+            output_path
+        );
+        if let Ok(mut file) = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.startup_capture.manifest_path)
+        {
+            let _ = file.write_all(row.as_bytes());
+        }
+        self.startup_capture.manifest_rows += 1;
+        self.startup_capture.last_hash = Some(frame.presented_hash);
     }
 
     /// Optional continuous frame dumping (`CLICKY_GL_DUMP_FRAMES=N`). Writes
@@ -1941,12 +2250,22 @@ impl Eapp {
         hasher.finish()
     }
 
-    fn preview_words(&mut self, addr: u32, count: usize) -> String {
+    fn read_guest_words(&mut self, addr: u32, count: usize) -> Vec<u32> {
+        if addr == 0 {
+            return Vec::new();
+        }
         (0..count)
             .map(|i| {
                 let a = addr.wrapping_add((i * 4) as u32);
-                format!("{:#010x}", self.read_guest_u32(a).unwrap_or(0xffff_ffff))
+                self.read_guest_u32(a).unwrap_or(0xffff_ffff)
             })
+            .collect()
+    }
+
+    fn preview_words(&mut self, addr: u32, count: usize) -> String {
+        self.read_guest_words(addr, count)
+            .into_iter()
+            .map(|w| format!("{:#010x}", w))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -2356,6 +2675,39 @@ impl Eapp {
             .collect::<Vec<_>>()
             .join(" -> ")
     }
+}
+
+fn array_summary(def: Option<&live_gl::LiveArrayDef>) -> String {
+    match def {
+        Some(def) => format!(
+            "idx={} comps={} fmt={:#x} stride={} ptr={:#010x} valid={} epoch={}",
+            def.array_index,
+            def.component_count,
+            def.format,
+            def.stride,
+            def.guest_ptr,
+            def.valid,
+            def.material_epoch
+        ),
+        None => "<none>".to_string(),
+    }
+}
+
+fn upload_summary(upload: &live_gl::LiveGlUpload) -> String {
+    format!(
+        "upload={} file={} file_off={} dim={}x{} format={:?} src_fmt={:#x} pix_type={:#x}",
+        upload.index,
+        upload.source_file.as_deref().unwrap_or("<unknown>"),
+        upload
+            .source_file_offset
+            .map(|off| off.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        upload.width,
+        upload.height,
+        upload.format,
+        upload.source_format,
+        upload.pixel_type
+    )
 }
 
 impl TakeControls for Eapp {

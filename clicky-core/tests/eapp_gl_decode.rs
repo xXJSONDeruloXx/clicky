@@ -967,6 +967,7 @@ struct LocalAsset {
 fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize {
     let bytes_per_pixel = match format {
         TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
+        TextureFormat::Rgba8888 => 4,
         TextureFormat::A8 => 1,
     };
     width * height * bytes_per_pixel
@@ -982,6 +983,7 @@ fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFormat
         (0x1907, 0x8363) => Some(TextureFormat::Rgb565),
         (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
         (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
+        (0x1908, 0x1401) => Some(TextureFormat::Rgba8888),
         (0x1906, 0x1401) => Some(TextureFormat::A8),
         _ => None,
     }
@@ -1203,6 +1205,10 @@ fn pix_payload_size_matches_format_dimensions() {
         pix_payload_size(TextureFormat::Rgba4444, 250, 162),
         250 * 162 * 2
     );
+    assert_eq!(
+        pix_payload_size(TextureFormat::Rgba8888, 40, 20),
+        40 * 20 * 4
+    );
     assert_eq!(pix_payload_size(TextureFormat::A8, 784, 20), 784 * 20);
 }
 
@@ -1216,6 +1222,10 @@ fn format_from_gl_maps_captured_upload_constants() {
     assert_eq!(
         format_from_gl(0x1908, 0x8033),
         Some(TextureFormat::Rgba4444)
+    );
+    assert_eq!(
+        format_from_gl(0x1908, 0x1401),
+        Some(TextureFormat::Rgba8888)
     );
     assert_eq!(format_from_gl(0x1906, 0x1401), Some(TextureFormat::A8));
     assert_eq!(format_from_gl(0xdead, 0xbeef), None);

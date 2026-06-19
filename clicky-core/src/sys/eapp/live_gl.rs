@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::gl_decode::{format_from_gl, pix_payload_size};
 use super::rasterizer::{
-    framebuffer_hash, framebuffer_to_ppm, rasterize_quad, Rgba8, Texture, TextureFormat,
+    framebuffer_hash, framebuffer_to_ppm, rasterize_quad, rasterize_solid_quad, Rgba8, Texture,
+    TextureFormat,
 };
 
 pub const FB_WIDTH: usize = 320;
@@ -41,6 +42,8 @@ pub struct LiveGlUpload {
     pub source_format: u32,
     pub pixel_type: u32,
     pub source_ptr: u32,
+    pub source_file: Option<String>,
+    pub source_file_offset: Option<u32>,
     pub format: Option<TextureFormat>,
     pub texture: Option<Texture>,
 }
@@ -55,6 +58,7 @@ pub struct LiveArrayDef {
     pub stride: u32,
     pub guest_ptr: u32,
     pub valid: bool,
+    pub material_epoch: u64,
 }
 
 /// One decoded ordinal-37 draw, recorded for diagnostics and comparison.
@@ -67,6 +71,11 @@ pub struct LiveDrawRecord {
     pub positions: [(f32, f32); 4],
     pub uvs: [(f32, f32); 4],
     pub has_uv: bool,
+    pub solid_color: Option<Rgba8>,
+    pub position_array: Option<LiveArrayDef>,
+    pub uv_array: Option<LiveArrayDef>,
+    pub enabled_arrays: Vec<u32>,
+    pub state_words: Vec<u32>,
     pub bounds: (f32, f32, f32, f32),
     pub coverage: u64,
     pub selected_upload: Option<usize>,
@@ -98,6 +107,7 @@ pub struct LiveGlState {
     pub enabled_arrays: HashSet<u32>,
     pub current_handle: u32,
     pub current_state_ptr: u32,
+    pub current_material_epoch: u64,
     pub translation: (f32, f32),
     pub framebuffer: Vec<Rgba8>,
     pub draws: Vec<LiveDrawRecord>,
@@ -162,6 +172,7 @@ impl LiveGlState {
             enabled_arrays: HashSet::new(),
             current_handle: 0,
             current_state_ptr: 0,
+            current_material_epoch: 0,
             translation: (0.0, 0.0),
             framebuffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
             draws: Vec::new(),
@@ -405,6 +416,8 @@ impl LiveGlState {
             source_format,
             pixel_type,
             source_ptr,
+            source_file: None,
+            source_file_offset: None,
             format,
             texture,
         }
@@ -420,6 +433,26 @@ impl LiveGlState {
             .map(|u| u.index)
     }
 
+    /// Select a live texture for the supplied texel-centered UVs. Full-texture
+    /// quads match by exact UV span; atlas sub-rects (e.g. Tetris menu A8
+    /// strips) match the smallest decoded upload that contains the UV extents.
+    fn select_upload_for_uvs(&self, uvs: &[(f32, f32); 4]) -> Option<usize> {
+        let (min_u, min_v, max_u, max_v) = uv_extents(uvs);
+        let span_w = (max_u - min_u).round().max(1.0) as usize;
+        let span_h = (max_v - min_v).round().max(1.0) as usize;
+        if let Some(idx) = self.select_upload_by_dims(span_w, span_h) {
+            return Some(idx);
+        }
+
+        let need_w = max_u.ceil().max(1.0) as usize;
+        let need_h = max_v.ceil().max(1.0) as usize;
+        self.uploads
+            .iter()
+            .filter(|u| u.texture.is_some() && u.width >= need_w && u.height >= need_h)
+            .min_by_key(|u| (u.width * u.height, u.index))
+            .map(|u| u.index)
+    }
+
     /// Rasterize one draw into the internal framebuffer using the existing
     /// rasterizer. Returns the produced `LiveDrawRecord`.
     pub fn rasterize_draw(
@@ -431,6 +464,7 @@ impl LiveGlState {
         positions: [(f32, f32); 4],
         uvs: [(f32, f32); 4],
         has_uv: bool,
+        solid_color: Option<Rgba8>,
     ) -> LiveDrawRecord {
         let bounds = bounds_for(&positions);
         let inferred_dim = if has_uv {
@@ -440,7 +474,11 @@ impl LiveGlState {
             None
         };
 
-        let selected_upload = inferred_dim.and_then(|(w, h)| self.select_upload_by_dims(w, h));
+        let selected_upload = if has_uv {
+            self.select_upload_for_uvs(&uvs)
+        } else {
+            None
+        };
 
         let mut record = LiveDrawRecord {
             draw_index,
@@ -450,6 +488,11 @@ impl LiveGlState {
             positions,
             uvs,
             has_uv,
+            solid_color,
+            position_array: None,
+            uv_array: None,
+            enabled_arrays: Vec::new(),
+            state_words: Vec::new(),
             bounds,
             coverage: 0,
             selected_upload,
@@ -458,8 +501,18 @@ impl LiveGlState {
         };
 
         let Some(upload_idx) = selected_upload else {
+            if let Some(color) = solid_color {
+                record.coverage = rasterize_solid_quad(
+                    &mut self.framebuffer,
+                    FB_WIDTH,
+                    FB_HEIGHT,
+                    color,
+                    &positions,
+                );
+                return record;
+            }
             record.skipped_reason = Some(format!(
-                "no live upload matched inferred dims {:?} (handle={:#x})",
+                "no live upload matched UV span {:?} (handle={:#x})",
                 inferred_dim, handle
             ));
             return record;
@@ -535,8 +588,8 @@ fn bounds_for(positions: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
 /// Infer intended texture dimensions from texel-centered UVs. The captured
 /// UVs are half-texel centered (e.g. 0.5 .. 50.5 for a 50px texture), so the
 /// span rounds to the texture dimension.
-fn infer_dims_from_uvs(uvs: &[(f32, f32); 4]) -> (usize, usize) {
-    let (min_u, min_v, max_u, max_v) = uvs.iter().fold(
+fn uv_extents(uvs: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    uvs.iter().fold(
         (
             f32::INFINITY,
             f32::INFINITY,
@@ -544,7 +597,11 @@ fn infer_dims_from_uvs(uvs: &[(f32, f32); 4]) -> (usize, usize) {
             f32::NEG_INFINITY,
         ),
         |acc, (u, v)| (acc.0.min(*u), acc.1.min(*v), acc.2.max(*u), acc.3.max(*v)),
-    );
+    )
+}
+
+fn infer_dims_from_uvs(uvs: &[(f32, f32); 4]) -> (usize, usize) {
+    let (min_u, min_v, max_u, max_v) = uv_extents(uvs);
     let w = (max_u - min_u).round().max(1.0) as usize;
     let h = (max_v - min_v).round().max(1.0) as usize;
     (w, h)
@@ -628,6 +685,33 @@ mod tests {
         assert_eq!(lg.select_upload_by_dims(50, 50), Some(0));
         assert_eq!(lg.select_upload_by_dims(250, 162), Some(1));
         assert_eq!(lg.select_upload_by_dims(999, 999), None);
+    }
+
+    #[test]
+    fn select_upload_for_uvs_uses_smallest_containing_atlas_when_span_is_subrect() {
+        let mut lg = LiveGlState::new(true, false, false);
+        lg.uploads.push(LiveGlState::build_upload(
+            0,
+            0x0de1,
+            980,
+            24,
+            0x1906,
+            0x1401,
+            0x1000_0000,
+            &vec![0xff; 980 * 24],
+        ));
+        lg.uploads.push(LiveGlState::build_upload(
+            1,
+            0x0de1,
+            320,
+            99,
+            0x1906,
+            0x1401,
+            0x1000_0010,
+            &vec![0xff; 320 * 99],
+        ));
+        let menu_strip_uvs = [(0.5, 37.5), (0.5, 3.5), (308.5, 3.5), (308.5, 37.5)];
+        assert_eq!(lg.select_upload_for_uvs(&menu_strip_uvs), Some(1));
     }
 
     #[test]
