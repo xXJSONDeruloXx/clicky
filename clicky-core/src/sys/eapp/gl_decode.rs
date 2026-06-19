@@ -1,8 +1,8 @@
+use super::rasterizer::TextureFormat;
 use super::{
     GlFileBacking, GlFrameRecord, GlImportRecord, GlMemorySnapshot, GlRegisterSnapshot,
     GlStackWordSnapshot, GlTraceFixture,
 };
-use super::rasterizer::TextureFormat;
 
 /// Bytes per pixel for each standalone renderer texture format.
 ///

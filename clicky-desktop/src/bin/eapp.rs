@@ -7,7 +7,7 @@ use std::sync::mpsc as chan;
 
 use clicky_core::gui::{ButtonCallback, RenderCallback, ScrollCallback, TakeControls};
 use clicky_core::sys::eapp::{Eapp, EappBinds, EappKey};
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, ScaleMode, Window, WindowOptions};
 use structopt::StructOpt;
 
 pub type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -72,6 +72,7 @@ fn run_minifb_ui(
         240,
         WindowOptions {
             scale: minifb::Scale::X2,
+            scale_mode: ScaleMode::AspectRatioStretch,
             resize: true,
             ..WindowOptions::default()
         },

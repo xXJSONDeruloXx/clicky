@@ -416,6 +416,32 @@ Gate B (`CLICKY_GL_GATE_B=1`) copies the presented buffer to the eapp render
 state; confirmed firing under its flag. Window presentation orientation is left
 configurable via `CLICKY_GL_PRESENT_VFLIP` pending visual confirmation.
 
+Continuous rendering lifecycle evidence (live, first steady frames):
+```text
+158(h0x3f001),165(h0x180254c8),...37#1...37#2...37#3...37#4...,157(h0x0)
+```
+
+Observed ordering supports neutral lifecycle labels:
+- `158`: candidate frame begin (always first surface ordinal, before all steady-state draws)
+- `165`: surface/setup state (immediately after 158, before draws)
+- `157`: candidate frame present/end (always last surface ordinal, after all steady-state draws)
+
+Continuous mode (`CLICKY_GL_LIVE_CONTINUOUS=1`) now avoids the one-shot repeated-signature heuristic. It assembles frames from the observed 158→157 lifecycle, keeps an active internal buffer separate from completed/presented buffers, presents only completed 4-draw frames, and discards transitional/incomplete candidates. Gate B publishes only the completed presented buffer under the render-state mutex, so the eapp window does not read a partially rendered frame.
+
+Headless continuous validation with Gate B enabled:
+```text
+frame_diag idx=2 begin=158@208 end=157@257 draws=4 sig=[0x13,0xe,0x1b,0x3]
+  internal=0xdc2cbe3857ad3483 presented=0x55462dde9fead727 skipped=1 status=presented
+frame_diag idx=3.. stable: same hashes/signature repeated
+```
+
+Detected transitional anomalies are bounded and reported:
+- startup `candidate_present without active frame` before steady rendering;
+- frame 2 had draws outside active 158→157 and a 10-draw transitional candidate, discarded;
+- steady frames repeat identically; first stable presented hash remains `0x55462dde9fead727`.
+
+Optional dumping: `CLICKY_GL_DUMP_FRAMES=N` writes the first N completed presented frames to `/tmp/tetris_live_frame_XXXX.ppm`.
+
 Handle→upload association is still *inferred* by live upload dimensions/format
 (logged as inferred), not a proven handle-creation path; the exact ordinal-159
 handle-to-upload mapping remains open.

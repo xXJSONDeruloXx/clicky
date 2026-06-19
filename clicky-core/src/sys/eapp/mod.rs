@@ -12,15 +12,15 @@ mod live_gl;
 mod rasterizer;
 pub use gl_decode::{
     bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
-    float_words_from_snapshot, format_from_gl, pix_payload_size, register,
-    stack_word, texture_upload_candidates, words_from_snapshot, TextureUploadCandidate,
+    float_words_from_snapshot, format_from_gl, pix_payload_size, register, stack_word,
+    texture_upload_candidates, words_from_snapshot, TextureUploadCandidate,
 };
 use gl_trace::hex_bytes;
-use live_gl::LiveGlState;
 pub use gl_trace::{
     GlFileBacking, GlFrameRecord, GlImportRecord, GlMemoryRegion, GlMemorySnapshot,
     GlRegisterSnapshot, GlStackWordSnapshot, GlTraceFixture, GlTraceRecorder, GlValueClass,
 };
+use live_gl::LiveGlState;
 pub use rasterizer::{
     blend_src_over, decode_texture_pixels, framebuffer_hash, framebuffer_to_ppm, rasterize_quad,
     rasterize_triangle, sample_nearest, Rgba8, Texture, TextureFormat,
@@ -856,12 +856,17 @@ impl Eapp {
         let continuous = std::env::var_os("CLICKY_GL_LIVE_CONTINUOUS")
             .map(|v| v.to_string_lossy() == "1")
             .unwrap_or(false);
+        let dump_frames = std::env::var_os("CLICKY_GL_DUMP_FRAMES")
+            .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
+            .unwrap_or(0);
         info!(
             target: "EAPP_GL",
-            "experimental GL HLE enabled: present_vflip={} gate_b={} continuous={}",
-            present_vflip, gate_b, continuous
+            "experimental GL HLE enabled: present_vflip={} gate_b={} continuous={} dump_frames={}",
+            present_vflip, gate_b, continuous, dump_frames
         );
-        Some(LiveGlState::new(present_vflip, gate_b, continuous))
+        let mut lg = LiveGlState::new(present_vflip, gate_b, continuous);
+        lg.dump_remaining = dump_frames;
+        Some(lg)
     }
 
     /// Experimental live GL HLE dispatch. Called for every OpenGLES import
@@ -869,18 +874,32 @@ impl Eapp {
     /// drives the software framebuffer via `LiveGlState`.
     fn handle_open_gl_hle(&mut self, ordinal: u32, args: [u32; 4]) {
         let frame = self.frame_counter;
-        {
-            let lg = match self.live_gl.as_mut() {
-                Some(lg) => lg,
-                None => return,
-            };
-            // Reset per-frame accumulators on the guest frame boundary. We do
-            // not clear/publish on lifecycle ordinals (157/158/165) because
-            // their roles remain unconfirmed.
-            if frame != lg.last_frame_counter {
+        let boundary = matches!(self.live_gl.as_ref(), Some(lg) if frame != lg.last_frame_counter);
+        if boundary {
+            // On the guest frame boundary, emit the previous frame's lifecycle
+            // trace (evidence for begin/present detection) before resetting.
+            if let Some(lg) = self.live_gl.as_mut() {
+                let prev_frame = lg.last_frame_counter;
+                let draws = lg.draw_count_in_frame;
+                if let Some(summary) = lg.take_frame_trace_summary(prev_frame, draws) {
+                    info!(target: "EAPP_GL", "{}", summary);
+                    if lg.lifecycle_reports.len() < lg.lifecycle_report_budget {
+                        lg.lifecycle_reports.push(summary);
+                    }
+                }
                 lg.last_frame_counter = frame;
                 lg.reset_for_frame();
             }
+        }
+
+        // Record this call in the current frame's lifecycle trace.
+        let trace_handle = if matches!(ordinal, 157 | 158 | 165 | 159) {
+            args[0]
+        } else {
+            0
+        };
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.ordinal_trace.push((ordinal, trace_handle));
         }
 
         match ordinal {
@@ -890,9 +909,12 @@ impl Eapp {
             169 => self.live_handle_translate(args),
             159 => self.live_handle_bind_material(args),
             37 => self.live_handle_draw(args),
-            // Lifecycle (157/158/165) already logged in handle_open_gl_import;
-            // ordering is recorded but not acted on.
-            157 | 158 | 165 => {}
+            // Candidate lifecycle from observed live ordering:
+            // 158 always precedes all steady-state draws; 157 always follows.
+            // Neutral names until exact ABI semantics are proven.
+            158 => self.live_handle_candidate_begin(),
+            157 => self.live_handle_candidate_present(),
+            165 => {}
             // Draw-adjacent state ordinals; recorded by observation only.
             175 | 125 | 36 => {}
             // Upload prep/bind ordinals; not required for dimension-based
@@ -900,6 +922,56 @@ impl Eapp {
             45 | 4 => {}
             _ => {
                 // Unknown/unsupported ordinal; fail safe (no panic).
+            }
+        }
+    }
+
+    /// Candidate begin from observed live ordering: ordinal 158 is the first
+    /// surface ordinal and always precedes steady-state draws. Neutral name;
+    /// exact ABI semantics remain unproven.
+    fn live_handle_candidate_begin(&mut self) {
+        let continuous = self
+            .live_gl
+            .as_ref()
+            .map(|lg| lg.continuous_capture)
+            .unwrap_or(false);
+        if !continuous {
+            return; // one-shot diagnostic capture keeps its existing heuristic
+        }
+        if let Some(lg) = self.live_gl.as_mut() {
+            let outcome = lg.begin_frame();
+            if matches!(outcome, live_gl::BeginOutcome::DoubleBegin) {
+                warn!(target: "EAPP_GL", "candidate_begin double-begin detected");
+            }
+        }
+    }
+
+    /// Candidate present from observed live ordering: ordinal 157 is the last
+    /// surface ordinal and always follows steady-state draws. Neutral name;
+    /// exact ABI semantics remain unproven.
+    fn live_handle_candidate_present(&mut self) {
+        let continuous = self
+            .live_gl
+            .as_ref()
+            .map(|lg| lg.continuous_capture)
+            .unwrap_or(false);
+        if !continuous {
+            return; // one-shot diagnostic capture keeps its existing heuristic
+        }
+        let completed = match self.live_gl.as_mut().and_then(|lg| lg.complete_frame()) {
+            Some(frame) => frame,
+            None => {
+                warn!(target: "EAPP_GL", "candidate_present without active frame; discarded");
+                return;
+            }
+        };
+
+        let should_present = completed.draw_count == 4;
+        self.live_log_completed_frame(&completed, should_present);
+        if should_present {
+            self.live_dump_completed_frame();
+            if self.live_gl.as_ref().map(|lg| lg.gate_b).unwrap_or(false) {
+                self.live_present_completed_to_window();
             }
         }
     }
@@ -1048,23 +1120,29 @@ impl Eapp {
             return;
         }
 
-        let (handle, state_ptr, translation, pos_def, uv_def, pos_enabled, uv_enabled, draw_index) =
-            {
-                let lg = match self.live_gl.as_ref() {
-                    Some(lg) => lg,
-                    None => return,
-                };
-                (
-                    lg.current_handle,
-                    lg.current_state_ptr,
-                    lg.translation,
-                    lg.arrays.get(&0).cloned(),
-                    lg.arrays.get(&1).cloned(),
-                    lg.enabled_arrays.contains(&0),
-                    lg.enabled_arrays.contains(&1),
-                    lg.draws.len(),
-                )
+        if let Some(lg) = self.live_gl.as_mut() {
+            if lg.continuous_capture && !lg.frame_active {
+                warn!(target: "EAPP_GL", "draw outside active candidate frame; auto-beginning safely");
+                lg.note_draw_outside_frame();
+            }
+        }
+
+        let (handle, state_ptr, translation, pos_def, uv_def, pos_enabled, uv_enabled, draw_index) = {
+            let lg = match self.live_gl.as_ref() {
+                Some(lg) => lg,
+                None => return,
             };
+            (
+                lg.current_handle,
+                lg.current_state_ptr,
+                lg.translation,
+                lg.arrays.get(&0).cloned(),
+                lg.arrays.get(&1).cloned(),
+                lg.enabled_arrays.contains(&0),
+                lg.enabled_arrays.contains(&1),
+                lg.draws.len(),
+            )
+        };
 
         let positions = match self.live_decode_positions(&pos_def, pos_enabled, translation) {
             Some(p) => p,
@@ -1081,9 +1159,7 @@ impl Eapp {
                     coverage: 0,
                     selected_upload: None,
                     inferred_dim: None,
-                    skipped_reason: Some(
-                        "position array not enabled/valid/GL_FIXED".to_string(),
-                    ),
+                    skipped_reason: Some("position array not enabled/valid/GL_FIXED".to_string()),
                 };
                 warn!(
                     target: "EAPP_GL",
@@ -1110,7 +1186,10 @@ impl Eapp {
             None => return,
         };
 
-        if let Some(reason) = &record.skipped_reason {
+        if let Some(reason) = record.skipped_reason.clone() {
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.note_skipped_draw(reason.clone());
+            }
             warn!(
                 target: "EAPP_GL",
                 "draw{} skipped: {} handle={:#x}",
@@ -1186,23 +1265,21 @@ impl Eapp {
             }
             lg.translation = (0.0, 0.0);
             lg.draw_count_in_frame += 1;
+            if lg.continuous_capture {
+                // Ongoing rendering is driven by the observed 158→157 frame
+                // lifecycle, not by the one-shot repeated-signature heuristic.
+                return;
+            }
             let four_draws = lg.draw_count_in_frame == 4;
             if !four_draws {
                 return;
             }
-            // Steady-state detection: the first consecutive repeat of the
-            // 4-draw handle signature is the stable frame we want to capture
-            // by default. This is evidence-based (observed repetition), not a
-            // hardcoded frame number or filename, and matches the offline
-            // dedup methodology (steady state = repeating signature).
+            // One-shot diagnostic capture only: first consecutive repeat of
+            // the 4-draw handle signature is the stable frame.
             let current_handles: Vec<u32> = lg.draws.iter().map(|d| d.handle).collect();
             let steady = matches!(&lg.prev_draw_handles, Some(prev) if *prev == current_handles);
             lg.prev_draw_handles = Some(current_handles);
-            if lg.continuous_capture {
-                should_capture = true;
-            } else {
-                should_capture = steady && !lg.captured_first_frame;
-            }
+            should_capture = steady && !lg.captured_first_frame;
         } else {
             return;
         }
@@ -1243,6 +1320,112 @@ impl Eapp {
         // Gate B: present to the desktop window only when explicitly enabled.
         if gate_b {
             self.live_present_to_window();
+        }
+    }
+
+    /// Bounded diagnostics for completed continuous frames (first 120 by
+    /// default). Reports candidate begin/end ordering, hashes, repeated-frame
+    /// count, skipped draws, and whether the frame was presented or discarded.
+    fn live_log_completed_frame(&mut self, frame: &live_gl::CompletedFrame, presented: bool) {
+        let Some(lg) = self.live_gl.as_ref() else {
+            return;
+        };
+        if frame.index as usize > lg.diagnostics_budget {
+            if lg.first_changed_frame == Some(frame.index) {
+                info!(
+                    target: "EAPP_GL",
+                    "frame_hash_changed first_change_frame={} presented_hash={:#018x}",
+                    frame.index,
+                    frame.presented_hash
+                );
+            }
+            return;
+        }
+        let begin_seq = lg
+            .ordinal_trace
+            .iter()
+            .position(|(ord, _)| *ord == lg.candidate_begin_ordinal)
+            .map(|idx| idx + 1);
+        let present_seq = lg
+            .ordinal_trace
+            .iter()
+            .rposition(|(ord, _)| *ord == lg.candidate_present_ordinal)
+            .map(|idx| idx + 1);
+        let signature = frame
+            .handle_signature
+            .iter()
+            .map(|h| format!("{:#x}", h))
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            target: "EAPP_GL",
+            "frame_diag idx={} begin={}@{:?} end={}@{:?} draws={} sig=[{}] internal={:#018x} presented={:#018x} repeated={} skipped={} unique_hashes={} status={}",
+            frame.index,
+            lg.candidate_begin_ordinal,
+            begin_seq,
+            lg.candidate_present_ordinal,
+            present_seq,
+            frame.draw_count,
+            signature,
+            frame.internal_hash,
+            frame.presented_hash,
+            lg.repeated_presented_count,
+            frame.skipped_draws,
+            lg.unique_presented_hashes.len(),
+            if presented { "presented" } else { "discarded" }
+        );
+        if !lg.frame_anomalies.is_empty() && frame.index as usize <= 12 {
+            info!(
+                target: "EAPP_GL",
+                "frame_diag anomalies_so_far={} latest={}",
+                lg.frame_anomalies.len(),
+                lg.frame_anomalies.last().unwrap()
+            );
+        }
+        if lg.first_changed_frame == Some(frame.index) {
+            info!(
+                target: "EAPP_GL",
+                "frame_hash_changed first_change_frame={} presented_hash={:#018x}",
+                frame.index,
+                frame.presented_hash
+            );
+        }
+    }
+
+    /// Optional continuous frame dumping (`CLICKY_GL_DUMP_FRAMES=N`). Writes
+    /// only the first N completed presented frames.
+    fn live_dump_completed_frame(&mut self) {
+        let (path, fb) = {
+            let Some(lg) = self.live_gl.as_mut() else {
+                return;
+            };
+            if lg.dump_remaining == 0 {
+                return;
+            }
+            let path = format!("/tmp/tetris_live_frame_{:04}.ppm", lg.dump_counter);
+            lg.dump_counter += 1;
+            lg.dump_remaining -= 1;
+            (path, lg.presented_buffer.clone())
+        };
+        framebuffer_to_ppm(
+            std::path::Path::new(&path),
+            &fb,
+            live_gl::FB_WIDTH,
+            live_gl::FB_HEIGHT,
+        );
+        info!(target: "EAPP_GL", "dumped_completed_frame path={}", path);
+    }
+
+    /// Gate B for continuous rendering: publish the most recent completed
+    /// presented frame to the desktop window under the render-state mutex.
+    fn live_present_completed_to_window(&mut self) {
+        let presented = match self.live_gl.as_ref() {
+            Some(lg) => lg.presented_buffer.clone(),
+            None => return,
+        };
+        let mut frame = self.render_state.lock().unwrap();
+        for (dst, src) in frame.iter_mut().zip(presented.iter()) {
+            *dst = ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
         }
     }
 

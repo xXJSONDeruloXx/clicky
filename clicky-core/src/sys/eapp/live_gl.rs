@@ -74,6 +74,22 @@ pub struct LiveDrawRecord {
     pub skipped_reason: Option<String>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum BeginOutcome {
+    Began,
+    DoubleBegin,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedFrame {
+    pub index: u64,
+    pub draw_count: usize,
+    pub skipped_draws: usize,
+    pub internal_hash: u64,
+    pub presented_hash: u64,
+    pub handle_signature: Vec<u32>,
+}
+
 /// Persistent per-eapp live graphics state, sufficient for the observed
 /// Tetris stream. Stored on `Eapp` only when the experimental flag is set.
 pub struct LiveGlState {
@@ -98,9 +114,44 @@ pub struct LiveGlState {
     /// Tentative lifecycle observations around ordinals 157/158/165. We record
     /// the observed ordering but do not rename them present/begin/end.
     pub lifecycle_log: Vec<String>,
+    /// Ordered (ordinal, handle) trace of GL calls in the current guest frame,
+    /// used to determine the real frame lifecycle (begin/present) from evidence.
+    pub ordinal_trace: Vec<(u32, u32)>,
+    /// Bounded per-frame lifecycle summaries (first N frames) for diagnostics.
+    pub lifecycle_reports: Vec<String>,
+    pub lifecycle_report_budget: usize,
     /// Most recent presented framebuffer (post optional vflip), kept so Gate B
     /// can copy it to the desktop window independently of the internal buffer.
     pub presented: Option<Vec<Rgba8>>,
+    // --- continuous frame assembly (double-buffered) ---
+    /// Last fully-rendered internal frame (copied from `framebuffer` at
+    /// present). The window never reads the active `framebuffer`.
+    pub completed_buffer: Vec<Rgba8>,
+    /// Host-facing presented buffer (completed + optional vflip).
+    pub presented_buffer: Vec<Rgba8>,
+    /// True between candidate begin (158) and present (157).
+    pub frame_active: bool,
+    /// Monotonic count of completed/presented frames.
+    pub completed_frame_index: u64,
+    /// Candidate frame-begin ordinal, derived from observed ordering (always
+    /// precedes all draws). Neutral name; semantics not yet proven.
+    pub candidate_begin_ordinal: u32,
+    /// Candidate frame-present ordinal, derived from observed ordering (always
+    /// follows all draws). Neutral name; semantics not yet proven.
+    pub candidate_present_ordinal: u32,
+    // --- per-frame diagnostics & anomaly detection ---
+    pub skipped_draws_this_frame: usize,
+    pub frame_anomalies: Vec<String>,
+    pub diagnostics_budget: usize,
+    // --- optional continuous frame dumping (CLICKY_GL_DUMP_FRAMES=N) ---
+    pub dump_remaining: usize,
+    pub dump_counter: usize,
+    // --- consecutive-frame hash tracking ---
+    pub first_presented_hash: Option<u64>,
+    pub prev_presented_hash: Option<u64>,
+    pub first_changed_frame: Option<u64>,
+    pub unique_presented_hashes: HashSet<u64>,
+    pub repeated_presented_count: u64,
 }
 
 impl LiveGlState {
@@ -123,6 +174,25 @@ impl LiveGlState {
             last_frame_counter: 0,
             prev_draw_handles: None,
             lifecycle_log: Vec::new(),
+            ordinal_trace: Vec::new(),
+            lifecycle_reports: Vec::new(),
+            lifecycle_report_budget: 120,
+            completed_buffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
+            presented_buffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
+            frame_active: false,
+            completed_frame_index: 0,
+            candidate_begin_ordinal: 158,
+            candidate_present_ordinal: 157,
+            skipped_draws_this_frame: 0,
+            frame_anomalies: Vec::new(),
+            diagnostics_budget: 120,
+            dump_remaining: 0,
+            dump_counter: 0,
+            first_presented_hash: None,
+            prev_presented_hash: None,
+            first_changed_frame: None,
+            unique_presented_hashes: HashSet::new(),
+            repeated_presented_count: 0,
             presented: None,
         }
     }
@@ -137,6 +207,167 @@ impl LiveGlState {
         self.framebuffer = vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS];
         self.draws.clear();
         self.draw_count_in_frame = 0;
+        self.ordinal_trace.clear();
+    }
+
+    /// Format the current frame's ordinal trace into a compact one-line
+    /// summary and drain it. Draw ordinals (37) are annotated with their
+    /// 1-based draw index; surface/material ordinals (157/158/165/159) include
+    /// their handle so begin/present ordering can be read directly.
+    pub fn take_frame_trace_summary(
+        &mut self,
+        frame_index: u64,
+        draw_count: usize,
+    ) -> Option<String> {
+        if self.ordinal_trace.is_empty() {
+            return None;
+        }
+        let mut draw_idx = 0usize;
+        let mut first_surface: Option<u32> = None;
+        let mut last_surface: Option<u32> = None;
+        let mut rendered = String::new();
+        for (ord, handle) in self.ordinal_trace.drain(..) {
+            if matches!(ord, 157 | 158 | 165) {
+                if first_surface.is_none() {
+                    first_surface = Some(ord);
+                }
+                last_surface = Some(ord);
+            }
+            if !rendered.is_empty() {
+                rendered.push(',');
+            }
+            if ord == 37 {
+                draw_idx += 1;
+                rendered.push_str(&format!("37#{}", draw_idx));
+            } else if matches!(ord, 157 | 158 | 165 | 159) {
+                rendered.push_str(&format!("{}(h{:#x})", ord, handle));
+            } else {
+                rendered.push_str(&format!("{}", ord));
+            }
+        }
+        Some(format!(
+            "lifecycle frame={} draws={} first_surface={} last_surface={} trace=[{}]",
+            frame_index,
+            draw_count,
+            first_surface
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "none".into()),
+            last_surface
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "none".into()),
+            rendered
+        ))
+    }
+
+    /// Outcome of a candidate begin event (ordinal 158).
+    pub fn begin_frame(&mut self) -> BeginOutcome {
+        // Stale-state check: arrays should have been cleared by the boundary
+        // reset. If not, the previous frame's array state leaked across.
+        if !self.arrays.is_empty() {
+            self.push_anomaly(format!(
+                "stale_array_state_at_begin ordinal={} leaked_arrays={}",
+                self.candidate_begin_ordinal,
+                self.arrays.len()
+            ));
+        }
+        self.skipped_draws_this_frame = 0;
+        if self.frame_active {
+            // 158 received while a frame is already active → the previous
+            // frame never received a 157 (incomplete / missing present).
+            self.push_anomaly(format!(
+                "incomplete_frame double_begin ordinal={} previous_not_presented draws={}",
+                self.candidate_begin_ordinal,
+                self.draws.len()
+            ));
+            BeginOutcome::DoubleBegin
+        } else {
+            self.frame_active = true;
+            BeginOutcome::Began
+        }
+    }
+
+    /// Finalize the active frame at the candidate present event (ordinal 157).
+    /// Copies active → completed → presented (with optional vflip) and returns
+    /// the completed-frame metadata. Returns None if no frame is active
+    /// (present without begin). The active `framebuffer` is left untouched;
+    /// it is cleared by the next boundary reset / begin.
+    pub fn complete_frame(&mut self) -> Option<CompletedFrame> {
+        if !self.frame_active {
+            self.push_anomaly(format!(
+                "present_without_active_frame ordinal={}",
+                self.candidate_present_ordinal
+            ));
+            return None;
+        }
+        self.frame_active = false;
+        let draw_count = self.draws.len();
+        if draw_count == 0 {
+            self.push_anomaly(format!(
+                "clear_without_draws ordinal={} (present with zero draws)",
+                self.candidate_present_ordinal
+            ));
+        }
+        if draw_count != 0 && draw_count != 4 {
+            self.push_anomaly(format!(
+                "unexpected_draw_count ordinal={} draws={} (steady=4)",
+                self.candidate_present_ordinal, draw_count
+            ));
+        }
+
+        self.completed_buffer.copy_from_slice(&self.framebuffer);
+        let mut presented = self.framebuffer.clone();
+        if self.present_vflip {
+            flip_vertical_in_place(&mut presented, FB_WIDTH, FB_HEIGHT);
+        }
+        self.presented_buffer.copy_from_slice(&presented);
+        self.presented = Some(presented);
+        self.completed_frame_index += 1;
+
+        let internal_hash = framebuffer_hash(&self.completed_buffer);
+        let presented_hash = framebuffer_hash(&self.presented_buffer);
+        let handle_signature: Vec<u32> = self.draws.iter().map(|d| d.handle).collect();
+
+        // Consecutive-frame hash tracking (req 12). A repeated splash is not
+        // treated as broken.
+        if self.first_presented_hash.is_none() {
+            self.first_presented_hash = Some(presented_hash);
+        }
+        if self.prev_presented_hash == Some(presented_hash) {
+            self.repeated_presented_count += 1;
+        } else if self.completed_frame_index > 1 && self.first_changed_frame.is_none() {
+            self.first_changed_frame = Some(self.completed_frame_index);
+        }
+        self.prev_presented_hash = Some(presented_hash);
+        self.unique_presented_hashes.insert(presented_hash);
+
+        Some(CompletedFrame {
+            index: self.completed_frame_index,
+            draw_count,
+            skipped_draws: self.skipped_draws_this_frame,
+            internal_hash,
+            presented_hash,
+            handle_signature,
+        })
+    }
+
+    /// Mark a draw observed while no frame is active (anomaly). Auto-begins so
+    /// rendering continues without crashing.
+    pub fn note_draw_outside_frame(&mut self) {
+        self.push_anomaly("draw_outside_active_frame".to_string());
+        self.frame_active = true;
+    }
+
+    /// Record a skipped draw (e.g. unresolved handle 3).
+    pub fn note_skipped_draw(&mut self, reason: String) {
+        self.skipped_draws_this_frame += 1;
+        self.push_anomaly(format!("skipped_draw {}", reason));
+    }
+
+    fn push_anomaly(&mut self, msg: String) {
+        // Bounded; keep enough to diagnose the first ~120 frames.
+        if self.frame_anomalies.len() < self.diagnostics_budget * 4 {
+            self.frame_anomalies.push(msg);
+        }
     }
 
     /// Build a `LiveGlUpload` from decoded ordinal-99 arguments, copying the
@@ -234,8 +465,7 @@ impl LiveGlState {
             return record;
         };
         let Some(texture) = self.uploads.get(upload_idx).and_then(|u| u.texture.clone()) else {
-            record.skipped_reason =
-                Some(format!("upload #{upload_idx} has no decoded texture"));
+            record.skipped_reason = Some(format!("upload #{upload_idx} has no decoded texture"));
             return record;
         };
 
@@ -307,7 +537,12 @@ fn bounds_for(positions: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
 /// span rounds to the texture dimension.
 fn infer_dims_from_uvs(uvs: &[(f32, f32); 4]) -> (usize, usize) {
     let (min_u, min_v, max_u, max_v) = uvs.iter().fold(
-        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+        (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ),
         |acc, (u, v)| (acc.0.min(*u), acc.1.min(*v), acc.2.max(*u), acc.3.max(*v)),
     );
     let w = (max_u - min_u).round().max(1.0) as usize;
@@ -338,16 +573,8 @@ mod tests {
     #[test]
     fn build_upload_decodes_pixels_and_preserves_dims() {
         let payload = rgb565_2x2();
-        let upload = LiveGlState::build_upload(
-            0,
-            0x0de1,
-            2,
-            2,
-            0x1907,
-            0x8363,
-            0x1000_0000,
-            &payload,
-        );
+        let upload =
+            LiveGlState::build_upload(0, 0x0de1, 2, 2, 0x1907, 0x8363, 0x1000_0000, &payload);
         assert_eq!(upload.format, Some(TextureFormat::Rgb565));
         assert_eq!(upload.width, 2);
         assert_eq!(upload.height, 2);
@@ -410,12 +637,18 @@ mod tests {
         lg.framebuffer[FB_WIDTH * (FB_HEIGHT - 1)] = Rgba8::rgba(0, 0, 255, 255);
         let no_flip = lg.present();
         assert_eq!(no_flip[0], Rgba8::rgba(255, 0, 0, 255));
-        assert_eq!(no_flip[FB_WIDTH * (FB_HEIGHT - 1)], Rgba8::rgba(0, 0, 255, 255));
+        assert_eq!(
+            no_flip[FB_WIDTH * (FB_HEIGHT - 1)],
+            Rgba8::rgba(0, 0, 255, 255)
+        );
 
         lg.present_vflip = true;
         let flipped = lg.present();
         assert_eq!(flipped[0], Rgba8::rgba(0, 0, 255, 255));
-        assert_eq!(flipped[FB_WIDTH * (FB_HEIGHT - 1)], Rgba8::rgba(255, 0, 0, 255));
+        assert_eq!(
+            flipped[FB_WIDTH * (FB_HEIGHT - 1)],
+            Rgba8::rgba(255, 0, 0, 255)
+        );
         // internal buffer is never mutated by presentation
         assert_eq!(lg.framebuffer[0], Rgba8::rgba(255, 0, 0, 255));
     }
@@ -423,12 +656,7 @@ mod tests {
     #[test]
     fn infer_dims_from_texel_centered_uvs() {
         // 50x50 texture: UVs span 0.5..50.5 in both axes
-        let uvs = [
-            (0.5, 0.5),
-            (0.5, -0.5),
-            (50.5, -0.5),
-            (50.5, 49.5),
-        ];
+        let uvs = [(0.5, 0.5), (0.5, -0.5), (50.5, -0.5), (50.5, 49.5)];
         let (w, h) = super::infer_dims_from_uvs(&uvs);
         assert_eq!((w, h), (50, 50));
     }
