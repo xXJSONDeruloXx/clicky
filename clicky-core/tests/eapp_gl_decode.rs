@@ -2,6 +2,7 @@ use clicky_core::sys::eapp::{
     blend_src_over, decode_fixed_16_16, first_frame, framebuffer_hash, framebuffer_to_ppm,
     rasterize_quad, register, sample_nearest, stack_word, texture_upload_candidates,
     words_from_snapshot, GlImportRecord, GlTraceFixture, Rgba8, Texture, TextureFormat,
+    TextureUploadCandidate,
 };
 
 fn load_fixture() -> GlTraceFixture {
@@ -943,4 +944,307 @@ fn frame4_artifact_comparison_and_handle_mapping() {
     assert_eq!(draw4_only.len(), 320 * 240);
     assert_eq!(draw4_alpha_fb.len(), 320 * 240);
     assert_eq!(draw4_opaque_fb.len(), 320 * 240);
+}
+
+// --- Local asset-backed replay helpers -------------------------------------
+//
+// These helpers power the optional, opt-in real-asset frame-4 replay. They
+// never embed commercial asset bytes; payloads are sliced from the user's own
+// local .pix files using the captured upload metadata as the source of truth
+// for dimensions, format, and payload offset.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalAsset {
+    filename: String,
+    file_path: std::path::PathBuf,
+    width: usize,
+    height: usize,
+    format: TextureFormat,
+    payload_offset: usize,
+    payload_size: usize,
+}
+
+fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize {
+    let bytes_per_pixel = match format {
+        TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
+        TextureFormat::A8 => 1,
+    };
+    width * height * bytes_per_pixel
+}
+
+/// Map the captured GL upload constants to the standalone renderer's
+/// `TextureFormat`. Constants are standard GL ES 1.1 enumerants:
+///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906
+///   GL_UNSIGNED_SHORT_5_6_5=0x8363, GL_UNSIGNED_SHORT_5_5_5_1=0x8034,
+///   GL_UNSIGNED_SHORT_4_4_4_4=0x8033, GL_UNSIGNED_BYTE=0x1401
+fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFormat> {
+    match (internal_format, pixel_type) {
+        (0x1907, 0x8363) => Some(TextureFormat::Rgb565),
+        (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
+        (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
+        (0x1906, 0x1401) => Some(TextureFormat::A8),
+        _ => None,
+    }
+}
+
+/// Slice the pixel payload out of a raw .pix file using the captured offset
+/// and the upload-derived dimensions/format. Validates bounds so a truncated
+/// or mismatched file produces a clear error instead of a panic.
+fn extract_pix_payload(
+    file_bytes: &[u8],
+    payload_offset: usize,
+    width: usize,
+    height: usize,
+    format: TextureFormat,
+) -> Result<Vec<u8>, String> {
+    let payload_size = pix_payload_size(format, width, height);
+    let end = payload_offset.checked_add(payload_size).ok_or_else(|| {
+        format!("payload size overflow: offset={payload_offset} size={payload_size}")
+    })?;
+    if end > file_bytes.len() {
+        return Err(format!(
+            "payload bounds exceed file: offset={payload_offset} size={payload_size} file_len={}",
+            file_bytes.len()
+        ));
+    }
+    Ok(file_bytes[payload_offset..end].to_vec())
+}
+
+/// Locate the first upload candidate whose captured source file matches
+/// `filename`. The trace uploads each asset at least once during frame 2.
+fn find_upload_for_file<'a>(
+    uploads: &'a [TextureUploadCandidate],
+    filename: &str,
+) -> Option<&'a TextureUploadCandidate> {
+    uploads.iter().find(|upload| {
+        upload
+            .source_file
+            .as_ref()
+            .map(|file| file.path == filename)
+            .unwrap_or(false)
+    })
+}
+
+/// Load one local .pix asset, extracting the payload using the captured
+/// upload metadata (dimensions, format, and payload offset). Prints
+/// diagnostics for every resolved asset.
+fn load_local_asset(
+    asset_dir: &std::path::Path,
+    uploads: &[TextureUploadCandidate],
+    filename: &str,
+) -> Result<(LocalAsset, Texture), String> {
+    let upload = find_upload_for_file(uploads, filename)
+        .ok_or_else(|| format!("no upload for {filename}"))?;
+    let file_backing = upload
+        .source_file
+        .as_ref()
+        .ok_or_else(|| format!("no file backing for {filename}"))?;
+    let format = format_from_gl(upload.internal_format, upload.pixel_type).ok_or_else(|| {
+        format!(
+            "unsupported format for {filename}: internal={:#x} type={:#x}",
+            upload.internal_format, upload.pixel_type
+        )
+    })?;
+    let width = upload.width as usize;
+    let height = upload.height as usize;
+    // The captured offset is `source_ptr - file_base_addr`, i.e. the byte
+    // offset within the .pix file where the guest told GL the pixels begin.
+    // Do NOT assume a universal header length; trust the captured value.
+    let payload_offset = file_backing.offset as usize;
+    let payload_size = pix_payload_size(format, width, height);
+
+    let file_path = asset_dir.join(&file_backing.path);
+    let file_bytes =
+        std::fs::read(&file_path).map_err(|e| format!("read {}: {e}", file_path.display()))?;
+
+    if file_bytes.len() as u32 != file_backing.len {
+        eprintln!(
+            "warn: {filename} local_len={} differs from captured_len={}; using captured offset/size",
+            file_bytes.len(),
+            file_backing.len
+        );
+    }
+
+    let payload = extract_pix_payload(&file_bytes, payload_offset, width, height, format)?;
+    println!(
+        "asset_resolved file={filename} path={} dimensions={width}x{height} format={format:?} payload_offset={payload_offset} payload_bytes={payload_size} file_bytes={}",
+        file_path.display(),
+        file_bytes.len(),
+    );
+
+    let texture = make_texture(format, width, height, payload);
+    let asset = LocalAsset {
+        filename: filename.to_string(),
+        file_path,
+        width,
+        height,
+        format,
+        payload_offset,
+        payload_size,
+    };
+    Ok((asset, texture))
+}
+
+/// Replace the generated placeholder textures for draws 1-3 with the supplied
+/// local-asset textures, matching each draw by its captured dimensions/format.
+fn apply_local_assets(draws: &mut [DrawReplay], assets: &[LocalAsset], textures: &[Texture]) {
+    for draw in draws.iter_mut().take(3) {
+        let (w, h) = (
+            draw.proposed_texture.width.unwrap_or(0),
+            draw.proposed_texture.height.unwrap_or(0),
+        );
+        if let Some(idx) = assets.iter().position(|asset| {
+            asset.width == w && asset.height == h && asset.format == draw.proposed_texture.format
+        }) {
+            draw.texture = textures[idx].clone();
+        }
+    }
+}
+
+fn render_real_variant_and_write_ppm(
+    name: &str,
+    path: &str,
+    draws: &[DrawReplay],
+    include_draw4: bool,
+) {
+    let fb = render_draws(draws, include_draw4);
+    framebuffer_to_ppm(std::path::Path::new(path), &fb, 320, 240);
+    println!(
+        "artifact={name} output={path} hash={:016x} nonzero={}",
+        framebuffer_hash(&fb),
+        framebuffer_stats(&fb, 320, 240).0,
+    );
+}
+
+/// Opt-in local-asset frame-4 replay. Skipped entirely when
+/// `CLICKY_TETRIS_ASSET_DIR` is absent so the generated-texture deterministic
+/// tests remain the default path. Draw 4 (handle 3) is deliberately kept as an
+/// experimental translucent overlay probe; it is NOT confirmed as a final
+/// visual interpretation.
+#[test]
+fn replay_frame4_with_local_assets_when_requested() {
+    let asset_dir = match std::env::var_os("CLICKY_TETRIS_ASSET_DIR") {
+        Some(value) => std::path::PathBuf::from(value),
+        None => return, // opt-in only
+    };
+
+    let fixture = load_fixture();
+    let uploads = texture_upload_candidates(&fixture);
+
+    let targets = [
+        "screenBG_565.pix",
+        "tetrisLogoT_4444.pix",
+        "eaLogo_5551.pix",
+    ];
+    let mut assets = Vec::new();
+    let mut textures = Vec::new();
+    for filename in targets {
+        let (asset, texture) = load_local_asset(&asset_dir, &uploads, filename)
+            .unwrap_or_else(|err| panic!("load {}: {}", filename, err));
+        assets.push(asset);
+        textures.push(texture);
+    }
+    assert_eq!(assets.len(), 3);
+
+    // draws 1-3 with real textures, draw 4 disabled (no overlay).
+    let (_, mut draws_no_overlay) = replay_frame4();
+    apply_local_assets(&mut draws_no_overlay, &assets, &textures);
+
+    // all draws: draw 4 stays as the current best-fit translucent overlay probe.
+    let (_, mut draws_all) = replay_frame4();
+    apply_local_assets(&mut draws_all, &assets, &textures);
+
+    // explicit alpha-only overlay probe variant for handle 3.
+    let mut draws_alpha = replay_frame4_with_probe(Draw4ProbeMode::AlphaOnly);
+    apply_local_assets(&mut draws_alpha, &assets, &textures);
+
+    println!("overlay_probe_note kind=experimental handle=3 interpretation=unconfirmed");
+
+    render_real_variant_and_write_ppm(
+        "real_draws_1_3",
+        "/tmp/tetris_frame4_real_draws_1_3.ppm",
+        &draws_no_overlay,
+        false,
+    );
+    render_real_variant_and_write_ppm(
+        "real_no_overlay",
+        "/tmp/tetris_frame4_real_no_overlay.ppm",
+        &draws_no_overlay,
+        false,
+    );
+    render_real_variant_and_write_ppm(
+        "real_all_draws",
+        "/tmp/tetris_frame4_real_all_draws.ppm",
+        &draws_all,
+        true,
+    );
+    render_real_variant_and_write_ppm(
+        "real_overlay_alpha",
+        "/tmp/tetris_frame4_real_overlay_alpha.ppm",
+        &draws_alpha,
+        true,
+    );
+}
+
+#[test]
+fn pix_payload_size_matches_format_dimensions() {
+    assert_eq!(
+        pix_payload_size(TextureFormat::Rgb565, 320, 240),
+        320 * 240 * 2
+    );
+    assert_eq!(
+        pix_payload_size(TextureFormat::Rgba5551, 50, 50),
+        50 * 50 * 2
+    );
+    assert_eq!(
+        pix_payload_size(TextureFormat::Rgba4444, 250, 162),
+        250 * 162 * 2
+    );
+    assert_eq!(pix_payload_size(TextureFormat::A8, 784, 20), 784 * 20);
+}
+
+#[test]
+fn format_from_gl_maps_captured_upload_constants() {
+    assert_eq!(format_from_gl(0x1907, 0x8363), Some(TextureFormat::Rgb565));
+    assert_eq!(
+        format_from_gl(0x1908, 0x8034),
+        Some(TextureFormat::Rgba5551)
+    );
+    assert_eq!(
+        format_from_gl(0x1908, 0x8033),
+        Some(TextureFormat::Rgba4444)
+    );
+    assert_eq!(format_from_gl(0x1906, 0x1401), Some(TextureFormat::A8));
+    assert_eq!(format_from_gl(0xdead, 0xbeef), None);
+}
+
+#[test]
+fn extract_pix_payload_slices_validated_region() {
+    // Synthetic .pix: 12-byte fake header, 6 bytes of RGB565 pixels (3 pixels),
+    // 4-byte trailer. Nothing here is a real asset.
+    let mut file = Vec::new();
+    file.extend_from_slice(&[0u8; 12]); // header
+    file.extend_from_slice(&[0x00, 0xf8, 0xe0, 0x07, 0x1f, 0x00]); // 3 rgb565 pixels
+    file.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // trailer
+
+    let payload =
+        extract_pix_payload(&file, 12, 3, 1, TextureFormat::Rgb565).expect("valid region");
+    assert_eq!(payload, vec![0x00, 0xf8, 0xe0, 0x07, 0x1f, 0x00]);
+}
+
+#[test]
+fn extract_pix_payload_rejects_short_files() {
+    let file = vec![0u8; 70 + 10]; // header-sized but payload truncated
+    let err =
+        extract_pix_payload(&file, 70, 50, 50, TextureFormat::Rgba5551).expect_err("should reject");
+    assert!(err.contains("payload bounds exceed file"), "{}", err);
+    assert!(err.contains("file_len=80"));
+}
+
+#[test]
+fn extract_pix_payload_handles_zero_dimensions() {
+    let file = vec![0u8; 8];
+    let payload =
+        extract_pix_payload(&file, 4, 0, 0, TextureFormat::A8).expect("zero-sized payload");
+    assert!(payload.is_empty());
 }
