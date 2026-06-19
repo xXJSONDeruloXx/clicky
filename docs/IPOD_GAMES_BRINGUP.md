@@ -195,14 +195,32 @@ Current observed behavior for **Tetris**:
   - bundle-root assets
   - `Resources/`
   - synthetic writable save files under `.clicky-saves/`
+- the runner now also includes two deliberately-hacky but useful bring-up aids:
+  - a tiny HLE for the game's `svc 0x123456` syscall wrapper so debug/error
+    printing no longer immediately falls into the unmapped exception vector
+  - placeholder resource-slot seeding for a later Tetris-only guest path that
+    was previously dereferencing null entries during menu/resource setup
 - observed imports now include:
   - `miscTBD:0`
   - `miscTBD:1`
+  - `miscTBD:6`
   - `miscTBD:9`
+  - `miscTBD:12`
   - `miscTBD:13`
+  - `miscTBD:14`
   - `InputEvents:0`
   - `Settings:0`
   - `Audio:0`
+  - `Audio:40`
+  - `Audio:43`
+  - `Audio:48`
+  - `Audio:51`
+  - `Audio:52`
+  - `Audio:53`
+  - `Audio:55`
+  - `Audio:56`
+  - `Metadata:62`
+  - `Metadata:134`
   - `OpenGLES:12`
   - `OpenGLES:13`
   - `OpenGLES:35`
@@ -224,10 +242,13 @@ Current observed behavior for **Tetris**:
   - many `.pix` UI/image assets
   - `.wav` audio assets
   - save paths like `prefs.sav` and `game.sav`
-- current blocker is no longer the first import or constructor return; the game
-  now crashes later in real guest code at `0x18013f5c` after the asset-open
-  sequence, likely because later resource/data-loading semantics are still
-  missing beyond the current open-success callback shim
+- with the current bring-up hacks in place, headless Tetris runs now survive at
+  least `20,000,000` cycles without fatal memory exceptions
+- current blocker has moved again: the runner is no longer dying on the first
+  constructor/import path or the first late menu/resource dereference, but it is
+  still missing real file/resource decoding semantics and real audio/runtime ABI
+  behavior, so this is a stability checkpoint rather than a genuinely playable
+  title yet
 
 This is the first meaningful checkpoint for the direct-runtime path.
 

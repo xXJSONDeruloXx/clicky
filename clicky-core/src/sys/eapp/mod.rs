@@ -297,6 +297,11 @@ impl Eapp {
             return Ok(());
         }
 
+        self.maybe_patch_guest_state(pc);
+        if self.handle_guest_svc(pc) {
+            return Ok(());
+        }
+
         let mut mem = MemoryAdapter::new(&mut self.bus);
         self.cpu.step(&mut mem);
         if let Some((access, e)) = mem.exception.take() {
@@ -548,8 +553,90 @@ impl Eapp {
         }
     }
 
+    fn read_guest_u8(&mut self, addr: u32) -> Option<u8> {
+        self.bus.r8(addr).ok()
+    }
+
     fn read_guest_u32(&mut self, addr: u32) -> Option<u32> {
         self.bus.r32(addr).ok()
+    }
+
+    fn write_guest_u32(&mut self, addr: u32, val: u32) -> bool {
+        self.bus.w32(addr, val).is_ok()
+    }
+
+    fn handle_guest_svc(&mut self, pc: u32) -> bool {
+        if self.read_guest_u32(pc) != Some(0xef12_3456) {
+            return false;
+        }
+
+        let call_num = self.cpu.reg_get(self.cpu.mode(), 0);
+        let arg_ptr = self.cpu.reg_get(self.cpu.mode(), 1);
+        match call_num {
+            3 => {
+                let ch = self.read_guest_u8(arg_ptr).unwrap_or_default();
+                debug!(target: "EAPP", "svc: putchar {:?}", ch as char);
+                self.cpu.reg_set(self.cpu.mode(), 0, ch as u32);
+            }
+            1 | 2 | 5 | 6 | 9 | 10 | 12 | 24 => {
+                debug!(target: "EAPP", "svc: call {} arg_ptr={:#010x}", call_num, arg_ptr);
+                self.cpu.reg_set(self.cpu.mode(), 0, 0);
+            }
+            other => {
+                warn!(target: "EAPP", "unhandled guest svc call {} at pc={:#010x}", other, pc);
+                self.cpu.reg_set(self.cpu.mode(), 0, 0);
+            }
+        }
+
+        self.cpu
+            .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
+        true
+    }
+
+    fn maybe_patch_guest_state(&mut self, pc: u32) {
+        if self.metadata.title != "66666" {
+            return;
+        }
+        if !(0x18013d4c..=0x18014020).contains(&pc) {
+            return;
+        }
+
+        let owner = match self.cpu.reg_get(self.cpu.mode(), 9) {
+            0 => return,
+            addr => addr,
+        };
+        let array = match self.read_guest_u32(owner.wrapping_add(8)) {
+            Some(0) | None => return,
+            Some(addr) => addr,
+        };
+
+        let mut patched = 0;
+        for idx in 20..=37u32 {
+            let slot_addr = array.wrapping_add(idx * 4);
+            if self.read_guest_u32(slot_addr).unwrap_or(0) != 0 {
+                continue;
+            }
+            let entry = self.alloc_zeroed(0x20);
+            let payload = self.alloc_zeroed(0x200);
+            if entry == 0 || payload == 0 {
+                break;
+            }
+            if !self.write_guest_u32(slot_addr, entry) {
+                break;
+            }
+            let _ = self.write_guest_u32(entry.wrapping_add(8), payload);
+            patched += 1;
+        }
+
+        if patched > 0 {
+            warn!(
+                target: "EAPP",
+                "patched {} placeholder Tetris resource slots at owner={:#010x} array={:#010x}",
+                patched,
+                owner,
+                array
+            );
+        }
     }
 
     fn resolve_bundle_path(&self, path: &str) -> Option<PathBuf> {
