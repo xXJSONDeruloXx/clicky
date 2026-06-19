@@ -330,19 +330,34 @@ Optional inspection artifact:
 
 ### Orientation investigation (local real assets)
 
-The real-asset replay was tested against the extracted `Games_RO/66666` .pix files with six shared-orientation variants. The captured UV evidence for draw 3 is consistent with a global vertical-origin mismatch: values like `v = 49.5` and `v = -0.5` map to rows `49` and `0` under the current top-down sampler, while the vertical normalization `v' = height - v` swaps them to `0.5` and `50.5` (which clamp to rows `0` and `49` respectively).
+The real-asset replay was tested against the extracted `Games_RO/66666` .pix files with separate texture and screen-space variants. The current trace geometry reads as:
+
+- draw 2 / handle 14: translation `(42.5, 76.0)`, current bounds `(42.5,76.0)–(277.5,238.0)`
+- draw 3 / handle 27: translation `(235.0, 79.0)`, current bounds `(235.0,79.0)–(285.0,129.0)`
+
+Mirroring the framebuffer/presentation origin moves those to:
+
+- draw 2: `(42.5,2.0)–(277.5,164.0)`
+- draw 3: `(235.0,111.0)–(285.0,161.0)`
+
+That mirrored layout matches the splash composition better than the unflipped output. The per-vertex and rectangle-aware Y transforms reach the same mirrored bounds, but they remain geometry questions, not texture-row questions. I found no explicit viewport/projection state in the offline replay path, so the coordinate-system evidence still stops at screen-space positioning.
 
 ```text
-current           = 0xaae9cac7ffba5133
-texture_vflip     = 0x868dea7c858c11b2
-uv_vflip          = 0xd6264f7a5e9d0156
-framebuffer_vflip = 0xce8b5d920ca880cb
-hflip_control     = 0xac56d21fe8cbd5bd
-both_axis_control = 0xebcfdc66fa6b385d
-best_orientation   = 0x868dea7c858c11b2
+current                         = 0xaae9cac7ffba5133
+screen_origin_best              = 0xce8b5d920ca880cb
+no_texture_framebuffer_vflip     = 0xce8b5d920ca880cb
+per_vertex_screen_y_flip         = 0xc3c9d9654c08b738
+rectangle_aware_screen_y_flip    = 0xf02275af7682e89d
+texture_vflip_no_framebuffer     = 0x868dea7c858c11b2
+texture_vflip_framebuffer_vflip  = 0x9fc1e1d7e21b8982
+uv_vflip_framebuffer_vflip       = 0x13fdb28d17a78bf2
+hflip_control                    = 0xac56d21fe8cbd5bd
+both_axis_control                = 0xebcfdc66fa6b385d
 ```
 
-Selected convention: **vertical texture-row normalization at local asset load** (`texture_vflip`). It keeps the reusable rasterizer unchanged, preserves the generated-texture deterministic tests, and matches the GL-style captured UVs better than the display-only/framebuffer control variants.
+Selected texture convention: **current row order preserved** (do not bake row inversion into local asset loading yet).
+
+Selected screen-space convention: **framebuffer presentation flip / PPM-output flip** for the offline replay diagnostics.
 
 ### Unresolved-state list
 

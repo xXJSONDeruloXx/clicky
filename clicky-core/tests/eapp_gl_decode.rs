@@ -1262,6 +1262,14 @@ enum OrientationVariant {
     BothAxisControl,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ScreenSpaceVariant {
+    Current,
+    PresentationFlip,
+    PerVertexYFlip,
+    RectangleAwareYFlip,
+}
+
 fn flip_v_for_height(v: f32, height: usize) -> f32 {
     height as f32 - v
 }
@@ -1307,6 +1315,62 @@ fn flip_draw_uvs_vertical(draw: &mut DrawReplay) {
         *v = flip_v_for_height(*v, height);
         let _ = u;
     }
+}
+
+fn flip_framebuffer_vertical_in_place(fb: &mut [Rgba8], width: usize, height: usize) {
+    let mut flipped = vec![Rgba8::rgba(0, 0, 0, 0); width * height];
+    for y in 0..height {
+        let src = &fb[y * width..(y + 1) * width];
+        let dst_y = height - 1 - y;
+        flipped[dst_y * width..(dst_y + 1) * width].copy_from_slice(src);
+    }
+    fb.copy_from_slice(&flipped);
+}
+
+fn bounds_for_positions(positions: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    positions.iter().fold(
+        (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ),
+        |acc, (x, y)| (acc.0.min(*x), acc.1.min(*y), acc.2.max(*x), acc.3.max(*y)),
+    )
+}
+
+fn format_positions(positions: &[(f32, f32); 4]) -> String {
+    positions
+        .iter()
+        .map(|(x, y)| format!("({x:.1},{y:.1})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn flip_positions_vertical_per_vertex(
+    positions: &[(f32, f32); 4],
+    framebuffer_height: usize,
+) -> [(f32, f32); 4] {
+    let height = framebuffer_height as f32;
+    [
+        (positions[0].0, height - positions[0].1),
+        (positions[1].0, height - positions[1].1),
+        (positions[2].0, height - positions[2].1),
+        (positions[3].0, height - positions[3].1),
+    ]
+}
+
+fn flip_positions_vertical_rectangle_aware(
+    draw: &DrawReplay,
+    framebuffer_height: usize,
+) -> [(f32, f32); 4] {
+    let delta = framebuffer_height as f32 - (draw.screen_bounds.1 + draw.screen_bounds.3);
+    [
+        (draw.local_positions[0].0, draw.local_positions[0].1 + delta),
+        (draw.local_positions[1].0, draw.local_positions[1].1 + delta),
+        (draw.local_positions[2].0, draw.local_positions[2].1 + delta),
+        (draw.local_positions[3].0, draw.local_positions[3].1 + delta),
+    ]
 }
 
 fn render_orientation_variant(draws: &[DrawReplay], variant: OrientationVariant) -> Vec<Rgba8> {
@@ -1358,6 +1422,68 @@ fn write_orientation_artifact(name: &str, path: &str, fb: &[Rgba8]) {
         "orientation_artifact={name} output={path} hash={:016x}",
         framebuffer_hash(fb)
     );
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum TextureOrientationVariant {
+    Current,
+    TextureVFlip,
+    UvVFlip,
+}
+
+fn render_texture_and_screen_variant(
+    draws: &[DrawReplay],
+    texture_variant: TextureOrientationVariant,
+    screen_variant: ScreenSpaceVariant,
+) -> Vec<Rgba8> {
+    let mut variant_draws = draws.to_vec();
+    match texture_variant {
+        TextureOrientationVariant::Current => {}
+        TextureOrientationVariant::TextureVFlip => {
+            for draw in &mut variant_draws {
+                draw.texture = flip_texture_vertical(&draw.texture);
+            }
+        }
+        TextureOrientationVariant::UvVFlip => {
+            for draw in &mut variant_draws {
+                flip_draw_uvs_vertical(draw);
+            }
+        }
+    }
+
+    match screen_variant {
+        ScreenSpaceVariant::Current | ScreenSpaceVariant::PresentationFlip => {}
+        ScreenSpaceVariant::PerVertexYFlip => {
+            for draw in &mut variant_draws {
+                draw.local_positions =
+                    flip_positions_vertical_per_vertex(&draw.local_positions, 240);
+                draw.screen_bounds = bounds_for_positions(&draw.local_positions);
+            }
+        }
+        ScreenSpaceVariant::RectangleAwareYFlip => {
+            for draw in &mut variant_draws {
+                draw.local_positions = flip_positions_vertical_rectangle_aware(draw, 240);
+                draw.screen_bounds = bounds_for_positions(&draw.local_positions);
+            }
+        }
+    }
+
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+    for draw in &variant_draws {
+        draw.rasterize(&mut fb);
+    }
+    if matches!(screen_variant, ScreenSpaceVariant::PresentationFlip) {
+        flip_framebuffer_vertical_in_place(&mut fb, 320, 240);
+    }
+    fb
+}
+
+fn screen_bounds_after_vertical_flip(
+    bounds: (f32, f32, f32, f32),
+    framebuffer_height: usize,
+) -> (f32, f32, f32, f32) {
+    let height = framebuffer_height as f32;
+    (bounds.0, height - bounds.3, bounds.2, height - bounds.1)
 }
 
 #[test]
@@ -1436,6 +1562,59 @@ fn orientation_helpers_respect_corner_markers_and_global_vertical_origin() {
 }
 
 #[test]
+fn screen_space_origin_and_serialization_flips_are_separate_from_texture_orientation() {
+    let mut current_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4 * 6];
+    current_fb[0] = Rgba8::rgba(255, 0, 0, 255);
+    current_fb[1] = Rgba8::rgba(0, 255, 0, 255);
+    current_fb[4 * 5] = Rgba8::rgba(0, 0, 255, 255);
+    current_fb[4 * 5 + 1] = Rgba8::rgba(255, 255, 255, 255);
+
+    let mut presentation_fb = current_fb.clone();
+    flip_framebuffer_vertical_in_place(&mut presentation_fb, 4, 6);
+    assert_eq!(presentation_fb[0], Rgba8::rgba(0, 0, 255, 255));
+    assert_eq!(presentation_fb[1], Rgba8::rgba(255, 255, 255, 255));
+    assert_eq!(presentation_fb[4 * 5], Rgba8::rgba(255, 0, 0, 255));
+    assert_eq!(presentation_fb[4 * 5 + 1], Rgba8::rgba(0, 255, 0, 255));
+
+    let quad = [(0.5, 0.5), (0.5, 2.5), (2.5, 2.5), (2.5, 0.5)];
+    let draw = DrawReplay {
+        ordinal159_handle: 1,
+        state_ptr: 2,
+        translation: (0.0, 0.0),
+        local_positions: quad,
+        uv_or_aux: vec![(0.5, 0.5); 4],
+        aux_array: None,
+        screen_bounds: bounds_for_positions(&quad),
+        proposed_texture: ProposedTexture::unresolved(
+            "screen-space probe",
+            "screen-space probe",
+            TextureFormat::Rgb565,
+            1.0,
+        ),
+        texture: Texture::from_bytes(
+            &[0x00, 0xf8],
+            1,
+            1,
+            TextureFormat::Rgb565,
+            Rgba8::rgba(255, 255, 255, 255),
+        ),
+        coverage: 0,
+    };
+
+    let per_vertex_positions = flip_positions_vertical_per_vertex(&draw.local_positions, 6);
+    let rect_aware_positions = flip_positions_vertical_rectangle_aware(&draw, 6);
+    assert_ne!(per_vertex_positions, rect_aware_positions);
+    assert_eq!(
+        bounds_for_positions(&per_vertex_positions),
+        bounds_for_positions(&rect_aware_positions)
+    );
+    assert_eq!(
+        screen_bounds_after_vertical_flip(draw.screen_bounds, 6),
+        bounds_for_positions(&per_vertex_positions)
+    );
+}
+
+#[test]
 fn replay_frame4_real_asset_orientation_when_requested() {
     let asset_dir = match std::env::var_os("CLICKY_TETRIS_ASSET_DIR") {
         Some(value) => std::path::PathBuf::from(value),
@@ -1462,34 +1641,129 @@ fn replay_frame4_real_asset_orientation_when_requested() {
     let (_, mut current_draws) = replay_frame4();
     apply_local_assets(&mut current_draws, &assets, &textures);
 
-    let current_fb = render_orientation_variant(&current_draws, OrientationVariant::Current);
+    if std::env::var_os("CLICKY_PRINT_FRAME4_ORIENTATION_GEOMETRY").is_some() {
+        println!("orientation_geometry screen_height=240 note=origin-convention-is-still-under-investigation");
+        for (idx, draw) in current_draws.iter().enumerate() {
+            let per_vertex_positions =
+                flip_positions_vertical_per_vertex(&draw.local_positions, 240);
+            let rect_aware_positions = flip_positions_vertical_rectangle_aware(draw, 240);
+            let current_bounds = draw.screen_bounds;
+            let presentation_bounds = screen_bounds_after_vertical_flip(current_bounds, 240);
+            println!(
+                "  draw{} handle={} translation=({:.1},{:.1}) current_positions=[{}] current_bounds=({:.1},{:.1})-({:.1},{:.1}) presentation_flip_bounds=({:.1},{:.1})-({:.1},{:.1}) per_vertex_positions=[{}] per_vertex_bounds=({:.1},{:.1})-({:.1},{:.1}) rect_aware_positions=[{}] rect_aware_bounds=({:.1},{:.1})-({:.1},{:.1})",
+                idx + 1,
+                draw.ordinal159_handle,
+                draw.translation.0,
+                draw.translation.1,
+                format_positions(&draw.local_positions),
+                current_bounds.0,
+                current_bounds.1,
+                current_bounds.2,
+                current_bounds.3,
+                presentation_bounds.0,
+                presentation_bounds.1,
+                presentation_bounds.2,
+                presentation_bounds.3,
+                format_positions(&per_vertex_positions),
+                bounds_for_positions(&per_vertex_positions).0,
+                bounds_for_positions(&per_vertex_positions).1,
+                bounds_for_positions(&per_vertex_positions).2,
+                bounds_for_positions(&per_vertex_positions).3,
+                format_positions(&rect_aware_positions),
+                bounds_for_positions(&rect_aware_positions).0,
+                bounds_for_positions(&rect_aware_positions).1,
+                bounds_for_positions(&rect_aware_positions).2,
+                bounds_for_positions(&rect_aware_positions).3,
+            );
+        }
+        println!("  texture_convention=current_row_order (not baked in)");
+        println!(
+            "  screen_space_convention=framebuffer_presentation_flip (not a vertex transform)"
+        );
+    }
+
+    let current_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::Current,
+        ScreenSpaceVariant::Current,
+    );
     write_orientation_artifact(
         "current",
         "/tmp/tetris_frame4_real_orientation_current.ppm",
         &current_fb,
     );
 
-    let texture_vflip_fb =
-        render_orientation_variant(&current_draws, OrientationVariant::TextureVFlip);
+    let screen_origin_best_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::Current,
+        ScreenSpaceVariant::PresentationFlip,
+    );
     write_orientation_artifact(
-        "texture_vflip",
-        "/tmp/tetris_frame4_real_orientation_texture_vflip.ppm",
+        "screen_origin_best",
+        "/tmp/tetris_frame4_orientation_screen_origin_best.ppm",
+        &screen_origin_best_fb,
+    );
+
+    let current_texture_screen_flip_fb = screen_origin_best_fb.clone();
+    write_orientation_artifact(
+        "no_texture_framebuffer_vflip",
+        "/tmp/tetris_frame4_orientation_no_texture_framebuffer_vflip.ppm",
+        &current_texture_screen_flip_fb,
+    );
+
+    let per_vertex_screen_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::Current,
+        ScreenSpaceVariant::PerVertexYFlip,
+    );
+    write_orientation_artifact(
+        "per_vertex_screen_y_flip",
+        "/tmp/tetris_frame4_orientation_per_vertex_screen_y_flip.ppm",
+        &per_vertex_screen_fb,
+    );
+
+    let rect_aware_screen_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::Current,
+        ScreenSpaceVariant::RectangleAwareYFlip,
+    );
+    write_orientation_artifact(
+        "rectangle_aware_screen_y_flip",
+        "/tmp/tetris_frame4_orientation_rectangle_aware_screen_y_flip.ppm",
+        &rect_aware_screen_fb,
+    );
+
+    let texture_vflip_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::TextureVFlip,
+        ScreenSpaceVariant::Current,
+    );
+    write_orientation_artifact(
+        "texture_vflip_no_framebuffer",
+        "/tmp/tetris_frame4_orientation_texture_vflip_no_framebuffer.ppm",
         &texture_vflip_fb,
     );
 
-    let uv_vflip_fb = render_orientation_variant(&current_draws, OrientationVariant::UvVFlip);
+    let texture_vflip_framebuffer_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::TextureVFlip,
+        ScreenSpaceVariant::PresentationFlip,
+    );
     write_orientation_artifact(
-        "uv_vflip",
-        "/tmp/tetris_frame4_real_orientation_uv_vflip.ppm",
-        &uv_vflip_fb,
+        "texture_vflip_framebuffer_vflip",
+        "/tmp/tetris_frame4_orientation_texture_vflip_framebuffer_vflip.ppm",
+        &texture_vflip_framebuffer_fb,
     );
 
-    let framebuffer_vflip_fb =
-        render_orientation_variant(&current_draws, OrientationVariant::FramebufferVFlip);
+    let uv_vflip_framebuffer_fb = render_texture_and_screen_variant(
+        &current_draws,
+        TextureOrientationVariant::UvVFlip,
+        ScreenSpaceVariant::PresentationFlip,
+    );
     write_orientation_artifact(
-        "framebuffer_vflip",
-        "/tmp/tetris_frame4_real_orientation_framebuffer_vflip.ppm",
-        &framebuffer_vflip_fb,
+        "uv_vflip_framebuffer_vflip",
+        "/tmp/tetris_frame4_orientation_uv_vflip_framebuffer_vflip.ppm",
+        &uv_vflip_framebuffer_fb,
     );
 
     let hflip_control_fb =
@@ -1508,39 +1782,10 @@ fn replay_frame4_real_asset_orientation_when_requested() {
         &both_axis_fb,
     );
 
-    let best_fb = texture_vflip_fb.clone();
-    write_orientation_artifact(
-        "best_orientation",
-        "/tmp/tetris_frame4_real_best_orientation.ppm",
-        &best_fb,
-    );
-
-    assert_ne!(
-        framebuffer_hash(&current_fb),
-        framebuffer_hash(&texture_vflip_fb)
-    );
-    assert_ne!(
-        framebuffer_hash(&current_fb),
-        framebuffer_hash(&uv_vflip_fb)
-    );
-    assert_ne!(
-        framebuffer_hash(&current_fb),
-        framebuffer_hash(&framebuffer_vflip_fb)
-    );
-    assert_ne!(
-        framebuffer_hash(&current_fb),
-        framebuffer_hash(&hflip_control_fb)
-    );
-    assert_ne!(
-        framebuffer_hash(&current_fb),
-        framebuffer_hash(&both_axis_fb)
-    );
-    assert_ne!(
-        framebuffer_hash(&texture_vflip_fb),
-        framebuffer_hash(&uv_vflip_fb)
-    );
-    assert_eq!(
-        framebuffer_hash(&best_fb),
-        framebuffer_hash(&texture_vflip_fb)
-    );
+    assert_ne!(current_fb, screen_origin_best_fb);
+    assert_ne!(current_fb, texture_vflip_fb);
+    assert_ne!(current_fb, texture_vflip_framebuffer_fb);
+    assert_ne!(current_fb, uv_vflip_framebuffer_fb);
+    assert_ne!(texture_vflip_fb, texture_vflip_framebuffer_fb);
+    assert_ne!(texture_vflip_framebuffer_fb, uv_vflip_framebuffer_fb);
 }
