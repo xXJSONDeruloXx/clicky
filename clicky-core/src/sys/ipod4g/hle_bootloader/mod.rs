@@ -65,8 +65,11 @@ pub(super) fn run_hle_bootloader(
     // until it parks itself via COP_CTRL. This seeds the COP memory-controller
     // mapping and leaves its PC at the post-wake path without racing the CPU
     // through the rest of OS init.
+    let mut cop_steps: u32 = 0;
+    let mut parked_early = false;
     for _ in 0..10_000 {
         if !ipod.devices.cpucon.is_cpu_running(CpuId::Cop) {
+            parked_early = true;
             break;
         }
 
@@ -76,10 +79,21 @@ pub(super) fn run_hle_bootloader(
 
         let mut mem = MemoryAdapter::new(&mut ipod.devices);
         ipod.cop.step(&mut mem);
-        if let Some((access, e)) = mem.exception.take() {
+        let exc = mem.exception.take();
+        drop(mem);
+        cop_steps += 1;
+        if let Some((access, e)) = exc {
             warn!("COP HLE preflight memory exception: {:?}: {:?}", access, e);
         }
     }
+    let cop_pc_after = ipod.cop.reg_get(ArmMode::User, reg::PC);
+    info!(
+        "COP HLE preflight: ran {} steps, parked_at={:#010x}, parked_early={}, running={}",
+        cop_steps,
+        cop_pc_after,
+        parked_early,
+        ipod.devices.cpucon.is_cpu_running(CpuId::Cop)
+    );
 
     ipod.devices.cpuid.set_cpuid(CpuId::Cpu);
     ipod.devices.memcon.set_cpuid(CpuId::Cpu);

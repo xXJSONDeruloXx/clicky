@@ -84,17 +84,41 @@ struct Watchdog {
     last_cpu_pc: u32,
     last_cop_pc: u32,
     fired: bool,
+    /// Optional periodic PC sampler cadence (env `CLICKY_SAMPLE_MS`).
+    sample_every: Option<std::time::Duration>,
+    last_sample: std::time::Instant,
+    /// Recent (cpu_pc, cop_pc) pairs for tight-loop detection.
+    pc_history: std::collections::VecDeque<(u32, u32)>,
 }
+
+const WATCHDOG_HISTORY: usize = 256;
+const WATCHDOG_LOOP_RADIUS: u32 = 0x80;
 
 impl Watchdog {
     fn from_env() -> Option<Watchdog> {
-        let ms: u64 = std::env::var("CLICKY_WATCHDOG_MS").ok()?.parse().ok()?;
+        let wd_ms: Option<u64> = std::env::var("CLICKY_WATCHDOG_MS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let sample_ms: Option<u64> = std::env::var("CLICKY_SAMPLE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        // Activate if either the stall detector or the sampler is requested.
+        // If only the sampler is on, use an effectively-infinite threshold so
+        // the stall detector never fires.
+        let activate = wd_ms.is_some() || sample_ms.is_some();
+        if !activate {
+            return None;
+        }
+        let now = std::time::Instant::now();
         Some(Watchdog {
-            threshold: std::time::Duration::from_millis(ms),
-            last_progress: std::time::Instant::now(),
+            threshold: std::time::Duration::from_millis(wd_ms.unwrap_or(u64::MAX / 2)),
+            last_progress: now,
             last_cpu_pc: 0,
             last_cop_pc: 0,
             fired: false,
+            sample_every: sample_ms.map(std::time::Duration::from_millis),
+            last_sample: now,
+            pc_history: std::collections::VecDeque::new(),
         })
     }
 }
@@ -143,6 +167,13 @@ impl Ipod4g {
 
             watchdog: Watchdog::from_env(),
         };
+
+        if let Some(w) = &sys.watchdog {
+            eprintln!(
+                "[watchdog] active: threshold={:?}, sample_every={:?}",
+                w.threshold, w.sample_every
+            );
+        }
 
         // connect HDD
         sys.devices
@@ -199,8 +230,56 @@ impl Ipod4g {
         let now = std::time::Instant::now();
         let cpu_pc = self.cpu.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::PC);
         let cop_pc = self.cop.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::PC);
+        let cpu_cpsr = self.cpu.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::CPSR);
+        let cop_cpsr = self.cop.reg_get(armv4t_emu::Mode::User, armv4t_emu::reg::CPSR);
+        let cpu_r: [u32; 4] = [
+            self.cpu.reg_get(armv4t_emu::Mode::User, 0),
+            self.cpu.reg_get(armv4t_emu::Mode::User, 1),
+            self.cpu.reg_get(armv4t_emu::Mode::User, 2),
+            self.cpu.reg_get(armv4t_emu::Mode::User, 3),
+        ];
+        let cpu_run = self.devices.cpucon.is_cpu_running(CpuId::Cpu);
+        let cop_run = self.devices.cpucon.is_cpu_running(CpuId::Cop);
 
-        if cpu_pc != w.last_cpu_pc || cop_pc != w.last_cop_pc {
+        // Periodic PC sampler (independent of stall detection).
+        if let Some(cadence) = w.sample_every {
+            if now.duration_since(w.last_sample) >= cadence {
+                w.last_sample = now;
+                eprintln!(
+                    "[watchdog] SAMPLE cpu_pc={:#010x} (cpsr={:#010x},run={}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} | cop_pc={:#010x} (cpsr={:#010x},run={})",
+                    cpu_pc, cpu_cpsr, cpu_run, cpu_r[0], cpu_r[1], cpu_r[2], cpu_r[3],
+                    cop_pc, cop_cpsr, cop_run
+                );
+            }
+        }
+
+        // Track PC history to detect tight-loop stalls. Count distinct 64KB
+        // pages visited by each core; if both cores stay within a tiny set of
+        // pages over the whole window, the guest is busy-waiting.
+        w.pc_history.push_back((cpu_pc, cop_pc));
+        if w.pc_history.len() > WATCHDOG_HISTORY {
+            w.pc_history.pop_front();
+        }
+        let tight_loop = if w.pc_history.len() == WATCHDOG_HISTORY {
+            use std::collections::HashSet;
+            let cpu_pages: HashSet<u32> =
+                w.pc_history.iter().map(|&(p, _)| p >> 16).collect();
+            let cop_pages: HashSet<u32> =
+                w.pc_history.iter().map(|&(_, p)| p >> 16).collect();
+            // Allow the loop to call into a couple of helper pages (e.g. an
+            // IDE handler) while still being recognized as stuck.
+            !cpu_pages.is_empty()
+                && cpu_pages.len() <= 3
+                && cop_pages.len() <= 3
+        } else {
+            false
+        };
+
+        // `progressing` is false only when the guest is in a tight loop (or
+        // exact-PC stall). PC movement inside the loop does NOT count as
+        // progress; only escaping to a new region resets the timer.
+        let progressing = !tight_loop;
+        if progressing {
             w.last_cpu_pc = cpu_pc;
             w.last_cop_pc = cop_pc;
             w.last_progress = now;
@@ -221,8 +300,22 @@ impl Ipod4g {
                     name, r[15], r[13], r[14], cpsr, r[0], r[1], r[2], r[3]
                 )
             };
-            error!("WATCHDOG: guest appears hung. {}", dump_regs("CPU", &self.cpu));
-            error!("WATCHDOG: {}", dump_regs("COP", &self.cop));
+            eprintln!("[watchdog] HUNG CPU {}", dump_regs("CPU", &self.cpu));
+            eprintln!("[watchdog] HUNG COP {}", dump_regs("COP", &self.cop));
+            // Dump the live instructions around each core's PC by reading
+            // through the system bus (this applies memcon translation, so it
+            // reflects what the CPU actually executes, not the raw mapping).
+            for (name, pc) in [("CPU", cpu_pc), ("COP", cop_pc)] {
+                let mut words = Vec::with_capacity(32);
+                for i in 0..32 {
+                    let addr = pc.wrapping_sub(32).wrapping_add(i * 4);
+                    match self.devices.r32(addr) {
+                        Ok(v) => words.push(format!("{:#010x}:{:08x}", addr, v)),
+                        Err(_) => words.push(format!("{:#010x}:<err>", addr)),
+                    }
+                }
+                eprintln!("[watchdog] {} code: {}", name, words.join(" "));
+            }
             w.last_progress = now;
         }
     }

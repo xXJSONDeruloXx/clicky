@@ -44,7 +44,34 @@ This matches the expected split between platform interrupt acknowledgement and A
 Down, Down, Action
 ```
 
-The synthetic button presses are held across UI frames so the emulated CPU can sample them reliably.
+The synthetic button presses are held across UI frames so the emulated CPU can sample them reliably. Note this is wall-clock based and races the full-speed emulator thread; for ZeroSlackr the preferred approach is now `default=4` auto-boot in `loader.cfg` (see `docs/IPOD_LINUX_BRINGUP.md`).
+
+## Hang watchdog / PC sampler (bring-up diagnostics)
+
+Two env-gated probes were added to `Ipod4g::step` to diagnose boot hangs
+without a GDB session. Both are completely inert unless their env var is set:
+
+- `CLICKY_WATCHDOG_MS=<ms>` - stall detector. It tracks recent (cpu_pc, cop_pc)
+  pairs; if both cores stay within a small set of 64KB pages for `<ms>` host
+  wall-clock time, it prints a one-shot dump of both cores' registers and the
+  live instructions around each PC (read through the system bus, so memcon
+  translation is applied and the dump reflects what the CPU actually executes).
+- `CLICKY_SAMPLE_MS=<ms>` - independent periodic sampler that logs both cores'
+  PC, CPSR, running-state, and r0-r3. Useful for watching boot trajectory and
+  marching pointers.
+
+A `ctl_raw(cpu)` getter was added to `CpuCon` to read the raw CPU/COP control
+word for diagnostics.
+
+## COP park model (confirmed)
+
+The HLE bootloader runs the COP from the kernel entry until it parks itself via
+`COP_CTL = PROC_SLEEP (0x80000000)`. For the ZeroSlackr prebuilt kernel the COP
+parks inside the kernel's own trampoline (a `ldr pc,[pc,#...]` wake stub, one
+instruction past the `COP_CTL` sleep write), which is exactly where real
+hardware resumes it. The COP is not woken through the mailbox `COP_QUEUE`
+registers on this code path (those writes are stubbed but are not required for
+the observed boot).
 
 ## Validation
 

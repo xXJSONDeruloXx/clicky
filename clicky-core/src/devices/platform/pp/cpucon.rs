@@ -84,6 +84,14 @@ impl CpuCon {
         cpuctl.load(Ordering::SeqCst).get_bits(flags::FLOW_MASK) == 0
     }
 
+    /// Raw control-word value for diagnostics.
+    pub fn ctl_raw(&self, cpu: CpuId) -> u32 {
+        match cpu {
+            CpuId::Cpu => self.cpuctl.load(Ordering::SeqCst),
+            CpuId::Cop => self.copctl.load(Ordering::SeqCst),
+        }
+    }
+
     pub fn wake_on_interrupt(&mut self, cpu: CpuId) {
         let cpuctl = match cpu {
             CpuId::Cpu => &self.cpuctl,
