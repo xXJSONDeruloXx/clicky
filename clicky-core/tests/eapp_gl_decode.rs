@@ -8,9 +8,7 @@ fn load_fixture() -> GlTraceFixture {
         .expect("valid trace fixture json")
 }
 
-fn make_test_rgba5551_texture() -> Vec<u8> {
-    let width = 50usize;
-    let height = 50usize;
+fn make_test_rgba5551_texture(width: usize, height: usize) -> Vec<u8> {
     let mut raw = Vec::with_capacity(width * height * 2);
     for y in 0..height {
         for x in 0..width {
@@ -133,14 +131,14 @@ fn rasterize_triangle(
     }
 }
 
-fn render_quad(
+fn render_quad_into(
+    fb: &mut [u32],
     tex: &[u32],
     tex_width: usize,
     tex_height: usize,
     positions: &[(f32, f32)],
     uvs: &[(f32, f32)],
-) -> Vec<u32> {
-    let mut fb = vec![0u32; 320 * 240];
+) {
     let tri0 = [
         (positions[0].0, positions[0].1, uvs[0].0, uvs[0].1),
         (positions[1].0, positions[1].1, uvs[1].0, uvs[1].1),
@@ -151,8 +149,15 @@ fn render_quad(
         (positions[2].0, positions[2].1, uvs[2].0, uvs[2].1),
         (positions[3].0, positions[3].1, uvs[3].0, uvs[3].1),
     ];
-    rasterize_triangle(&mut fb, 320, 240, tex, tex_width, tex_height, &tri0);
-    rasterize_triangle(&mut fb, 320, 240, tex, tex_width, tex_height, &tri1);
+    rasterize_triangle(fb, 320, 240, tex, tex_width, tex_height, &tri0);
+    rasterize_triangle(fb, 320, 240, tex, tex_width, tex_height, &tri1);
+}
+
+fn render_quads_into(quads: &[(&[(f32, f32)], &[(f32, f32)], &[u32], usize, usize)]) -> Vec<u32> {
+    let mut fb = vec![0u32; 320 * 240];
+    for (positions, uvs, tex, tex_width, tex_height) in quads {
+        render_quad_into(&mut fb, tex, *tex_width, *tex_height, positions, uvs);
+    }
     fb
 }
 
@@ -268,8 +273,8 @@ fn renders_real_tetris_quad_and_hashes_framebuffer() {
         .map(|(x, y, _, _)| (x + tx, y + ty))
         .collect();
 
-    let tex = decode_rgba5551(&make_test_rgba5551_texture(), 50, 50);
-    let fb = render_quad(&tex, 50, 50, &positions, &uv);
+    let tex = decode_rgba5551(&make_test_rgba5551_texture(50, 50), 50, 50);
+    let fb = render_quads_into(&[(&positions, &uv, &tex, 50, 50)]);
 
     let mut bytes = Vec::with_capacity(fb.len() * 4);
     for px in &fb {
@@ -280,4 +285,75 @@ fn renders_real_tetris_quad_and_hashes_framebuffer() {
         write_ppm(std::path::Path::new("/tmp/tetris_quad3.ppm"), &fb, 320, 240);
     }
     assert_eq!(hash, 0x8fd5_603a_6dfa_4182);
+}
+
+#[test]
+fn replays_multiple_real_tetris_quads_and_hashes_framebuffer() {
+    let fixture = load_fixture();
+    let frame4 = first_frame(&fixture, 4).expect("steady-state frame");
+
+    let bg_pos = seq_record(frame4, 7);
+    let bg_pos_snapshot = stack_word(bg_pos, 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("background position snapshot");
+    let bg_positions = words_as_positions_xyzw(&words_from_snapshot(bg_pos_snapshot))
+        .into_iter()
+        .map(|(x, y, _, _)| (x, y))
+        .collect::<Vec<_>>();
+
+    let bg_uv_snapshot = stack_word(seq_record(frame4, 10), 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("background uv snapshot");
+    let bg_uv = words_as_pairs(&words_from_snapshot(bg_uv_snapshot));
+
+    let mid_pos_snapshot = stack_word(seq_record(frame4, 21), 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("middle position snapshot");
+    let mid_positions = words_as_positions_xyzw(&words_from_snapshot(mid_pos_snapshot))
+        .into_iter()
+        .map(|(x, y, _, _)| (x, y))
+        .collect::<Vec<_>>();
+
+    let mid_uv_snapshot = stack_word(seq_record(frame4, 24), 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("middle uv snapshot");
+    let mid_uv = words_as_pairs(&words_from_snapshot(mid_uv_snapshot));
+
+    let small_pos_snapshot = stack_word(seq_record(frame4, 32), 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("small position snapshot");
+    let small_positions = words_as_positions_xyzw(&words_from_snapshot(small_pos_snapshot))
+        .into_iter()
+        .map(|(x, y, _, _)| (x, y))
+        .collect::<Vec<_>>();
+
+    let small_uv_snapshot = stack_word(seq_record(frame4, 35), 0x04)
+        .and_then(|word| word.snapshot.as_ref())
+        .expect("small uv snapshot");
+    let small_uv = words_as_pairs(&words_from_snapshot(small_uv_snapshot));
+
+    let bg_tex = decode_rgba5551(&make_test_rgba5551_texture(320, 240), 320, 240);
+    let mid_tex = decode_rgba5551(&make_test_rgba5551_texture(250, 162), 250, 162);
+    let small_tex = decode_rgba5551(&make_test_rgba5551_texture(50, 50), 50, 50);
+
+    let fb = render_quads_into(&[
+        (&bg_positions, &bg_uv, &bg_tex, 320, 240),
+        (&mid_positions, &mid_uv, &mid_tex, 250, 162),
+        (&small_positions, &small_uv, &small_tex, 50, 50),
+    ]);
+
+    let mut bytes = Vec::with_capacity(fb.len() * 4);
+    for px in &fb {
+        bytes.extend_from_slice(&px.to_le_bytes());
+    }
+    let hash = fnv1a64(&bytes);
+    if std::env::var_os("CLICKY_WRITE_TETRIS_QUAD_PPM").is_some() {
+        write_ppm(
+            std::path::Path::new("/tmp/tetris_frame4_replay.ppm"),
+            &fb,
+            320,
+            240,
+        );
+    }
+    assert_eq!(hash, 0xebe4_c911_e186_1ed7);
 }

@@ -2,7 +2,7 @@
 
 Fixture:
 - `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json`
-- standalone renderer uses a generated 50×50 RGBA5551 test texture
+- standalone renderer uses generated textures for replay tests
 
 This report reflects the deeper capture pass that follows pointer-like stack words and records bounded snapshots, mapped regions, truncation status, and AsyncFileIO-backed file relationships.
 
@@ -258,15 +258,15 @@ Ordinal36State(...)
 
 ## Standalone renderer result
 
-A standalone test now decodes the real `50 × 50` upload candidate, the real frame-4 quad-3 position/UV arrays, applies the real translation values above, rasterizes with nearest-neighbor sampling against a generated 50×50 RGBA5551 texture, and hashes the 320×240 framebuffer.
+A standalone replay test now decodes three frame-4 quads (background, mid-logo, and the real `50 × 50` overlay candidate), applies the real position/UV/translation data above, rasterizes them with nearest-neighbor sampling against generated replay textures, and hashes the 320×240 framebuffer.
 
-Deterministic framebuffer hash (generated texture fixture):
+Deterministic framebuffer hash (generated replay textures):
 
 ```text
-fnv1a64 = 0x8fd5603a6dfa4182
+fnv1a64 = 0xebe4c911e1861ed7
 ```
 
 Optional inspection artifact:
 - set `CLICKY_WRITE_TETRIS_QUAD_PPM=1`
-- run the render test
-- it writes `/tmp/tetris_quad3.ppm`
+- run the replay test
+- it writes `/tmp/tetris_frame4_replay.ppm`
