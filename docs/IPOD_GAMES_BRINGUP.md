@@ -188,20 +188,46 @@ Current observed behavior for **Tetris**:
 
 - the binary loads and begins executing native ARM code from the parsed entrypoint
 - the runner now treats the initial `eapp` entry as a bootstrap/init phase and
-  then invokes the app constructor path
+  then repeatedly pumps the app's `aux` callback as a synthetic frame loop
+- synthetic completion callbacks for `AsyncFileIO:3` let the game advance past
+  its early asynchronous asset-open flow
+- host-side path resolution now covers:
+  - bundle-root assets
+  - `Resources/`
+  - synthetic writable save files under `.clicky-saves/`
 - observed imports now include:
   - `miscTBD:0`
+  - `miscTBD:1`
   - `miscTBD:9`
+  - `miscTBD:13`
   - `InputEvents:0`
+  - `Settings:0`
+  - `Audio:0`
   - `OpenGLES:12`
   - `OpenGLES:13`
+  - `OpenGLES:35`
+  - `OpenGLES:36`
+  - `OpenGLES:37`
+  - `OpenGLES:40`
+  - `OpenGLES:125`
+  - `OpenGLES:137`
   - `OpenGLES:157`
-- current evidence suggests:
-  - `miscTBD:0` behaves like a small allocation helper
-  - `miscTBD:9` is some kind of object/base-class constructor hook
-  - `InputEvents:0` is used during constructor-time input state probing
-- the runner can now get through constructor-time setup far enough to reach
-  multiple graphics/input imports before halting the experimental bootstrap
+  - `OpenGLES:158`
+  - `OpenGLES:159`
+  - `OpenGLES:165`
+  - `OpenGLES:167`
+  - `OpenGLES:169`
+  - `OpenGLES:175`
+  - `AsyncFileIO:3`
+- Tetris now successfully walks a long real asset-open sequence including:
+  - `Strings.dta`
+  - many `.pix` UI/image assets
+  - `.wav` audio assets
+  - save paths like `prefs.sav` and `game.sav`
+- current blocker is no longer the first import or constructor return; the game
+  now crashes later in real guest code at `0x18013f5c` after the asset-open
+  sequence, likely because later resource/data-loading semantics are still
+  missing beyond the current open-success callback shim
 
 This is the first meaningful checkpoint for the direct-runtime path.
 

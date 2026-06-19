@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use armv4t_emu::{reg, Cpu, Mode as ArmMode};
 use thiserror::Error;
 
-use crate::devices::{Device, Probe};
 use crate::devices::generic::Ram;
+use crate::devices::{Device, Probe};
 use crate::error::*;
 use crate::gui::{ButtonCallback, RenderCallback, ScrollCallback, TakeControls};
 use crate::memory::{armv4t_adaptor::MemoryAdapter, Memory};
@@ -15,6 +15,7 @@ use crate::memory::{armv4t_adaptor::MemoryAdapter, Memory};
 const FILE_VMA_BASE: u32 = 0x1800_0000;
 const RECENT_PC_LIMIT: usize = 64;
 const BOOTSTRAP_RETURN_PC: u32 = 0x1eff_fffc;
+const GUEST_CALLBACK_RETURN_PC: u32 = 0x1eff_fff8;
 const WORK_RAM_BASE: u32 = 0x1000_0000;
 const WORK_RAM_SIZE: usize = 8 * 1024 * 1024;
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
@@ -119,13 +120,23 @@ pub struct Eapp {
     next_alloc: u32,
     bootstrap_phase: BootstrapPhase,
     app_object: u32,
+    frame_context: u32,
+    frame_counter: u64,
+    pending_guest_calls: VecDeque<PendingGuestCall>,
     halted: bool,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct PendingGuestCall {
+    pc: u32,
+    arg0: u32,
+    arg1: u32,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum BootstrapPhase {
     Entry,
-    Aux,
+    Running,
     Done,
 }
 
@@ -226,6 +237,9 @@ impl Eapp {
             next_alloc: WORK_RAM_BASE + 0x1000,
             bootstrap_phase: BootstrapPhase::Entry,
             app_object: 0,
+            frame_context: 0,
+            frame_counter: 0,
+            pending_guest_calls: VecDeque::new(),
             halted: false,
         })
     }
@@ -272,6 +286,10 @@ impl Eapp {
         self.record_pc(pc);
         if pc == BOOTSTRAP_RETURN_PC || (pc == 0 && self.bootstrap_phase != BootstrapPhase::Done) {
             self.handle_bootstrap_return();
+            return Ok(());
+        }
+        if pc == GUEST_CALLBACK_RETURN_PC {
+            self.handle_guest_callback_return();
             return Ok(());
         }
         if let Some(&import_idx) = self.trampoline_to_import.get(&pc) {
@@ -334,14 +352,11 @@ impl Eapp {
         }
 
         let ret = match import.module.as_str() {
-            "OpenGLES" => {
-                self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
-                self.alloc_zeroed(0x80)
-            }
+            "OpenGLES" => self.handle_open_gl_import(import.ordinal, args),
             "InputEvents" => self.handle_input_events_import(import.ordinal, args),
             "Settings" => self.handle_settings_import(import.ordinal, args),
             "Metadata" => 0,
-            "miscTBD" => self.alloc_zeroed(0x40),
+            "miscTBD" => self.handle_misc_import(import.ordinal, args),
             "Audio" => 0,
             "AsyncFileIO" => self.handle_async_file_io_import(import.ordinal, args),
             other => {
@@ -354,6 +369,22 @@ impl Eapp {
         self.cpu.reg_set(self.cpu.mode(), 0, ret);
         self.cpu.reg_set(self.cpu.mode(), reg::PC, lr & !1);
         Ok(())
+    }
+
+    fn handle_open_gl_import(&mut self, _ordinal: u32, _args: [u32; 4]) -> u32 {
+        self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
+        0
+    }
+
+    fn handle_misc_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        match ordinal {
+            0 => {
+                let len = args[0].max(args[1]).max(0x10);
+                self.alloc_zeroed(len)
+            }
+            9 => args[0],
+            _ => 0,
+        }
     }
 
     fn handle_input_events_import(&mut self, ordinal: u32, _args: [u32; 4]) -> u32 {
@@ -398,15 +429,34 @@ impl Eapp {
     }
 
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
-        if let Some(path) = self.try_read_c_string(args[0], 256) {
+        let path = self
+            .try_read_c_string(args[0], 256)
+            .or_else(|| self.try_read_c_string(args[1], 256));
+        if let Some(path) = path {
             info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path={}", ordinal, path);
             self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
-            return self.alloc_zeroed(0x40);
-        }
-        if let Some(path) = self.try_read_c_string(args[1], 256) {
-            info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path@r1={}", ordinal, path);
-            self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
-            return self.alloc_zeroed(0x40);
+
+            if ordinal == 3 {
+                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:3 resolved={}", host_path.display());
+                    if let Some(callback_pc) = self.read_guest_u32(args[2].wrapping_add(0x34)) {
+                        let callback_ctx =
+                            self.read_guest_u32(args[2].wrapping_add(0x38)).unwrap_or(0);
+                        if callback_pc != 0 {
+                            self.pending_guest_calls.push_back(PendingGuestCall {
+                                pc: callback_pc,
+                                arg0: args[2],
+                                arg1: callback_ctx,
+                            });
+                        }
+                    }
+                    return 1;
+                }
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:3 missing host path {}", path);
+                return 0;
+            }
+
+            return 1;
         }
         0
     }
@@ -419,33 +469,70 @@ impl Eapp {
     fn handle_bootstrap_return(&mut self) {
         match self.bootstrap_phase {
             BootstrapPhase::Entry => {
+                self.app_object = self.alloc_zeroed(0x2000);
+                self.frame_context = self.alloc_zeroed(0x80);
                 info!(
                     target: "EAPP",
-                    "bootstrap entry returned; invoking aux constructor at {:#010x}",
+                    "bootstrap entry returned; app_object={:#010x} frame_context={:#010x} aux={:#010x}",
+                    self.app_object,
+                    self.frame_context,
                     self.header.aux_addr
                 );
-                self.app_object = self.alloc_zeroed(0x2000);
-                let empty_arg = self.alloc_zeroed(0x10);
-                self.cpu.reg_set(self.cpu.mode(), 0, self.app_object);
-                self.cpu.reg_set(self.cpu.mode(), 1, empty_arg);
-                self.cpu.reg_set(self.cpu.mode(), reg::LR, BOOTSTRAP_RETURN_PC);
-                self.cpu.reg_set(self.cpu.mode(), reg::PC, self.header.aux_addr);
-                self.bootstrap_phase = BootstrapPhase::Aux;
+                self.bootstrap_phase = BootstrapPhase::Running;
+                self.queue_next_frame();
                 self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
             }
-            BootstrapPhase::Aux => {
-                info!(
-                    target: "EAPP",
-                    "bootstrap aux returned; app_object={:#010x}",
-                    self.app_object
-                );
-                self.bootstrap_phase = BootstrapPhase::Done;
-                self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
-                self.halted = true;
+            BootstrapPhase::Running => {
+                self.frame_counter = self.frame_counter.wrapping_add(1);
+                if self.frame_counter == 1 || self.frame_counter % 600 == 0 {
+                    info!(
+                        target: "EAPP",
+                        "frame {} returned r0={:#010x}",
+                        self.frame_counter,
+                        self.cpu.reg_get(self.cpu.mode(), 0)
+                    );
+                }
+                if !self.dispatch_pending_guest_call() {
+                    self.queue_next_frame();
+                }
             }
             BootstrapPhase::Done => {
                 self.halted = true;
             }
+        }
+    }
+
+    fn queue_next_frame(&mut self) {
+        self.cpu.reg_set(self.cpu.mode(), 0, self.app_object);
+        self.cpu.reg_set(self.cpu.mode(), 1, self.frame_context);
+        self.cpu
+            .reg_set(self.cpu.mode(), reg::LR, BOOTSTRAP_RETURN_PC);
+        self.cpu
+            .reg_set(self.cpu.mode(), reg::PC, self.header.aux_addr);
+    }
+
+    fn dispatch_pending_guest_call(&mut self) -> bool {
+        if let Some(call) = self.pending_guest_calls.pop_front() {
+            debug!(
+                target: "EAPP",
+                "dispatching guest callback pc={:#010x} arg0={:#010x} arg1={:#010x}",
+                call.pc,
+                call.arg0,
+                call.arg1
+            );
+            self.cpu.reg_set(self.cpu.mode(), 0, call.arg0);
+            self.cpu.reg_set(self.cpu.mode(), 1, call.arg1);
+            self.cpu
+                .reg_set(self.cpu.mode(), reg::LR, GUEST_CALLBACK_RETURN_PC);
+            self.cpu.reg_set(self.cpu.mode(), reg::PC, call.pc);
+            return true;
+        }
+        false
+    }
+
+    fn handle_guest_callback_return(&mut self) {
+        if !self.dispatch_pending_guest_call() {
+            self.queue_next_frame();
         }
     }
 
@@ -459,6 +546,41 @@ impl Eapp {
         } else {
             0
         }
+    }
+
+    fn read_guest_u32(&mut self, addr: u32) -> Option<u32> {
+        self.bus.r32(addr).ok()
+    }
+
+    fn resolve_bundle_path(&self, path: &str) -> Option<PathBuf> {
+        let direct = self.metadata.bundle_dir.join(path);
+        if direct.exists() {
+            return Some(direct);
+        }
+        let resources = self.metadata.bundle_dir.join("Resources").join(path);
+        if resources.exists() {
+            return Some(resources);
+        }
+        None
+    }
+
+    fn resolve_or_create_host_path(&self, path: &str) -> Option<PathBuf> {
+        if let Some(found) = self.resolve_bundle_path(path) {
+            return Some(found);
+        }
+
+        if Path::new(path).is_absolute() {
+            return None;
+        }
+
+        let writable = self.metadata.bundle_dir.join(".clicky-saves").join(path);
+        if let Some(parent) = writable.parent() {
+            fs::create_dir_all(parent).ok()?;
+        }
+        if !writable.exists() {
+            fs::write(&writable, []).ok()?;
+        }
+        Some(writable)
     }
 
     fn try_read_c_string(&mut self, addr: u32, max_len: usize) -> Option<String> {
@@ -530,13 +652,11 @@ impl Device for EappBus {
 
     fn probe(&self, offset: u32) -> Probe {
         match offset {
-            FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
-                Probe::Device {
-                    kind: "Ram",
-                    label: Some("eapp-image"),
-                    next: Box::new(self.image.probe(offset - FILE_VMA_BASE)),
-                }
-            }
+            FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => Probe::Device {
+                kind: "Ram",
+                label: Some("eapp-image"),
+                next: Box::new(self.image.probe(offset - FILE_VMA_BASE)),
+            },
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 Probe::Device {
                     kind: "Ram",
@@ -704,7 +824,10 @@ fn parse_eapp_header(image: &[u8]) -> Result<EappHeader, EappBuildError> {
     })
 }
 
-fn parse_import_modules(image: &[u8], mut name_addr: u32) -> Result<Vec<EappImportModule>, EappBuildError> {
+fn parse_import_modules(
+    image: &[u8],
+    mut name_addr: u32,
+) -> Result<Vec<EappImportModule>, EappBuildError> {
     let mut modules = Vec::new();
     let mut seen = HashSet::new();
 
