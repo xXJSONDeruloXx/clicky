@@ -1,0 +1,168 @@
+#[macro_use]
+extern crate log;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc as chan;
+
+use clicky_core::gui::{ButtonCallback, RenderCallback, ScrollCallback, TakeControls};
+use clicky_core::sys::eapp::{Eapp, EappBinds, EappKey};
+use minifb::{Key, Window, WindowOptions};
+use structopt::StructOpt;
+
+pub type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "clicky-eapp")]
+#[structopt(about = "Run an iPod clickwheel game executable via the experimental eapp runner.")]
+struct Args {
+    /// Path to a Games_RO/<id> bundle directory.
+    #[structopt(parse(from_os_str))]
+    bundle_dir: PathBuf,
+
+    /// Run a fixed number of CPU cycles and then exit.
+    #[structopt(long)]
+    cycles: Option<usize>,
+
+    /// Disable the minifb UI and run headless.
+    #[structopt(long)]
+    headless: bool,
+}
+
+struct MinifbControls {
+    keymap: HashMap<Key, ButtonCallback>,
+    on_scroll: Option<ScrollCallback>,
+}
+
+fn eapp_key_to_minifb(key: EappKey) -> Key {
+    match key {
+        EappKey::Up => Key::Up,
+        EappKey::Down => Key::Down,
+        EappKey::Left => Key::Left,
+        EappKey::Right => Key::Right,
+        EappKey::Action => Key::Enter,
+        EappKey::Menu => Key::M,
+    }
+}
+
+impl From<EappBinds> for MinifbControls {
+    fn from(binds: EappBinds) -> MinifbControls {
+        let EappBinds { keys, wheel } = binds;
+        MinifbControls {
+            keymap: keys
+                .into_iter()
+                .map(|(key, callback)| (eapp_key_to_minifb(key), callback))
+                .collect(),
+            on_scroll: wheel,
+        }
+    }
+}
+
+fn run_minifb_ui(
+    title: String,
+    mut update_fb: RenderCallback,
+    controls: impl Into<MinifbControls>,
+    kill_rx: chan::Receiver<()>,
+) {
+    let mut controls = controls.into();
+
+    let mut window = Window::new(
+        &title,
+        320,
+        240,
+        WindowOptions {
+            scale: minifb::Scale::X2,
+            resize: true,
+            ..WindowOptions::default()
+        },
+    )
+    .expect("could not create minifb window");
+
+    window.limit_update_rate(Some(std::time::Duration::from_micros(16_600)));
+
+    let mut buffer: Vec<u32> = vec![0; 320 * 240];
+    let mut emu_buffer = Vec::new();
+
+    'ui: while window.is_open() && kill_rx.try_recv().is_err() {
+        for key in window.get_keys_pressed(minifb::KeyRepeat::Yes) {
+            if key == Key::Escape {
+                break 'ui;
+            }
+            if let Some(callback) = controls.keymap.get_mut(&key) {
+                callback(true);
+            }
+        }
+
+        for key in window.get_keys_released() {
+            if let Some(callback) = controls.keymap.get_mut(&key) {
+                callback(false);
+            }
+        }
+
+        if let Some(scroll) = window.get_scroll_wheel() {
+            if let Some(callback) = controls.on_scroll.as_mut() {
+                callback(scroll);
+            }
+        }
+
+        let (width, _height) = update_fb(&mut emu_buffer);
+        let new_buf = emu_buffer
+            .chunks_exact(width)
+            .take(240)
+            .flat_map(|row| row.iter().take(320))
+            .copied();
+        buffer.splice(.., new_buf);
+
+        window
+            .update_with_buffer(&buffer, 320, 240)
+            .expect("could not update minifb window");
+    }
+}
+
+fn main() -> DynResult<()> {
+    pretty_env_logger::formatted_builder()
+        .filter(None, log::LevelFilter::Error)
+        .filter(Some("clicky"), log::LevelFilter::Trace)
+        .filter(Some("EAPP_IMPORT"), log::LevelFilter::Info)
+        .filter(Some("EAPP"), log::LevelFilter::Info)
+        .filter(Some("armv4t_emu"), log::LevelFilter::Warn)
+        .parse_filters(&std::env::var("RUST_LOG").unwrap_or_default())
+        .init();
+
+    let args = Args::from_args();
+    let mut system = Eapp::from_bundle_dir(&args.bundle_dir)?;
+    let title = format!("{} [eapp]", system.title());
+
+    if args.headless {
+        let result = match args.cycles {
+            Some(cycles) => system.run_cycles(cycles),
+            None => system.run(),
+        };
+        if let Err(err) = result {
+            return Err(format!("fatal eapp error: {:#010x?}", err).into());
+        }
+        return Ok(());
+    }
+
+    let update_fb = system.render_callback();
+    let controls = system
+        .take_controls()
+        .ok_or_else(|| "could not take eapp controls".to_string())?;
+    let (kill_tx, kill_rx) = chan::channel();
+
+    let cycles = args.cycles;
+    std::thread::spawn(move || {
+        let result = match cycles {
+            Some(cycles) => system.run_cycles(cycles),
+            None => system.run(),
+        };
+        if let Err(err) = result {
+            error!("fatal eapp error: {:#010x?}", err);
+        }
+        let _ = kill_tx.send(());
+    });
+
+    run_minifb_ui(title, update_fb, controls, kill_rx);
+
+    Ok(())
+}
