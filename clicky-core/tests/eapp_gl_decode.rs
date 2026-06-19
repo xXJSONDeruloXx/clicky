@@ -653,6 +653,21 @@ fn replay_frame4_produces_complete_artifact_and_hash() {
         println!("frame4_hash={:016x}", hash);
     }
 
+    if std::env::var_os("CLICKY_WRITE_TETRIS_FRAME4_PPM").is_some() {
+        let (_, base_draws) = replay_frame4();
+        let draws_1_to_3_fb = render_draws(&base_draws, false);
+        let all_draws_fb = render_draws(&base_draws, true);
+        let draw4_alpha = replay_frame4_with_probe(Draw4ProbeMode::AlphaOnly);
+        let draw4_alpha_fb = render_draws(&draw4_alpha[3..4], true);
+        let draw4_opaque = replay_frame4_with_probe(Draw4ProbeMode::Opaque);
+        let draw4_opaque_fb = render_draws(&draw4_opaque[3..4], true);
+
+        write_frame4_ppm_if_requested("/tmp/tetris_frame4_draws_1_3.ppm", &draws_1_to_3_fb);
+        write_frame4_ppm_if_requested("/tmp/tetris_frame4_all_draws.ppm", &all_draws_fb);
+        write_frame4_ppm_if_requested("/tmp/tetris_frame4_draw4_alpha.ppm", &draw4_alpha_fb);
+        write_frame4_ppm_if_requested("/tmp/tetris_frame4_draw4_opaque.ppm", &draw4_opaque_fb);
+    }
+
     assert_eq!(hash, 0x3514_598d_ae7f_1fe2);
     assert_eq!(bytes.len(), 320 * 240 * 4);
 }
@@ -751,6 +766,13 @@ fn diff_pixels(a: &[Rgba8], b: &[Rgba8]) -> usize {
         .count()
 }
 
+fn write_frame4_ppm_if_requested(path: &str, fb: &[Rgba8]) {
+    if std::env::var_os("CLICKY_WRITE_TETRIS_FRAME4_PPM").is_some() {
+        framebuffer_to_ppm(std::path::Path::new(path), fb, 320, 240);
+        println!("ppm_path={path} hash={:016x}", framebuffer_hash(fb));
+    }
+}
+
 fn print_draw_summary(
     name: &str,
     fb: &[Rgba8],
@@ -845,6 +867,11 @@ fn frame4_artifact_comparison_and_handle_mapping() {
             3,
         );
     }
+
+    write_frame4_ppm_if_requested("/tmp/tetris_frame4_draws_1_3.ppm", &draws_1_to_3);
+    write_frame4_ppm_if_requested("/tmp/tetris_frame4_all_draws.ppm", &all_draws);
+    write_frame4_ppm_if_requested("/tmp/tetris_frame4_draw4_alpha.ppm", &draw4_alpha_fb);
+    write_frame4_ppm_if_requested("/tmp/tetris_frame4_draw4_opaque.ppm", &draw4_opaque_fb);
 
     // Conservative handle mapping from upload candidates to frame-4 ord159 draws.
     let mapping_rows = [
