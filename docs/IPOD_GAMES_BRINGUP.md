@@ -255,7 +255,57 @@ Current observed behavior for **Tetris**:
   behavior, so this is a stability checkpoint rather than a genuinely playable
   title yet
 
-This is the first meaningful checkpoint for the direct-runtime path.
+#### Honest status (stable but green)
+
+Running the desktop (non-headless) runner today shows a flat green window. That
+is expected and is *us*, not the game. Concretely:
+
+What is **actually working**:
+
+- `eapp` binary loading: header, import-module chain, entry/init/aux pointers
+- real ARM execution on the existing core (not a stub loop)
+- bootstrap lifecycle: entry → constructor → synthetic frame pump
+- import interception: every guest import is trapped via patched literal
+  tables and routed to an HLE handler
+- `AsyncFileIO:3` path resolution across bundle-root / `Resources/` /
+  virtual-root `/audio/...` / synthetic `.clicky-saves/` saves
+- stability: `20,000,000` headless cycles without fatal exceptions for both
+  Tetris and PAC-MAN
+
+What is **NOT working** (and why it is a green screen):
+
+- `OpenGLES` is a pure no-op. Every GL import just fills the whole framebuffer
+  solid green (`HLE_OPENGL_FRAMEBUFFER = 0xff205020`) and returns 0. There is:
+  - no texture upload (`.pix` / `.tga` never become GL textures)
+  - no draw calls, no vertex data, no matrices
+  - no clear / viewport / scissor
+  - no guest-drawn framebuffer at all
+- File contents never reach guest memory. `AsyncFileIO:3` resolves the path and
+  fires a completion callback, but the actual bytes of `Strings.dta`, `*.pix`,
+  `*.wav`, etc. are never read from disk into any guest-accessible buffer.
+- The completion callback is synthetic. We call the guest's open-done callback
+  with the request object, but do not populate the resource/data fields the game
+  expects. The Tetris placeholder-slot hack exists precisely because those fields
+  stay null.
+- `Audio` is fully stubbed (returns 0, nothing plays).
+- `InputEvents:0` is wired to host keys but unverifiable because nothing renders.
+- `Metadata` / `Settings` return dummy zeros (fine for startup, may matter later).
+- Saves are empty shells: `.clicky-saves/*.sav` are created zero-byte; we never
+  read or write real save data.
+
+#### Critical path to "something visible"
+
+In order:
+
+1. Make `AsyncFileIO:3` actually load file bytes into a guest buffer the
+   resource layer points at (replace the placeholder-slot hack).
+2. Implement the handful of `OpenGLES` ordinals needed to blit a texture:
+   texture upload, texcoord/vertex setup, draw, and a real framebuffer the game
+   writes into instead of our green fill.
+
+Step 1 unblocks step 2.
+
+This is the current meaningful checkpoint for the direct-runtime path.
 
 ### Milestone 2: minimal runtime services
 
