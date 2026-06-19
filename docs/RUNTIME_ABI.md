@@ -2,11 +2,11 @@
 
 ## Summary
 
-iPod clickwheel games (`.ipg` packages) contain native ARM executables in Apple's "eapp" container format. These games are **not** standalone firmware images or interpreted scripts—they are native ARM applications dynamically bound to an Apple/Pixo-derived runtime ABI.
+iPod clickwheel games (`.ipg` packages) contain native ARM executables in Apple's `eapp` container format. These games are **not** standalone firmware images or interpreted scripts—they are native ARM applications dynamically bound to an Apple/Pixo-derived runtime ABI.
 
-This document captures the reverse-engineered runtime interface needed to implement high-level emulation (HLE) for these games.
+This document intentionally keeps ordinal names conservative. Unless an item is directly backed by the trace fixture, decoder report, and/or disassembly, treat it as a research note.
 
-> Note: ordinal names and argument layouts below are research notes unless backed by the trace fixture and decoder report. See `docs/EAPP_GL_TRACE_DECODER_REPORT.md` and `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json` for confirmed evidence.
+See `docs/EAPP_GL_TRACE_DECODER_REPORT.md` and `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json` for the current verified evidence.
 
 ---
 
@@ -42,7 +42,7 @@ An `.ipg` is a deployment package (ZIP-compatible) containing:
 0x18  init pointer
 0x1c  unknown
 0x20  unknown
-0x24  aux pointer (frame callback)
+0x24  aux pointer (recurring callback in Tetris)
 ```
 
 **Observed VMAs:** File pointers resolve correctly with base `0x18000000`.
@@ -76,43 +76,64 @@ literal target array (module, ordinal) -> function
 
 ## 4. Graphics API (Apple GL-like, not raw GLES 1.1)
 
-### Confirmed Ordinals
+### Confirmed call-site evidence
 
-| Ordinal | Function | Evidence |
-|---------|----------|----------|
-| `GL:37` | **glDrawArrays** | disasm: `mov r0,#7(QUADS) mov r1,#0, mov r2,#4` |
-| `GL:45` | createTexture/initObj | width/height args, once per asset |
-| `GL:99` | **glTexImage2D** | r0=GL_TEXTURE_2D, r1=level, r2=format enum |
-| `GL:137` | setVertexArrayFormat | r0=array_idx, r1=components, r2=GL_FIXED |
-| `GL:157` | **submitFrame** | LAST call in aux frame |
-| `GL:158` | **presentFrame** | FIRST call in aux, r0=0x3f001 token |
-| `GL:159` | bindTexture + setVertexBuffer | r0=tex_id (small int), r1=vtx_ptr |
-| `GL:165` | beginFrame | after present, before draw loop |
-| `GL:169` | setPosition/translate | r1=x, r2=y (float), screen coords |
-| `GL:4` | glTexParameteri | r0=GL_TEXTURE_2D, called before upload |
-| `GL:12` | glClear (init) | r0=0x4000=GL_COLOR_BUFFER_BIT |
-| `GL:13` | glClearColor (init) | r0-r3=0,0,0,1.0 (black) |
+| Ordinal | Status | Evidence |
+|---------|--------|----------|
+| `GL:37` | confirmed | `DrawArrays(7, 0, 4)` from disassembly: `mov r0,#7(QUADS) mov r1,#0, mov r2,#4` |
+| `GL:99` | confirmed | exact upload ABI table below |
+| `GL:137` | confirmed | direct args `r0..r3`, plus stack args at `sp+0`, `sp+4` |
+| `GL:40` | confirmed count | only `r0` is set at the call site; other registers are caller leftovers |
+| `GL:159` | confirmed count | only `r0`, `r1` are set at the call site; other registers are caller leftovers |
+| `GL:175` | confirmed count | only `r0`, `r1`, `r2` are set at the call site; `r3=0` |
 
-### Per-Frame Sequence (Tetris)
+### 99 ABI table
+
+| Field | Location | Meaning |
+|-------|----------|---------|
+| `r0` | register | target |
+| `r1` | register | level |
+| `r2` | register | internal_format |
+| `r3` | register | width |
+| `sp+0x00` | stack | height |
+| `sp+0x04` | stack | border |
+| `sp+0x08` | stack | format |
+| `sp+0x0c` | stack | pixel_type |
+| `sp+0x10` | stack | source_ptr |
+
+### Neutral / unresolved ordinals seen in Tetris
+
+| Ordinal | Conservative label | Note |
+|---------|---------------------|------|
+| `45` | `Ordinal45State` | upload-prep-like; exact role unresolved |
+| `4` | `Ordinal4State` | state/setup step before upload; exact role unresolved |
+| `157` | `Ordinal157State` | frame-terminal call in Tetris; exact semantics unresolved |
+| `158` | `Ordinal158State` | frame-initial call in Tetris; exact semantics unresolved |
+| `165` | `Ordinal165State` | per-frame setup call; exact semantics unresolved |
+| `169` | `Ordinal169State` | float-arg position/translation-like call; exact semantics unresolved |
+| `125` | `Ordinal125State` | draw-state helper; exact semantics unresolved |
+| `36` | `Ordinal36State` | post-draw helper; exact semantics unresolved |
+
+### Per-frame sequence (conservative)
 
 ```
-presentFrame (GL:158)     → display previous frame
-beginFrame (GL:165)       → allocate new framebuffer
+Ordinal158State(...)      → Tetris frame boundary, not universally proven as a global "present" call
+Ordinal165State(...)      → per-frame setup
 for each quad:
-    setPosition (GL:169)  → x, y translation
-    bindTexture (GL:159)  → texture ID + vertex buffer
-    setArrayFormat (GL:137) → position: 4 comps, GL_FIXED
-    enableArray (GL:40)   → enable position array
-    setArrayFormat (GL:137) → texcoord: 2 comps, GL_FIXED  
-    enableArray (GL:40)   → enable texcoord array
-    bindDrawState (GL:175)
-    prepareDraw (GL:125)
-    drawArrays (GL:37)    → glDrawArrays(GL_QUADS, 0, 4)
-    postDraw (GL:36)
-submitFrame (GL:157)      → commit for next present
+    Ordinal169State(...)  → float position/translation-like inputs
+    Ordinal159State(...)  → small handle + vertex pointer-like inputs
+    Ordinal137Array(...)  → position array format
+    Ordinal40State(...)   → enable array
+    Ordinal137Array(...)  → texcoord array format
+    Ordinal40State(...)   → enable array
+    Ordinal175State(...)
+    Ordinal125State(...)
+    DrawArrays(7, 0, 4)
+    Ordinal36State(...)
+Ordinal157State(...)      → frame-terminal call in Tetris, exact semantics unresolved
 ```
 
-### Vertex Format
+### Vertex format
 - **Type:** GL_FIXED (16.16 fixed-point)
 - **Position:** 4 components (XYZW)
 - **TexCoord:** 2 components (ST)
@@ -122,14 +143,17 @@ submitFrame (GL:157)      → commit for next present
 
 ## 5. Texture Formats (.pix files)
 
-Guest parses `.pix` headers; we only need to implement the upload ABI.
+Guest parses `.pix` assets; the emulator only needs to implement the upload ABI.
 
 **GL format constants:**
 - `GL_RGB (0x1907)` → `_565` files (16-bit opaque)
 - `GL_RGBA (0x1908)` → `_5551`, `_4444` files (16-bit alpha)
 - `GL_ALPHA (0x1906)` → `_a8` files (8-bit mask)
 
-**Header:** ~72 bytes before raw pixel data.
+**Payload offsets:** format- and asset-dependent. Do **not** assume a universal `~72` byte header. Use the guest-provided upload pointer and follow the trace-decoded offset for each asset.
+
+One decoded example:
+- `eaLogo_5551.pix` payload offset: `70` bytes
 
 ---
 
@@ -142,6 +166,7 @@ Guest parses `.pix` headers; we only need to implement the upload ABI.
 +0x18  expected byte count
 +0x34  completion callback PC
 +0x38  completion callback context
++0x3c  source file handle / staging state (observed indirectly)
 ```
 
 **HLE:** Copy file bytes to guest buffer, invoke callback.
@@ -151,31 +176,25 @@ Guest parses `.pix` headers; we only need to implement the upload ABI.
 ## 7. Lifecycle Model
 
 ```
-entry()           → game initialization
-init(app_obj)     → optional runtime init
-aux(app_obj)      → frame callback (repeated)
+entry()            → game initialization
+init(app_obj)      → optional runtime init
+aux(app_obj)       → recurring callback (frame-like in Tetris; not universally confirmed as the sole frame callback)
 ```
-
-**Frame sequence per aux():**
-1. GL:158 (present previous frame)
-2. GL:165 (begin current frame)
-3. Draw quads...
-4. GL:157 (submit current frame)
 
 ---
 
 ## 8. Implementation Priority
 
 ### Tier 1: First Pixels
-1. `GL:45` + `GL:4` + `GL:99` — texture upload
-2. `GL:169` — setPosition
-3. `GL:159` — bindTexture + vertex buffer
+1. `Ordinal45State` + `Ordinal4State` + `GL:99` — texture upload path
+2. `Ordinal169State` — conservative float position/translation call
+3. `Ordinal159State` — small handle + vertex pointer-like call
 4. `GL:37` — drawArrays (software rasterize)
-5. `GL:158` — presentFrame (copy framebuffer to window)
+5. `Ordinal158State` / `Ordinal157State` — frame boundary handling
 
 ### Tier 2: Playable
 - `GL:137` + `GL:40` — vertex array setup
-- `GL:165` + `GL:157` — frame lifecycle
+- `Ordinal165State` — per-frame setup
 - Input event contract
 - Save file semantics
 
@@ -222,4 +241,4 @@ Compare runs with:
 
 ---
 
-*This analysis enables the "software sprite renderer" approach—implement ~15 ordinals for textured quads, not a full GLES stack.*
+*This analysis enables the software sprite renderer approach: implement the verified upload + draw path first, then expand carefully from captured evidence.*

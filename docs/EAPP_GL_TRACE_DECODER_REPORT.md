@@ -2,7 +2,7 @@
 
 Fixture:
 - `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json`
-- extracted renderer texture fixture: `clicky-core/tests/fixtures/eapp/eaLogo_5551_50x50_rgba5551.bin`
+- standalone renderer uses a generated 50×50 RGBA5551 test texture
 
 This report reflects the deeper capture pass that follows pointer-like stack words and records bounded snapshots, mapped regions, truncation status, and AsyncFileIO-backed file relationships.
 
@@ -258,12 +258,12 @@ Ordinal36State(...)
 
 ## Standalone renderer result
 
-A standalone test now decodes the real `50 × 50` upload candidate, the real frame-4 quad-3 position/UV arrays, applies the real translation values above, rasterizes with nearest-neighbor sampling, and hashes the 320×240 framebuffer.
+A standalone test now decodes the real `50 × 50` upload candidate, the real frame-4 quad-3 position/UV arrays, applies the real translation values above, rasterizes with nearest-neighbor sampling against a generated 50×50 RGBA5551 texture, and hashes the 320×240 framebuffer.
 
-Deterministic framebuffer hash:
+Deterministic framebuffer hash (generated texture fixture):
 
 ```text
-fnv1a64 = 0xc6913d1457cb5696
+fnv1a64 = 0x8fd5603a6dfa4182
 ```
 
 Optional inspection artifact:

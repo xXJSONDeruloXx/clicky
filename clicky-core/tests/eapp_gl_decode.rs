@@ -8,8 +8,20 @@ fn load_fixture() -> GlTraceFixture {
         .expect("valid trace fixture json")
 }
 
-fn load_ea_logo_rgba5551() -> Vec<u8> {
-    include_bytes!("fixtures/eapp/eaLogo_5551_50x50_rgba5551.bin").to_vec()
+fn make_test_rgba5551_texture() -> Vec<u8> {
+    let width = 50usize;
+    let height = 50usize;
+    let mut raw = Vec::with_capacity(width * height * 2);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as u16) * 31 / (width as u16 - 1)) & 0x1f;
+            let g = ((y as u16) * 31 / (height as u16 - 1)) & 0x1f;
+            let b = (((x + y) as u16) * 31 / ((width + height - 2) as u16)) & 0x1f;
+            let px = (r << 11) | (g << 6) | (b << 1) | 1;
+            raw.extend_from_slice(&px.to_le_bytes());
+        }
+    }
+    raw
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -256,7 +268,7 @@ fn renders_real_tetris_quad_and_hashes_framebuffer() {
         .map(|(x, y, _, _)| (x + tx, y + ty))
         .collect();
 
-    let tex = decode_rgba5551(&load_ea_logo_rgba5551(), 50, 50);
+    let tex = decode_rgba5551(&make_test_rgba5551_texture(), 50, 50);
     let fb = render_quad(&tex, 50, 50, &positions, &uv);
 
     let mut bytes = Vec::with_capacity(fb.len() * 4);
@@ -267,5 +279,5 @@ fn renders_real_tetris_quad_and_hashes_framebuffer() {
     if std::env::var_os("CLICKY_WRITE_TETRIS_QUAD_PPM").is_some() {
         write_ppm(std::path::Path::new("/tmp/tetris_quad3.ppm"), &fb, 320, 240);
     }
-    assert_eq!(hash, 0xc6913d1457cb5696);
+    assert_eq!(hash, 0x8fd5_603a_6dfa_4182);
 }
