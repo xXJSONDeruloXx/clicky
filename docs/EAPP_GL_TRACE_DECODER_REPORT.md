@@ -440,6 +440,20 @@ Detected transitional anomalies are bounded and reported:
 - frame 2 had draws outside active 158→157 and a 10-draw transitional candidate, discarded;
 - steady frames repeat identically; first stable presented hash remains `0x55462dde9fead727`.
 
+Runtime progression root cause (Tetris splash hang): `miscTBD:9` is a monotonic-time out-pointer API, not a no-op/status return. The aux frame callback calls it with `r0=app_object+4` and `r0=app_object+8`, then computes `delta = [app+8] - [app+4]`. With the old handler (`return args[0]`, no write), `[app+4]`, `[app+8]`, and the splash timeout timestamps stayed zero indefinitely while guest frames and async callbacks continued. Guest constants at `0x180256c0/0x180256c4` are `4_000_000` and `2_000_000`, confirming microsecond tick units.
+
+`miscTBD:9` now writes host monotonic microseconds through `r0`. With `CLICKY_STARTUP_PROGRESS_TRACE=1`, bounded diagnostics include module/ordinal, args, return value, host monotonic time, pointed value before/after, and whether guest time advanced. The same trace records per-frame framebuffer hash, candidate time values, pending async request count, callback count, and first hash-change frame.
+
+Post-fix evidence with live rendering enabled:
+```text
+startup_progress frame=120 app_time_current≈3_900_000 app_time_delta≈13_000 pending=0 callbacks=51
+startup_progress frame=193 fb_hash changed to 0xe48b120366ee7539 app_time_current≈5_600_000
+```
+
+Async startup I/O evidence: 51 `AsyncFileIO:3` requests were resolved, 51 callbacks were queued, 51 callbacks were dispatched, and `pending_async=0` before the visual transition. The common callback at `0x1801fc68` consumes request fields `[0x08]`, `[0x20]`, and `[0x24]`; the observed callback path does not depend on the `0xffffffff` diagnostic fields at `[0x28..0x30]`.
+
+After time starts advancing, Tetris legitimately emits non-4-draw completed frames (3-draw splash/loading phase, then 29-draw menu/loading frames). Continuous Gate B now publishes any completed non-empty 158→157 frame; rasterization behavior is unchanged. This prevents the window from staying pinned to the last 4-draw splash frame after the guest has progressed.
+
 Optional dumping: `CLICKY_GL_DUMP_FRAMES=N` writes the first N completed presented frames to `/tmp/tetris_live_frame_XXXX.ppm`.
 
 Handle→upload association is still *inferred* by live upload dimensions/format

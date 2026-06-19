@@ -1,7 +1,10 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use armv4t_emu::{reg, Cpu, Mode as ArmMode};
 use thiserror::Error;
@@ -125,6 +128,38 @@ struct BoundImport {
     ordinal: u32,
 }
 
+#[derive(Debug, Clone)]
+struct StartupProgressTrace {
+    enabled: bool,
+    max_logs: usize,
+    interval: u64,
+    logged: usize,
+    last_framebuffer_hash: Option<u64>,
+    first_hash_change_frame: Option<u64>,
+}
+
+impl StartupProgressTrace {
+    fn from_env() -> StartupProgressTrace {
+        let enabled = std::env::var_os("CLICKY_STARTUP_PROGRESS_TRACE")
+            .map(|v| v.to_string_lossy() == "1")
+            .unwrap_or(false);
+        let max_logs = std::env::var_os("CLICKY_STARTUP_PROGRESS_FRAMES")
+            .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
+            .unwrap_or(180);
+        let interval = std::env::var_os("CLICKY_STARTUP_PROGRESS_INTERVAL")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(60);
+        StartupProgressTrace {
+            enabled,
+            max_logs,
+            interval: interval.max(1),
+            logged: 0,
+            last_framebuffer_hash: None,
+            first_hash_change_frame: None,
+        }
+    }
+}
+
 pub struct Eapp {
     cpu: Cpu,
     bus: EappBus,
@@ -150,6 +185,16 @@ pub struct Eapp {
     dumped_requests: HashSet<u32>,
     /// Per-(module, ordinal) call counters, to find render-critical imports.
     import_call_counts: HashMap<(String, u32), u64>,
+    /// Per-frame import counters used by the optional startup-progress trace.
+    frame_import_counts: HashMap<(String, u32), u64>,
+    startup_progress: StartupProgressTrace,
+    host_start: Instant,
+    misc9_time_diag_count: u64,
+    misc9_last_pointed_value: Option<u32>,
+    async_request_count: u64,
+    async_callback_queued_count: u64,
+    guest_callback_invocation_count: u64,
+    async_pending_requests: HashSet<u32>,
     /// Optional inclusive frame window in which to log every OpenGLES call
     /// with full args + return address, for reverse-engineering the GL stream.
     gl_trace_frames: Option<(u64, u64)>,
@@ -293,6 +338,15 @@ impl Eapp {
             staged_files: HashMap::new(),
             dumped_requests: HashSet::new(),
             import_call_counts: HashMap::new(),
+            frame_import_counts: HashMap::new(),
+            startup_progress: StartupProgressTrace::from_env(),
+            host_start: Instant::now(),
+            misc9_time_diag_count: 0,
+            misc9_last_pointed_value: None,
+            async_request_count: 0,
+            async_callback_queued_count: 0,
+            guest_callback_invocation_count: 0,
+            async_pending_requests: HashSet::new(),
             gl_trace_frames: None,
             gl_capture: None,
             staged_file_generation: 0,
@@ -731,6 +785,7 @@ impl Eapp {
 
         let key = (import.module.clone(), import.ordinal);
         *self.import_call_counts.entry(key.clone()).or_insert(0u64) += 1;
+        *self.frame_import_counts.entry(key.clone()).or_insert(0u64) += 1;
 
         let in_gl_trace = self
             .gl_trace_frames
@@ -966,7 +1021,13 @@ impl Eapp {
             }
         };
 
-        let should_present = completed.draw_count == 4;
+        // Continuous rendering publishes completed, non-empty 158→157 frames.
+        // The old `== 4` gate was useful while validating the static splash,
+        // but after runtime time starts advancing Tetris legitimately emits
+        // 3-draw loading frames and later higher-draw menu frames. Rasterizer
+        // behavior is unchanged; this only avoids pinning the window to the
+        // last 4-draw splash frame.
+        let should_present = completed.draw_count > 0;
         self.live_log_completed_frame(&completed, should_present);
         if should_present {
             self.live_dump_completed_frame();
@@ -1573,7 +1634,14 @@ impl Eapp {
                 let len = args[0].max(args[1]).max(0x10);
                 self.alloc_zeroed(len)
             }
-            9 => args[0],
+            9 => {
+                // Candidate monotonic tick API. Tetris calls this with r0
+                // pointing at app_object+4 and app_object+8, then computes a
+                // frame delta from the values stored there. The splash timeout
+                // thresholds in the guest are 4_000_000 and 2_000_000, matching
+                // microsecond units, so expose host monotonic microseconds.
+                self.handle_misc9_time_api(args)
+            }
             _ => 0,
         }
     }
@@ -1629,6 +1697,10 @@ impl Eapp {
 
             if ordinal == 3 {
                 let req = args[2];
+                self.async_request_count = self.async_request_count.wrapping_add(1);
+                if req != 0 {
+                    self.async_pending_requests.insert(req);
+                }
                 self.dump_request_object(req);
                 if let Some(host_path) = self.resolve_or_create_host_path(&path) {
                     // Request-object protocol (observed):
@@ -1639,6 +1711,22 @@ impl Eapp {
                     // We are the I/O layer, so we fill the guest's buffer.
                     let dest = self.read_guest_u32(req.wrapping_add(0x14)).unwrap_or(0);
                     let want = self.read_guest_u32(req.wrapping_add(0x18)).unwrap_or(0);
+                    let callback_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
+                    let callback_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
+                    if self.startup_progress.enabled {
+                        info!(
+                            target: "EAPP_PROGRESS",
+                            "async_request frame={} count={} req={:#010x} dest={:#010x} want={} cb_pc={:#010x} cb_ctx={:#010x} path={}",
+                            self.frame_counter,
+                            self.async_request_count,
+                            req,
+                            dest,
+                            want,
+                            callback_pc,
+                            callback_ctx,
+                            path
+                        );
+                    }
                     match fs::read(&host_path) {
                         Ok(bytes) => {
                             let n = if want != 0 {
@@ -1685,18 +1773,31 @@ impl Eapp {
                         }
                     }
                     info!(target: "EAPP_IMPORT", "AsyncFileIO:3 resolved={}", host_path.display());
-                    if let Some(callback_pc) = self.read_guest_u32(req.wrapping_add(0x34)) {
-                        let callback_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
-                        if callback_pc != 0 {
-                            self.pending_guest_calls.push_back(PendingGuestCall {
-                                pc: callback_pc,
-                                arg0: req,
-                                arg1: callback_ctx,
-                            });
+                    if callback_pc != 0 {
+                        self.async_callback_queued_count =
+                            self.async_callback_queued_count.wrapping_add(1);
+                        self.pending_guest_calls.push_back(PendingGuestCall {
+                            pc: callback_pc,
+                            arg0: req,
+                            arg1: callback_ctx,
+                        });
+                        if self.startup_progress.enabled {
+                            info!(
+                                target: "EAPP_PROGRESS",
+                                "async_callback_queued frame={} queued={} req={:#010x} cb_pc={:#010x} pending_async={}",
+                                self.frame_counter,
+                                self.async_callback_queued_count,
+                                req,
+                                callback_pc,
+                                self.async_pending_requests.len()
+                            );
                         }
+                    } else {
+                        self.async_pending_requests.remove(&req);
                     }
                     return 1;
                 }
+                self.async_pending_requests.remove(&req);
                 warn!(target: "EAPP_IMPORT", "AsyncFileIO:3 missing host path {}", path);
                 return 0;
             }
@@ -1704,6 +1805,184 @@ impl Eapp {
             return 1;
         }
         0
+    }
+
+    fn handle_misc9_time_api(&mut self, args: [u32; 4]) -> u32 {
+        self.misc9_time_diag_count = self.misc9_time_diag_count.wrapping_add(1);
+        let before = self.read_guest_u32(args[0]).unwrap_or(0xffff_ffff);
+        let host_us = self.host_start.elapsed().as_micros() as u64;
+        let guest_tick = host_us as u32;
+        let wrote = args[0] != 0 && self.write_guest_u32(args[0], guest_tick);
+        let after = self.read_guest_u32(args[0]).unwrap_or(0xffff_ffff);
+        let guest_time_advances = self
+            .misc9_last_pointed_value
+            .map(|prev| prev != after)
+            .unwrap_or(false);
+        self.misc9_last_pointed_value = Some(after);
+        let ret = args[0];
+        let log_limit = std::env::var_os("CLICKY_EAPP_TIME_DIAG_LIMIT")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .unwrap_or(80);
+        if self.startup_progress.enabled && self.misc9_time_diag_count <= log_limit {
+            info!(
+                target: "EAPP_PROGRESS",
+                "time_api module=miscTBD ordinal=9 frame={} call={} args=[{:#010x},{:#010x},{:#010x},{:#010x}] pointed_before={:#010x} pointed_after={:#010x} ret={:#010x} host_us={} guest_time_advances={} writes_guest_time={}",
+                self.frame_counter,
+                self.misc9_time_diag_count,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                before,
+                after,
+                ret,
+                host_us,
+                guest_time_advances,
+                wrote
+            );
+        }
+        ret
+    }
+
+    fn maybe_log_startup_progress(&mut self) {
+        if !self.startup_progress.enabled {
+            return;
+        }
+        let frame = self.frame_counter;
+        let fb_hash = self.render_state_hash();
+        let hash_changed = self
+            .startup_progress
+            .last_framebuffer_hash
+            .map(|prev| prev != fb_hash)
+            .unwrap_or(false);
+        if hash_changed && self.startup_progress.first_hash_change_frame.is_none() {
+            self.startup_progress.first_hash_change_frame = Some(frame);
+        }
+        self.startup_progress.last_framebuffer_hash = Some(fb_hash);
+
+        let should_log = frame <= 10
+            || frame % self.startup_progress.interval == 0
+            || hash_changed
+            || self.startup_progress.logged < 10;
+        if !should_log || self.startup_progress.logged >= self.startup_progress.max_logs {
+            return;
+        }
+        self.startup_progress.logged += 1;
+
+        let app_time_current = self
+            .read_guest_u32(self.app_object.wrapping_add(4))
+            .unwrap_or(0);
+        let app_time_delta = self
+            .read_guest_u32(self.app_object.wrapping_add(8))
+            .unwrap_or(0);
+        let frame_state = self.read_guest_u8(self.frame_context).unwrap_or(0xff);
+        let frame_event_mask = self
+            .read_guest_u32(self.frame_context.wrapping_add(0x20))
+            .unwrap_or(0);
+        let app_event_head = self
+            .read_guest_u32(self.app_object.wrapping_add(0x30))
+            .unwrap_or(0);
+        let app_event_preview = self.preview_event_list(app_event_head, 4);
+        let splash_base = 0x1802_56bc;
+        let splash_phase = self.read_guest_u8(splash_base).unwrap_or(0xff);
+        let splash_timeout_a = self
+            .read_guest_u32(splash_base.wrapping_add(4))
+            .unwrap_or(0);
+        let splash_timeout_b = self
+            .read_guest_u32(splash_base.wrapping_add(8))
+            .unwrap_or(0);
+        let splash_flags = self
+            .read_guest_u32(splash_base.wrapping_add(0x14))
+            .unwrap_or(0);
+        let splash_time_a = self
+            .read_guest_u32(splash_base.wrapping_add(0x18))
+            .unwrap_or(0);
+        let splash_time_b = self
+            .read_guest_u32(splash_base.wrapping_add(0x1c))
+            .unwrap_or(0);
+        let splash_time_c = self
+            .read_guest_u32(splash_base.wrapping_add(0x20))
+            .unwrap_or(0);
+        let import_summary = self.format_frame_import_counts(8);
+        info!(
+            target: "EAPP_PROGRESS",
+            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}]",
+            frame,
+            self.host_start.elapsed().as_micros() as u64,
+            fb_hash,
+            hash_changed,
+            self.startup_progress.first_hash_change_frame,
+            app_time_current,
+            app_time_delta,
+            frame_state,
+            frame_event_mask,
+            app_event_head,
+            app_event_preview,
+            splash_phase,
+            splash_flags,
+            splash_timeout_a,
+            splash_timeout_b,
+            splash_time_a,
+            splash_time_b,
+            splash_time_c,
+            self.async_request_count,
+            self.async_callback_queued_count,
+            self.guest_callback_invocation_count,
+            self.async_pending_requests.len(),
+            self.staged_files.len(),
+            import_summary
+        );
+    }
+
+    fn render_state_hash(&self) -> u64 {
+        let frame = self.render_state.lock().unwrap();
+        let mut hasher = DefaultHasher::new();
+        frame.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn preview_words(&mut self, addr: u32, count: usize) -> String {
+        (0..count)
+            .map(|i| {
+                let a = addr.wrapping_add((i * 4) as u32);
+                format!("{:#010x}", self.read_guest_u32(a).unwrap_or(0xffff_ffff))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn preview_event_list(&mut self, mut head: u32, limit: usize) -> String {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for _ in 0..limit {
+            if head == 0 || !seen.insert(head) {
+                break;
+            }
+            let b0 = self.read_guest_u8(head).unwrap_or(0xff);
+            let b1 = self.read_guest_u8(head.wrapping_add(1)).unwrap_or(0xff);
+            let next = self.read_guest_u32(head.wrapping_add(8)).unwrap_or(0);
+            out.push(format!(
+                "{:#010x}:b0={} b1={} next={:#010x}",
+                head, b0, b1, next
+            ));
+            head = next;
+        }
+        out.join("|")
+    }
+
+    fn format_frame_import_counts(&self, limit: usize) -> String {
+        let mut counts: Vec<_> = self
+            .frame_import_counts
+            .iter()
+            .filter(|((module, _), _)| module != "OpenGLES")
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        counts
+            .into_iter()
+            .take(limit)
+            .map(|((module, ordinal), count)| format!("{}:{}={}", module, ordinal, count))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn fill_framebuffer(&mut self, color: u32) {
@@ -1714,11 +1993,21 @@ impl Eapp {
     fn handle_bootstrap_return(&mut self) {
         match self.bootstrap_phase {
             BootstrapPhase::Entry => {
+                let entry_r0 = self.cpu.reg_get(self.cpu.mode(), 0);
+                let entry_r1 = self.cpu.reg_get(self.cpu.mode(), 1);
+                let entry_r2 = self.cpu.reg_get(self.cpu.mode(), 2);
+                let entry_r3 = self.cpu.reg_get(self.cpu.mode(), 3);
+                let entry_r1_preview = self.preview_words(entry_r1, 12);
                 self.app_object = self.alloc_zeroed(0x2000);
                 self.frame_context = self.alloc_zeroed(0x80);
                 info!(
                     target: "EAPP",
-                    "bootstrap entry returned; app_object={:#010x} frame_context={:#010x} aux={:#010x}",
+                    "bootstrap entry returned; entry_ret=[{:#010x},{:#010x},{:#010x},{:#010x}] entry_r1_words=[{}] app_object={:#010x} frame_context={:#010x} aux={:#010x}",
+                    entry_r0,
+                    entry_r1,
+                    entry_r2,
+                    entry_r3,
+                    entry_r1_preview,
                     self.app_object,
                     self.frame_context,
                     self.header.aux_addr
@@ -1737,6 +2026,8 @@ impl Eapp {
                         self.cpu.reg_get(self.cpu.mode(), 0)
                     );
                 }
+                self.maybe_log_startup_progress();
+                self.frame_import_counts.clear();
                 if !self.dispatch_pending_guest_call() {
                     self.queue_next_frame();
                 }
@@ -1758,13 +2049,29 @@ impl Eapp {
 
     fn dispatch_pending_guest_call(&mut self) -> bool {
         if let Some(call) = self.pending_guest_calls.pop_front() {
-            debug!(
-                target: "EAPP",
-                "dispatching guest callback pc={:#010x} arg0={:#010x} arg1={:#010x}",
-                call.pc,
-                call.arg0,
-                call.arg1
-            );
+            self.guest_callback_invocation_count =
+                self.guest_callback_invocation_count.wrapping_add(1);
+            self.async_pending_requests.remove(&call.arg0);
+            if self.startup_progress.enabled {
+                info!(
+                    target: "EAPP_PROGRESS",
+                    "callback_dispatch frame={} count={} pc={:#010x} arg0={:#010x} arg1={:#010x} pending_async={}",
+                    self.frame_counter,
+                    self.guest_callback_invocation_count,
+                    call.pc,
+                    call.arg0,
+                    call.arg1,
+                    self.async_pending_requests.len()
+                );
+            } else {
+                debug!(
+                    target: "EAPP",
+                    "dispatching guest callback pc={:#010x} arg0={:#010x} arg1={:#010x}",
+                    call.pc,
+                    call.arg0,
+                    call.arg1
+                );
+            }
             self.cpu.reg_set(self.cpu.mode(), 0, call.arg0);
             self.cpu.reg_set(self.cpu.mode(), 1, call.arg1);
             self.cpu
