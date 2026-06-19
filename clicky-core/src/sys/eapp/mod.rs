@@ -128,6 +128,8 @@ pub struct Eapp {
     staged_files: HashMap<u32, StagedFile>,
     /// Request objects we've already dumped once, to keep logs tractable.
     dumped_requests: HashSet<u32>,
+    /// Per-(module, ordinal) call counters, to find render-critical imports.
+    import_call_counts: HashMap<(String, u32), u64>,
     halted: bool,
 }
 
@@ -257,6 +259,7 @@ impl Eapp {
             pending_guest_calls: VecDeque::new(),
             staged_files: HashMap::new(),
             dumped_requests: HashSet::new(),
+            import_call_counts: HashMap::new(),
             halted: false,
         })
     }
@@ -293,6 +296,18 @@ impl Eapp {
             self.step()?;
         }
         Ok(())
+    }
+
+    /// Log the most-frequent import calls seen so far. Useful for finding
+    /// render-critical ordinals inside the per-frame loop.
+    pub fn log_top_imports(&self, limit: usize) {
+        let mut counts: Vec<(&(String, u32), &u64)> = self.import_call_counts.iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(a.1));
+        let mut rendered = String::new();
+        for ((module, ordinal), count) in counts.into_iter().take(limit) {
+            rendered.push_str(&format!("\n    {}:{} = {}", module, ordinal, count));
+        }
+        info!(target: "EAPP", "top {} imports by call count:{}", limit, rendered);
     }
 
     pub fn step(&mut self) -> FatalMemResult<()> {
@@ -349,6 +364,7 @@ impl Eapp {
         ];
 
         let key = (import.module.clone(), import.ordinal);
+        *self.import_call_counts.entry(key.clone()).or_insert(0u64) += 1;
         if self.logged_imports.insert(key.clone()) {
             info!(
                 target: "EAPP_IMPORT",

@@ -138,6 +138,7 @@ fn main() -> DynResult<()> {
             Some(cycles) => system.run_cycles(cycles),
             None => system.run(),
         };
+        system.log_top_imports(25);
         if let Err(err) = result {
             return Err(format!("fatal eapp error: {:#010x?}", err).into());
         }

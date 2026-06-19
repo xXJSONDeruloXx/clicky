@@ -312,6 +312,24 @@ In order:
    texture upload, texcoord/vertex setup, draw, and a real framebuffer the game
    writes into instead of our green fill. (This is now the active blocker.)
 
+   Per-call frequency (5,000,000-cycle headless run, ~561 frames) narrows this
+   down considerably. The render-critical ordinals are:
+   - once-per-frame (~560 calls, matches `InputEvents:0`):
+     - `OpenGLES:157`, `OpenGLES:158`, `OpenGLES:165` — frame begin / present / swap.
+       `OpenGLES:158` is the most likely present/swap (carries a surface handle
+       like `0x0003f001` in `r0`).
+   - per-quad draw cluster (~2238 calls each, ≈ 4× frames):
+     - `OpenGLES:125`, `OpenGLES:37`, `OpenGLES:159`, `OpenGLES:175`
+   - very high frequency (likely state setters / clears):
+     - `OpenGLES:40` (5302), `OpenGLES:137` (5035), `OpenGLES:169` (4474),
+       `OpenGLES:36` (2797)
+
+   Plausible shortcut worth investigating before committing to a full software
+   GL ES renderer: if `OpenGLES:158` is present and the surface handle resolves
+   to a known guest framebuffer address, we may be able to blit that surface
+   directly to the host window instead of emulating the full fixed-function
+   pipeline.
+
 Step 1 unblocks step 2.
 
 This is the current meaningful checkpoint for the direct-runtime path.
