@@ -187,11 +187,21 @@ cargo run -p clicky-desktop --bin eapp -- /path/to/Games_RO/66666 --headless --c
 Current observed behavior for **Tetris**:
 
 - the binary loads and begins executing native ARM code from the parsed entrypoint
-- the runner reaches the first runtime import
-- first observed import is `miscTBD:0`
-- current evidence suggests `miscTBD:0` behaves like a small allocation helper
-- execution still crashes shortly afterward because more runtime semantics are
-  missing, but this is already past static loading and into real guest code
+- the runner now treats the initial `eapp` entry as a bootstrap/init phase and
+  then invokes the app constructor path
+- observed imports now include:
+  - `miscTBD:0`
+  - `miscTBD:9`
+  - `InputEvents:0`
+  - `OpenGLES:12`
+  - `OpenGLES:13`
+  - `OpenGLES:157`
+- current evidence suggests:
+  - `miscTBD:0` behaves like a small allocation helper
+  - `miscTBD:9` is some kind of object/base-class constructor hook
+  - `InputEvents:0` is used during constructor-time input state probing
+- the runner can now get through constructor-time setup far enough to reach
+  multiple graphics/input imports before halting the experimental bootstrap
 
 This is the first meaningful checkpoint for the direct-runtime path.
 
