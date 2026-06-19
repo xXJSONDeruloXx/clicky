@@ -245,9 +245,10 @@ Current observed behavior for **Tetris**:
   - save paths like `prefs.sav` and `game.sav`
 - with the current bring-up hacks in place, headless Tetris runs now survive at
   least `20,000,000` cycles without fatal memory exceptions
-- the same runtime changes also help broader titles: a quick headless PAC-MAN
-  smoke test now resolves virtual-root audio paths like `/audio/extra life.wav`
-  instead of immediately failing path lookup
+- the same runtime changes also help broader titles: headless PAC-MAN now
+  resolves virtual-root audio paths like `/audio/extra life.wav` instead of
+  immediately failing path lookup, and a `20,000,000`-cycle smoke test also
+  completes without fatal memory exceptions
 - current blocker has moved again: the runner is no longer dying on the first
   constructor/import path or the first late menu/resource dereference, but it is
   still missing real file/resource decoding semantics and real audio/runtime ABI
