@@ -8,6 +8,7 @@ use thiserror::Error;
 
 mod gl_decode;
 mod gl_trace;
+mod rasterizer;
 pub use gl_decode::{
     bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
     float_words_from_snapshot, register, stack_word, texture_upload_candidates,
@@ -17,6 +18,10 @@ use gl_trace::hex_bytes;
 pub use gl_trace::{
     GlFileBacking, GlFrameRecord, GlImportRecord, GlMemoryRegion, GlMemorySnapshot,
     GlRegisterSnapshot, GlStackWordSnapshot, GlTraceFixture, GlTraceRecorder, GlValueClass,
+};
+pub use rasterizer::{
+    blend_src_over, decode_texture_pixels, framebuffer_hash, framebuffer_to_ppm, rasterize_quad,
+    rasterize_triangle, sample_nearest, Rgba8, Texture, TextureFormat,
 };
 
 use crate::devices::generic::Ram;

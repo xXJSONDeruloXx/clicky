@@ -1,6 +1,7 @@
 use clicky_core::sys::eapp::{
-    decode_fixed_16_16, first_frame, register, stack_word, texture_upload_candidates,
-    words_from_snapshot, GlImportRecord, GlTraceFixture,
+    blend_src_over, decode_fixed_16_16, first_frame, framebuffer_hash, framebuffer_to_ppm,
+    rasterize_quad, register, sample_nearest, stack_word, words_from_snapshot, GlImportRecord,
+    GlTraceFixture, Rgba8, Texture, TextureFormat,
 };
 
 fn load_fixture() -> GlTraceFixture {
@@ -8,27 +9,15 @@ fn load_fixture() -> GlTraceFixture {
         .expect("valid trace fixture json")
 }
 
-fn make_test_rgba5551_texture(width: usize, height: usize) -> Vec<u8> {
-    let mut raw = Vec::with_capacity(width * height * 2);
-    for y in 0..height {
-        for x in 0..width {
-            let r = ((x as u16) * 31 / (width as u16 - 1)) & 0x1f;
-            let g = ((y as u16) * 31 / (height as u16 - 1)) & 0x1f;
-            let b = (((x + y) as u16) * 31 / ((width + height - 2) as u16)) & 0x1f;
-            let px = (r << 11) | (g << 6) | (b << 1) | 1;
-            raw.extend_from_slice(&px.to_le_bytes());
-        }
-    }
-    raw
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn seq_record<'a>(
+    frame: &'a clicky_core::sys::eapp::GlFrameRecord,
+    seq: u64,
+) -> &'a GlImportRecord {
+    frame
+        .records
+        .iter()
+        .find(|record| record.seq_in_frame == seq)
+        .unwrap_or_else(|| panic!("missing seq_in_frame {}", seq))
 }
 
 fn words_as_positions_xyzw(words: &[u32]) -> Vec<(f32, f32, f32, f32)> {
@@ -52,135 +41,314 @@ fn words_as_pairs(words: &[u32]) -> Vec<(f32, f32)> {
         .collect()
 }
 
-fn decode_rgba5551(raw: &[u8], width: usize, height: usize) -> Vec<u32> {
-    assert_eq!(raw.len(), width * height * 2);
-    raw.chunks_exact(2)
-        .map(|chunk| {
-            let px = u16::from_le_bytes([chunk[0], chunk[1]]);
-            let r = ((px >> 11) & 0x1f) as u32 * 255 / 31;
-            let g = ((px >> 6) & 0x1f) as u32 * 255 / 31;
-            let b = ((px >> 1) & 0x1f) as u32 * 255 / 31;
-            let a = if (px & 0x1) != 0 { 255 } else { 0 };
-            (a << 24) | (r << 16) | (g << 8) | b
-        })
-        .collect()
-}
-
-fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
-    (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-}
-
-fn rasterize_triangle(
-    fb: &mut [u32],
-    fb_width: usize,
-    fb_height: usize,
-    tex: &[u32],
-    tex_width: usize,
-    tex_height: usize,
-    verts: &[(f32, f32, f32, f32); 3],
-) {
-    let min_x = verts
-        .iter()
-        .map(|v| v.0)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i32;
-    let min_y = verts
-        .iter()
-        .map(|v| v.1)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i32;
-    let max_x = verts
-        .iter()
-        .map(|v| v.0)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min((fb_width - 1) as f32) as i32;
-    let max_y = verts
-        .iter()
-        .map(|v| v.1)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min((fb_height - 1) as f32) as i32;
-
-    let area = edge(
-        verts[0].0, verts[0].1, verts[1].0, verts[1].1, verts[2].0, verts[2].1,
-    );
-    if area == 0.0 {
-        return;
-    }
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let w0 = edge(verts[1].0, verts[1].1, verts[2].0, verts[2].1, px, py) / area;
-            let w1 = edge(verts[2].0, verts[2].1, verts[0].0, verts[0].1, px, py) / area;
-            let w2 = edge(verts[0].0, verts[0].1, verts[1].0, verts[1].1, px, py) / area;
-            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                continue;
-            }
-            let u = verts[0].2 * w0 + verts[1].2 * w1 + verts[2].2 * w2;
-            let v = verts[0].3 * w0 + verts[1].3 * w1 + verts[2].3 * w2;
-            let tx = u.floor().clamp(0.0, (tex_width - 1) as f32) as usize;
-            let ty = v.floor().clamp(0.0, (tex_height - 1) as f32) as usize;
-            let color = tex[ty * tex_width + tx];
-            fb[y as usize * fb_width + x as usize] = color;
+fn make_raw_rgb565(width: usize, height: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(width * height * 2);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as u16) * 31 / (width as u16 - 1)) & 0x1f;
+            let g = ((y as u16) * 63 / (height as u16 - 1)) & 0x3f;
+            let b = (((x + y) as u16) * 31 / ((width + height - 2) as u16)) & 0x1f;
+            let px = (r << 11) | (g << 5) | b;
+            raw.extend_from_slice(&px.to_le_bytes());
         }
     }
+    raw
 }
 
-fn render_quad_into(
-    fb: &mut [u32],
-    tex: &[u32],
-    tex_width: usize,
-    tex_height: usize,
-    positions: &[(f32, f32)],
-    uvs: &[(f32, f32)],
-) {
-    let tri0 = [
-        (positions[0].0, positions[0].1, uvs[0].0, uvs[0].1),
-        (positions[1].0, positions[1].1, uvs[1].0, uvs[1].1),
-        (positions[2].0, positions[2].1, uvs[2].0, uvs[2].1),
-    ];
-    let tri1 = [
-        (positions[0].0, positions[0].1, uvs[0].0, uvs[0].1),
-        (positions[2].0, positions[2].1, uvs[2].0, uvs[2].1),
-        (positions[3].0, positions[3].1, uvs[3].0, uvs[3].1),
-    ];
-    rasterize_triangle(fb, 320, 240, tex, tex_width, tex_height, &tri0);
-    rasterize_triangle(fb, 320, 240, tex, tex_width, tex_height, &tri1);
-}
-
-fn render_quads_into(quads: &[(&[(f32, f32)], &[(f32, f32)], &[u32], usize, usize)]) -> Vec<u32> {
-    let mut fb = vec![0u32; 320 * 240];
-    for (positions, uvs, tex, tex_width, tex_height) in quads {
-        render_quad_into(&mut fb, tex, *tex_width, *tex_height, positions, uvs);
+fn make_raw_rgba5551(width: usize, height: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(width * height * 2);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as u16) * 31 / (width as u16 - 1)) & 0x1f;
+            let g = ((y as u16) * 31 / (height as u16 - 1)) & 0x1f;
+            let b = (((x + y) as u16) * 31 / ((width + height - 2) as u16)) & 0x1f;
+            let a = if ((x / 4) + (y / 4)) % 2 == 0 { 1 } else { 0 };
+            let px = (r << 11) | (g << 6) | (b << 1) | a;
+            raw.extend_from_slice(&px.to_le_bytes());
+        }
     }
-    fb
+    raw
 }
 
-fn write_ppm(path: &std::path::Path, fb: &[u32], width: usize, height: usize) {
-    let mut out = Vec::with_capacity(width * height * 3 + 64);
-    out.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
-    for &px in fb {
-        out.push(((px >> 16) & 0xff) as u8);
-        out.push(((px >> 8) & 0xff) as u8);
-        out.push((px & 0xff) as u8);
+fn make_raw_rgba4444(width: usize, height: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(width * height * 2);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as u16) * 15 / (width as u16 - 1)) & 0x0f;
+            let g = ((y as u16) * 15 / (height as u16 - 1)) & 0x0f;
+            let b = (((x + y) as u16) * 15 / ((width + height - 2) as u16)) & 0x0f;
+            let a = (((x ^ y) as u16) * 15 / ((width.max(height) - 1) as u16)) & 0x0f;
+            let px = (r << 12) | (g << 8) | (b << 4) | a;
+            raw.extend_from_slice(&px.to_le_bytes());
+        }
     }
-    std::fs::write(path, out).expect("write ppm");
+    raw
 }
 
-fn seq_record<'a>(
-    frame: &'a clicky_core::sys::eapp::GlFrameRecord,
-    seq: u64,
-) -> &'a GlImportRecord {
-    frame
-        .records
-        .iter()
-        .find(|record| record.seq_in_frame == seq)
-        .unwrap_or_else(|| panic!("missing seq_in_frame {}", seq))
+fn make_raw_a8(width: usize, height: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = if width == 1 && height == 1 {
+                128
+            } else {
+                ((x * 255 / (width - 1)) ^ (y * 255 / (height - 1))) as u8
+            };
+            raw.push(alpha);
+        }
+    }
+    raw
+}
+
+fn make_texture(format: TextureFormat, width: usize, height: usize, raw: Vec<u8>) -> Texture {
+    Texture::from_bytes(&raw, width, height, format, Rgba8::rgba(255, 255, 255, 255))
+}
+
+fn replay_frame4() -> (Vec<Rgba8>, Vec<DrawReplay>) {
+    let fixture = load_fixture();
+    let frame4 = first_frame(&fixture, 4).expect("steady-state frame");
+
+    let draws = vec![
+        DrawReplay::from_frame(
+            frame4,
+            DrawPlan {
+                seqs_169: &[3, 4, 5],
+                seq_159: 6,
+                seq_pos: 7,
+                seq_uv: 10,
+                seq_aux: Some(11),
+                proposed_texture: ProposedTexture::resolved(
+                    "screenBG_565.pix",
+                    320,
+                    240,
+                    TextureFormat::Rgb565,
+                    0.93,
+                ),
+                texture: make_texture(TextureFormat::Rgb565, 320, 240, make_raw_rgb565(320, 240)),
+            },
+        ),
+        DrawReplay::from_frame(
+            frame4,
+            DrawPlan {
+                seqs_169: &[18, 19],
+                seq_159: 20,
+                seq_pos: 21,
+                seq_uv: 24,
+                seq_aux: None,
+                proposed_texture: ProposedTexture::resolved(
+                    "tetrisLogo_4444.pix",
+                    250,
+                    162,
+                    TextureFormat::Rgba4444,
+                    0.84,
+                ),
+                texture: make_texture(
+                    TextureFormat::Rgba4444,
+                    250,
+                    162,
+                    make_raw_rgba4444(250, 162),
+                ),
+            },
+        ),
+        DrawReplay::from_frame(
+            frame4,
+            DrawPlan {
+                seqs_169: &[29, 30],
+                seq_159: 31,
+                seq_pos: 32,
+                seq_uv: 35,
+                seq_aux: None,
+                proposed_texture: ProposedTexture::resolved(
+                    "eaLogo_5551.pix",
+                    50,
+                    50,
+                    TextureFormat::Rgba5551,
+                    0.87,
+                ),
+                texture: make_texture(TextureFormat::Rgba5551, 50, 50, make_raw_rgba5551(50, 50)),
+            },
+        ),
+        DrawReplay::from_frame(
+            frame4,
+            DrawPlan {
+                seqs_169: &[40],
+                seq_159: 41,
+                seq_pos: 42,
+                seq_uv: 44,
+                seq_aux: None,
+                proposed_texture: ProposedTexture::unresolved(
+                    "generated placeholder",
+                    "handle 3 / full-screen overlay",
+                    TextureFormat::A8,
+                    0.28,
+                ),
+                texture: make_texture(TextureFormat::A8, 1, 1, make_raw_a8(1, 1)),
+            },
+        ),
+    ];
+
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+    for draw in &draws {
+        draw.rasterize(&mut fb);
+    }
+    (fb, draws)
+}
+
+#[derive(Debug, Clone)]
+struct DrawPlan {
+    seqs_169: &'static [u64],
+    seq_159: u64,
+    seq_pos: u64,
+    seq_uv: u64,
+    seq_aux: Option<u64>,
+    proposed_texture: ProposedTexture,
+    texture: Texture,
+}
+
+#[derive(Debug, Clone)]
+struct DrawReplay {
+    ordinal159_handle: u32,
+    state_ptr: u32,
+    translation: (f32, f32),
+    local_positions: [(f32, f32); 4],
+    uv_or_aux: Vec<(f32, f32)>,
+    aux_array: Option<Vec<(f32, f32)>>,
+    screen_bounds: (f32, f32, f32, f32),
+    proposed_texture: ProposedTexture,
+    texture: Texture,
+    coverage: u64,
+}
+
+impl DrawReplay {
+    fn from_frame(frame: &clicky_core::sys::eapp::GlFrameRecord, plan: DrawPlan) -> Self {
+        let mut tx = 0.0f32;
+        let mut ty = 0.0f32;
+        for seq in plan.seqs_169 {
+            let record = seq_record(frame, *seq);
+            tx += f32::from_bits(register(record, "r1").unwrap().value);
+            ty += f32::from_bits(register(record, "r2").unwrap().value);
+        }
+
+        let record_159 = seq_record(frame, plan.seq_159);
+        let ordinal159_handle = register(record_159, "r0").unwrap().value;
+        let state_ptr = register(record_159, "r1").unwrap().value;
+
+        let pos_words = stack_word(seq_record(frame, plan.seq_pos), 0x04)
+            .and_then(|word| word.snapshot.as_ref())
+            .expect("position snapshot");
+        let local_positions = {
+            let points = words_as_positions_xyzw(&words_from_snapshot(pos_words));
+            [
+                (points[0].0 + tx, points[0].1 + ty),
+                (points[1].0 + tx, points[1].1 + ty),
+                (points[2].0 + tx, points[2].1 + ty),
+                (points[3].0 + tx, points[3].1 + ty),
+            ]
+        };
+
+        let uv_words = stack_word(seq_record(frame, plan.seq_uv), 0x04)
+            .and_then(|word| word.snapshot.as_ref())
+            .expect("uv snapshot");
+        let uv_or_aux = words_as_pairs(&words_from_snapshot(uv_words));
+        let aux_array = plan.seq_aux.map(|seq| {
+            let aux_words = stack_word(seq_record(frame, seq), 0x04)
+                .and_then(|word| word.snapshot.as_ref())
+                .expect("aux snapshot");
+            words_as_pairs(&words_from_snapshot(aux_words))
+        });
+
+        let screen_bounds = local_positions.iter().fold(
+            (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            |acc, (x, y)| (acc.0.min(*x), acc.1.min(*y), acc.2.max(*x), acc.3.max(*y)),
+        );
+
+        let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+        let coverage = rasterize_quad(
+            &mut fb,
+            320,
+            240,
+            &plan.texture,
+            &local_positions,
+            &[uv_or_aux[0], uv_or_aux[1], uv_or_aux[2], uv_or_aux[3]],
+        );
+
+        Self {
+            ordinal159_handle,
+            state_ptr,
+            translation: (tx, ty),
+            local_positions,
+            uv_or_aux,
+            aux_array,
+            screen_bounds,
+            proposed_texture: plan.proposed_texture,
+            texture: plan.texture,
+            coverage,
+        }
+    }
+
+    fn rasterize(&self, fb: &mut [Rgba8]) -> u64 {
+        let positions = self.local_positions;
+        let uvs = [
+            self.uv_or_aux[0],
+            self.uv_or_aux[1],
+            self.uv_or_aux[2],
+            self.uv_or_aux[3],
+        ];
+        rasterize_quad(fb, 320, 240, &self.texture, &positions, &uvs)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProposedTexture {
+    label: &'static str,
+    kind: &'static str,
+    width: Option<usize>,
+    height: Option<usize>,
+    format: TextureFormat,
+    confidence: f32,
+    unresolved_note: Option<&'static str>,
+}
+
+impl ProposedTexture {
+    fn resolved(
+        label: &'static str,
+        width: usize,
+        height: usize,
+        format: TextureFormat,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            label,
+            kind: "candidate",
+            width: Some(width),
+            height: Some(height),
+            format,
+            confidence,
+            unresolved_note: None,
+        }
+    }
+
+    fn unresolved(
+        label: &'static str,
+        note: &'static str,
+        format: TextureFormat,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            label,
+            kind: "unresolved",
+            width: None,
+            height: None,
+            format,
+            confidence,
+            unresolved_note: Some(note),
+        }
+    }
 }
 
 #[test]
@@ -192,168 +360,299 @@ fn fixed_16_16_decodes_signed_values() {
 }
 
 #[test]
-fn decodes_real_texture_triplet_and_quad_arrays() {
+fn decodes_frame4_draw_stream_and_associations() {
     let fixture = load_fixture();
-    let uploads = texture_upload_candidates(&fixture);
-    let logo = uploads
-        .iter()
-        .find(|candidate| {
-            candidate.width == 50
-                && candidate.height == 50
-                && candidate.pixel_type == 0x8034
-                && candidate
-                    .source_file
-                    .as_ref()
-                    .map(|file| file.path.as_str())
-                    == Some("eaLogo_5551.pix")
-        })
-        .expect("50x50 eaLogo upload");
-    assert_eq!(logo.source_ptr, 0x1001_45d6);
-    assert_eq!(logo.source_file.as_ref().unwrap().offset, 70);
-
     let frame4 = first_frame(&fixture, 4).expect("steady-state frame");
-    let tex_record = seq_record(frame4, 31);
-    assert_eq!(register(tex_record, "r0").unwrap().value, 0x1b);
 
-    let pos_record = seq_record(frame4, 32);
-    let pos_snapshot = stack_word(pos_record, 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("position snapshot");
-    let pos = words_as_positions_xyzw(&words_from_snapshot(pos_snapshot));
-    assert_eq!(pos[0], (0.0, 0.0, 0.0, 1.0));
-    assert_eq!(pos[1], (0.0, 50.0, 0.0, 1.0));
-    assert_eq!(pos[2], (50.0, 50.0, 0.0, 1.0));
-    assert_eq!(pos[3], (50.0, 0.0, 0.0, 1.0));
+    let draws = [
+        (
+            6u64,
+            320u32,
+            240u32,
+            TextureFormat::Rgb565,
+            0.93f32,
+            "screenBG_565.pix",
+            false,
+        ),
+        (
+            20u64,
+            250u32,
+            162u32,
+            TextureFormat::Rgba4444,
+            0.84f32,
+            "tetrisLogo_4444.pix",
+            false,
+        ),
+        (
+            31u64,
+            50u32,
+            50u32,
+            TextureFormat::Rgba5551,
+            0.87f32,
+            "eaLogo_5551.pix",
+            false,
+        ),
+        (
+            41u64,
+            1u32,
+            1u32,
+            TextureFormat::A8,
+            0.28f32,
+            "generated placeholder",
+            true,
+        ),
+    ];
 
-    let uv_record = seq_record(frame4, 35);
-    let uv_snapshot = stack_word(uv_record, 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("uv snapshot");
-    let uv = words_as_pairs(&words_from_snapshot(uv_snapshot));
-    assert_eq!(uv[0], (0.5, 49.5));
-    assert_eq!(uv[1], (0.5, -0.5));
-    assert_eq!(uv[2], (50.5, -0.5));
-    assert_eq!(uv[3], (50.5, 49.5));
+    let summaries = replay_frame4().1;
+    assert_eq!(summaries.len(), 4);
 
-    let t0 = seq_record(frame4, 29);
-    let t1 = seq_record(frame4, 30);
-    let tx = register(t0, "r1").unwrap().float_value.unwrap()
-        + register(t1, "r1").unwrap().float_value.unwrap();
-    let ty = register(t0, "r2").unwrap().float_value.unwrap()
-        + register(t1, "r2").unwrap().float_value.unwrap();
-    assert_eq!((tx, ty), (235.0, 79.0));
+    for (idx, (summary, (seq_159, width, height, format, confidence, label, unresolved))) in
+        summaries.iter().zip(draws.iter()).enumerate()
+    {
+        assert!(summary.ordinal159_handle > 0);
+        if idx == 0 {
+            assert!(summary.aux_array.is_some());
+        } else {
+            assert!(summary.aux_array.is_none());
+        }
+        assert!(summary.state_ptr > 0);
+        assert_eq!(
+            summary.proposed_texture.kind,
+            if *unresolved {
+                "unresolved"
+            } else {
+                "candidate"
+            }
+        );
+        assert_eq!(summary.proposed_texture.format, *format);
+        assert!((summary.proposed_texture.confidence - confidence).abs() < 0.001);
+        assert_eq!(summary.proposed_texture.label, *label);
+        if *unresolved {
+            assert_eq!(summary.proposed_texture.width, None);
+            assert_eq!(summary.proposed_texture.height, None);
+            assert_eq!(
+                summary.proposed_texture.unresolved_note,
+                Some("handle 3 / full-screen overlay")
+            );
+        } else {
+            assert_eq!(summary.proposed_texture.width, Some(*width as usize));
+            assert_eq!(summary.proposed_texture.height, Some(*height as usize));
+            assert_eq!(summary.proposed_texture.unresolved_note, None);
+        }
+        assert!(summary.coverage > 0);
+        assert!(summary.translation.0.is_finite());
+        assert!(summary.translation.1.is_finite());
+        assert!(summary.screen_bounds.0.is_finite());
+        assert!(summary.screen_bounds.1.is_finite());
+        assert!(summary.screen_bounds.2.is_finite());
+        assert!(summary.screen_bounds.3.is_finite());
+        let record = seq_record(frame4, *seq_159);
+        assert_eq!(
+            summary.ordinal159_handle,
+            register(record, "r0").unwrap().value
+        );
+    }
 }
 
 #[test]
-fn renders_real_tetris_quad_and_hashes_framebuffer() {
-    let fixture = load_fixture();
-    let frame4 = first_frame(&fixture, 4).expect("steady-state frame");
-
-    let pos_record = seq_record(frame4, 32);
-    let pos_snapshot = stack_word(pos_record, 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("position snapshot");
-    let pos_local = words_as_positions_xyzw(&words_from_snapshot(pos_snapshot));
-
-    let uv_record = seq_record(frame4, 35);
-    let uv_snapshot = stack_word(uv_record, 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("uv snapshot");
-    let uv = words_as_pairs(&words_from_snapshot(uv_snapshot));
-
-    let t0 = seq_record(frame4, 29);
-    let t1 = seq_record(frame4, 30);
-    let tx = register(t0, "r1").unwrap().float_value.unwrap()
-        + register(t1, "r1").unwrap().float_value.unwrap();
-    let ty = register(t0, "r2").unwrap().float_value.unwrap()
-        + register(t1, "r2").unwrap().float_value.unwrap();
-
-    let positions: Vec<(f32, f32)> = pos_local
-        .iter()
-        .map(|(x, y, _, _)| (x + tx, y + ty))
-        .collect();
-
-    let tex = decode_rgba5551(&make_test_rgba5551_texture(50, 50), 50, 50);
-    let fb = render_quads_into(&[(&positions, &uv, &tex, 50, 50)]);
-
-    let mut bytes = Vec::with_capacity(fb.len() * 4);
-    for px in &fb {
-        bytes.extend_from_slice(&px.to_le_bytes());
-    }
-    let hash = fnv1a64(&bytes);
-    if std::env::var_os("CLICKY_WRITE_TETRIS_QUAD_PPM").is_some() {
-        write_ppm(std::path::Path::new("/tmp/tetris_quad3.ppm"), &fb, 320, 240);
-    }
-    assert_eq!(hash, 0x8fd5_603a_6dfa_4182);
+fn sample_nearest_matches_floor_and_clamp_capture_coordinates() {
+    let tex = Texture::from_bytes(
+        &[
+            0x00, 0xf8, // top-left red
+            0xe0, 0x07, // top-right green
+            0x1f, 0x00, // bottom-left blue
+            0xff, 0xff, // bottom-right white
+        ],
+        2,
+        2,
+        TextureFormat::Rgb565,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
+    assert_eq!(sample_nearest(&tex, 0.5, 0.5), Rgba8::rgba(255, 0, 0, 255));
+    assert_eq!(sample_nearest(&tex, 1.5, 0.5), Rgba8::rgba(0, 255, 0, 255));
+    assert_eq!(sample_nearest(&tex, 0.5, 1.5), Rgba8::rgba(0, 0, 255, 255));
+    assert_eq!(
+        sample_nearest(&tex, 1.5, 1.5),
+        Rgba8::rgba(255, 255, 255, 255)
+    );
+    assert_eq!(
+        sample_nearest(&tex, -0.5, -0.5),
+        Rgba8::rgba(255, 0, 0, 255)
+    );
 }
 
 #[test]
-fn replays_multiple_real_tetris_quads_and_hashes_framebuffer() {
-    let fixture = load_fixture();
-    let frame4 = first_frame(&fixture, 4).expect("steady-state frame");
+fn rasterizer_supports_formats_alpha_clipping_and_winding() {
+    let transparent = Texture::from_bytes(
+        &[0x00],
+        1,
+        1,
+        TextureFormat::A8,
+        Rgba8::rgba(255, 0, 0, 255),
+    );
+    let opaque_red = Texture::from_bytes(
+        &[0xff],
+        1,
+        1,
+        TextureFormat::A8,
+        Rgba8::rgba(255, 0, 0, 255),
+    );
+    let rgba4444 = Texture::from_bytes(
+        &[0x08, 0xf0],
+        1,
+        1,
+        TextureFormat::Rgba4444,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
+    let rgba5551 = Texture::from_bytes(
+        &[0x01, 0xf8],
+        1,
+        1,
+        TextureFormat::Rgba5551,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
+    let rgb565 = Texture::from_bytes(
+        &[0x1f, 0x00],
+        1,
+        1,
+        TextureFormat::Rgb565,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
 
-    let bg_pos = seq_record(frame4, 7);
-    let bg_pos_snapshot = stack_word(bg_pos, 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("background position snapshot");
-    let bg_positions = words_as_positions_xyzw(&words_from_snapshot(bg_pos_snapshot))
-        .into_iter()
-        .map(|(x, y, _, _)| (x, y))
-        .collect::<Vec<_>>();
+    assert_eq!(
+        blend_src_over(Rgba8::rgba(10, 20, 30, 255), Rgba8::rgba(0, 0, 0, 0)),
+        Rgba8::rgba(10, 20, 30, 255)
+    );
+    assert_eq!(
+        blend_src_over(Rgba8::rgba(10, 20, 30, 255), Rgba8::rgba(200, 10, 50, 255)),
+        Rgba8::rgba(200, 10, 50, 255)
+    );
 
-    let bg_uv_snapshot = stack_word(seq_record(frame4, 10), 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("background uv snapshot");
-    let bg_uv = words_as_pairs(&words_from_snapshot(bg_uv_snapshot));
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 4 * 4];
+    let quad = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)];
+    let uvs = [(0.5, 0.5), (0.5, 0.5), (0.5, 0.5), (0.5, 0.5)];
+    let cov = rasterize_quad(&mut fb, 4, 4, &opaque_red, &quad, &uvs);
+    assert_eq!(cov, 4);
+    assert_eq!(fb[0], Rgba8::rgba(255, 0, 0, 255));
 
-    let mid_pos_snapshot = stack_word(seq_record(frame4, 21), 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("middle position snapshot");
-    let mid_positions = words_as_positions_xyzw(&words_from_snapshot(mid_pos_snapshot))
-        .into_iter()
-        .map(|(x, y, _, _)| (x, y))
-        .collect::<Vec<_>>();
+    let mut fb = vec![Rgba8::rgba(0, 0, 255, 255); 2 * 2];
+    let quad = [(-1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (1.0, -1.0)];
+    let uvs = [(0.5, 0.5), (0.5, 0.5), (0.5, 0.5), (0.5, 0.5)];
+    let cov = rasterize_quad(&mut fb, 2, 2, &transparent, &quad, &uvs);
+    assert_eq!(cov, 1);
+    assert_eq!(fb[0], Rgba8::rgba(0, 0, 255, 255));
 
-    let mid_uv_snapshot = stack_word(seq_record(frame4, 24), 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("middle uv snapshot");
-    let mid_uv = words_as_pairs(&words_from_snapshot(mid_uv_snapshot));
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 2 * 2];
+    let quad = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    let uvs = [(0.5, 0.5), (0.5, 0.5), (0.5, 0.5), (0.5, 0.5)];
+    let cov_rgba4444 = rasterize_quad(&mut fb, 2, 2, &rgba4444, &quad, &uvs);
+    assert_eq!(cov_rgba4444, 1);
+    assert_eq!(rgba4444.pixels[0].a, 136);
+    assert_eq!(fb[0], rgba4444.pixels[0]);
 
-    let small_pos_snapshot = stack_word(seq_record(frame4, 32), 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("small position snapshot");
-    let small_positions = words_as_positions_xyzw(&words_from_snapshot(small_pos_snapshot))
-        .into_iter()
-        .map(|(x, y, _, _)| (x, y))
-        .collect::<Vec<_>>();
+    let mut fb_blend = vec![Rgba8::rgba(0, 0, 255, 255); 2 * 2];
+    let cov_rgba4444_blend = rasterize_quad(&mut fb_blend, 2, 2, &rgba4444, &quad, &uvs);
+    assert_eq!(cov_rgba4444_blend, 1);
+    assert_eq!(
+        fb_blend[0],
+        blend_src_over(Rgba8::rgba(0, 0, 255, 255), rgba4444.pixels[0])
+    );
 
-    let small_uv_snapshot = stack_word(seq_record(frame4, 35), 0x04)
-        .and_then(|word| word.snapshot.as_ref())
-        .expect("small uv snapshot");
-    let small_uv = words_as_pairs(&words_from_snapshot(small_uv_snapshot));
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 2 * 2];
+    let cov_rgba5551 = rasterize_quad(&mut fb, 2, 2, &rgba5551, &quad, &uvs);
+    assert_eq!(cov_rgba5551, 1);
+    assert_eq!(fb[0].a, 255);
 
-    let bg_tex = decode_rgba5551(&make_test_rgba5551_texture(320, 240), 320, 240);
-    let mid_tex = decode_rgba5551(&make_test_rgba5551_texture(250, 162), 250, 162);
-    let small_tex = decode_rgba5551(&make_test_rgba5551_texture(50, 50), 50, 50);
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 2 * 2];
+    let cov_rgb565 = rasterize_quad(&mut fb, 2, 2, &rgb565, &quad, &uvs);
+    assert_eq!(cov_rgb565, 1);
+    assert_eq!(fb[0].a, 255);
 
-    let fb = render_quads_into(&[
-        (&bg_positions, &bg_uv, &bg_tex, 320, 240),
-        (&mid_positions, &mid_uv, &mid_tex, 250, 162),
-        (&small_positions, &small_uv, &small_tex, 50, 50),
-    ]);
+    let a8_mask = Texture::from_bytes(
+        &[128],
+        1,
+        1,
+        TextureFormat::A8,
+        Rgba8::rgba(40, 80, 160, 255),
+    );
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 1];
+    let cov_a8 = rasterize_quad(
+        &mut fb,
+        1,
+        1,
+        &a8_mask,
+        &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+        &uvs,
+    );
+    assert_eq!(cov_a8, 1);
+    assert_eq!(fb[0], Rgba8::rgba(40, 80, 160, 128));
+
+    let mut fb_a = vec![Rgba8::rgba(0, 0, 0, 0); 4 * 4];
+    let mut fb_b = vec![Rgba8::rgba(0, 0, 0, 0); 4 * 4];
+    let quad = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)];
+    let uvs = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    let tex = Texture::from_bytes(
+        &[
+            0x00, 0xf8, // red
+            0xe0, 0x07, // green
+            0x1f, 0x00, // blue
+            0xff, 0xff, // white
+        ],
+        2,
+        2,
+        TextureFormat::Rgb565,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
+    let cov_a = rasterize_quad(&mut fb_a, 4, 4, &tex, &quad, &uvs);
+    let cov_b = rasterize_quad(
+        &mut fb_b,
+        4,
+        4,
+        &tex,
+        &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+        &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    );
+    assert_eq!(cov_a, cov_b);
+    assert_eq!(fb_a, fb_b);
+}
+
+#[test]
+fn replay_frame4_produces_complete_artifact_and_hash() {
+    let (fb, draws) = replay_frame4();
+    assert_eq!(draws.len(), 4);
 
     let mut bytes = Vec::with_capacity(fb.len() * 4);
     for px in &fb {
-        bytes.extend_from_slice(&px.to_le_bytes());
+        bytes.extend_from_slice(&[px.r, px.g, px.b, px.a]);
     }
-    let hash = fnv1a64(&bytes);
-    if std::env::var_os("CLICKY_WRITE_TETRIS_QUAD_PPM").is_some() {
-        write_ppm(
+    let hash = framebuffer_hash(&fb);
+    if std::env::var_os("CLICKY_WRITE_TETRIS_FRAME4_PPM").is_some() {
+        framebuffer_to_ppm(
             std::path::Path::new("/tmp/tetris_frame4_replay.ppm"),
             &fb,
             320,
             240,
         );
     }
-    assert_eq!(hash, 0xebe4_c911_e186_1ed7);
+    if std::env::var_os("CLICKY_PRINT_FRAME4_SUMMARY").is_some() {
+        for (idx, draw) in draws.iter().enumerate() {
+            println!(
+                "draw{} handle={} cov={} bounds=({:.1},{:.1})-({:.1},{:.1}) tex={} kind={} format={:?}",
+                idx + 1,
+                draw.ordinal159_handle,
+                draw.coverage,
+                draw.screen_bounds.0,
+                draw.screen_bounds.1,
+                draw.screen_bounds.2,
+                draw.screen_bounds.3,
+                draw.proposed_texture.label,
+                draw.proposed_texture.kind,
+                draw.proposed_texture.format,
+            );
+        }
+        println!("frame4_hash={:016x}", hash);
+    }
+
+    assert_eq!(hash, 0x3514_598d_ae7f_1fe2);
+    assert_eq!(bytes.len(), 320 * 240 * 4);
 }

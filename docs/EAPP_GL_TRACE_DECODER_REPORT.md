@@ -256,17 +256,55 @@ Ordinal36State(...)
 
 ---
 
-## Standalone renderer result
+## Frame 4 replay summary
 
-A standalone replay test now decodes three frame-4 quads (background, mid-logo, and the real `50 × 50` overlay candidate), applies the real position/UV/translation data above, rasterizes them with nearest-neighbor sampling against generated replay textures, and hashes the 320×240 framebuffer.
+The standalone replay now renders the complete steady-state frame-4 draw stream using generated textures only:
+- draw 1: generated `320 × 240` RGB565 background
+- draw 2: generated `250 × 162` RGBA4444 sprite
+- draw 3: generated `50 × 50` RGBA5551 sprite
+- draw 4: generated `1 × 1` A8 placeholder for the unresolved handle `3`
 
-Deterministic framebuffer hash (generated replay textures):
+### Per-draw summary
+
+| draw | seq | handle | translation | bounds | proposed texture | confidence | coverage |
+|---|---:|---:|---|---|---|---:|---:|
+| 1 | `15` | `19` | `(0.0, 0.0)` | `(0,0)–(320,240)` | `screenBG_565.pix` / `320×240` / `RGB565` | 0.93 | 76800 |
+| 2 | `27` | `14` | `(42.5, 76.0)` | `(42.5,76.0)–(277.5,238.0)` | `tetrisLogo_4444.pix` / `250×162` / `RGBA4444` | 0.84 | 38070 |
+| 3 | `38` | `27` | `(235.0, 79.0)` | `(235,79)–(285,129)` | `eaLogo_5551.pix` / `50×50` / `RGBA5551` | 0.87 | 2500 |
+| 4 | `48` | `3` | `(0.0, 0.0)` | `(0,0)–(320,240)` | unresolved handle `3` / generated `1×1` A8 placeholder | 0.28 | 76800 |
+
+### Relevant state grouped with each draw
+
+- **Draw 1**: `169×3` → `159` → `137`/`40`/`137`/`40`/`137` → `175` → `125` → `37` → `36` → `36`
+  - aux `137` seq `11` is present and currently unresolved as a secondary 4-component array.
+- **Draw 2**: `169×2` → `159` → `137` → `40` → `40` → `137` → `175` → `125` → `37` → `36`
+- **Draw 3**: `169×2` → `159` → `137` → `40` → `40` → `137` → `175` → `125` → `37` → `36`
+- **Draw 4**: `169` → `159` → `137` → `40` → `137` → `40` → `175` → `125` → `37` → `36`
+  - the second `137` seq `44` currently decodes as an all-ones 4-component array; exact semantic role remains unresolved.
+
+### Replay semantics recovered so far
+
+- Texture rows are consumed in file order; the replay sampler uses floor+clamp nearest-neighbor sampling.
+- UVs in the trace are half-texel centered (`±0.5`) and do not need an extra correction in replay.
+- The current quad split is seam-free with the rasterizer's winding-normalized triangle rule.
+- `A8`, `RGB565`, `RGBA5551`, and `RGBA4444` are all supported in the standalone renderer.
+- Alpha-bearing textures use source-over compositing.
+
+### Deterministic replay artifact
 
 ```text
-fnv1a64 = 0xebe4c911e1861ed7
+frame4_hash = 0x3514598dae7f1fe2
 ```
 
 Optional inspection artifact:
-- set `CLICKY_WRITE_TETRIS_QUAD_PPM=1`
-- run the replay test
+- set `CLICKY_WRITE_TETRIS_FRAME4_PPM=1`
+- run `cargo test -p clicky-core --test eapp_gl_decode replay_frame4_produces_complete_artifact_and_hash -- --nocapture`
 - it writes `/tmp/tetris_frame4_replay.ppm`
+
+### Unresolved-state list
+
+- exact descriptor/object → handle mapping for `Ordinal45`/`Ordinal4`/`Ordinal99` → `Ordinal159`
+- draw 1 secondary `137` seq `11` role
+- draw 4 secondary `137` seq `44` role
+- whether the `handle 3` overlay is a texture, color pass, or another state object
+- whether the generated replay textures correspond to the real game art (they do not attempt to)
