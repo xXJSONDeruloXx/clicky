@@ -640,13 +640,19 @@ impl Eapp {
     }
 
     fn resolve_bundle_path(&self, path: &str) -> Option<PathBuf> {
-        let direct = self.metadata.bundle_dir.join(path);
-        if direct.exists() {
-            return Some(direct);
-        }
-        let resources = self.metadata.bundle_dir.join("Resources").join(path);
-        if resources.exists() {
-            return Some(resources);
+        let normalized = path.trim_start_matches('/').trim_start_matches('\\');
+        for candidate in [path, normalized] {
+            if candidate.is_empty() {
+                continue;
+            }
+            let direct = self.metadata.bundle_dir.join(candidate);
+            if direct.exists() {
+                return Some(direct);
+            }
+            let resources = self.metadata.bundle_dir.join("Resources").join(candidate);
+            if resources.exists() {
+                return Some(resources);
+            }
         }
         None
     }
@@ -656,11 +662,12 @@ impl Eapp {
             return Some(found);
         }
 
-        if Path::new(path).is_absolute() {
+        let normalized = path.trim_start_matches('/').trim_start_matches('\\');
+        if normalized.is_empty() {
             return None;
         }
 
-        let writable = self.metadata.bundle_dir.join(".clicky-saves").join(path);
+        let writable = self.metadata.bundle_dir.join(".clicky-saves").join(normalized);
         if let Some(parent) = writable.parent() {
             fs::create_dir_all(parent).ok()?;
         }

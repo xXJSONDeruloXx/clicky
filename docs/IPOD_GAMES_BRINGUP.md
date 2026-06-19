@@ -194,6 +194,7 @@ Current observed behavior for **Tetris**:
 - host-side path resolution now covers:
   - bundle-root assets
   - `Resources/`
+  - virtual-root bundle paths like `/audio/foo.wav`
   - synthetic writable save files under `.clicky-saves/`
 - the runner now also includes two deliberately-hacky but useful bring-up aids:
   - a tiny HLE for the game's `svc 0x123456` syscall wrapper so debug/error
@@ -244,6 +245,9 @@ Current observed behavior for **Tetris**:
   - save paths like `prefs.sav` and `game.sav`
 - with the current bring-up hacks in place, headless Tetris runs now survive at
   least `20,000,000` cycles without fatal memory exceptions
+- the same runtime changes also help broader titles: a quick headless PAC-MAN
+  smoke test now resolves virtual-root audio paths like `/audio/extra life.wav`
+  instead of immediately failing path lookup
 - current blocker has moved again: the runner is no longer dying on the first
   constructor/import path or the first late menu/resource dereference, but it is
   still missing real file/resource decoding semantics and real audio/runtime ABI
