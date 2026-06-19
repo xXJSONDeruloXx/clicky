@@ -2,6 +2,37 @@ use super::{
     GlFileBacking, GlFrameRecord, GlImportRecord, GlMemorySnapshot, GlRegisterSnapshot,
     GlStackWordSnapshot, GlTraceFixture,
 };
+use super::rasterizer::TextureFormat;
+
+/// Bytes per pixel for each standalone renderer texture format.
+///
+/// Mirrors the payload sizing used by the local-asset replay path so the
+/// live HLE upload handler can validate/copy guest pixel bytes with the same
+/// accounting.
+pub fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize {
+    let bytes_per_pixel = match format {
+        TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
+        TextureFormat::A8 => 1,
+    };
+    width * height * bytes_per_pixel
+}
+
+/// Map captured GL ES 1.1 upload enumerants to the standalone renderer's
+/// `TextureFormat`. Constants:
+///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906
+///   GL_UNSIGNED_SHORT_5_6_5=0x8363, GL_UNSIGNED_SHORT_5_5_5_1=0x8034,
+///   GL_UNSIGNED_SHORT_4_4_4_4=0x8033, GL_UNSIGNED_BYTE=0x1401
+///
+/// Returns `None` for unsupported combinations so callers can log+skip.
+pub fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFormat> {
+    match (internal_format, pixel_type) {
+        (0x1907, 0x8363) => Some(TextureFormat::Rgb565),
+        (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
+        (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
+        (0x1906, 0x1401) => Some(TextureFormat::A8),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextureUploadCandidate {

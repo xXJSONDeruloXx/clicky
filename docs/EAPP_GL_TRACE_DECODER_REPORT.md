@@ -359,6 +359,67 @@ Selected texture convention: **current row order preserved** (do not bake row in
 
 Selected screen-space convention: **framebuffer presentation flip / PPM-output flip** for the offline replay diagnostics.
 
+### Live OpenGLES HLE (experimental, Gate A confirmed)
+
+A first minimal live HLE render pass is available behind explicit flags. It
+reuses the standalone rasterizer, texture decoders, framebuffer hashing, and
+PPM writer (no second live-only renderer) and is staged in two gates.
+
+Flags:
+- `CLICKY_EXPERIMENTAL_GL_HLE=1` — enable the live path. When unset, the
+  legacy fill-color diagnostic path is used unchanged.
+- `CLICKY_GL_PRESENT_VFLIP=0|1` — configurable vertical presentation flip
+  (default 1). Applied only when serializing/presenting, never baked into
+  texture decode, UV decode, vertex transforms, or rasterizer storage.
+- `CLICKY_GL_GATE_B=1` — copy the presented framebuffer to the eapp window.
+  Off by default; intended to be enabled only after Gate A is coherent.
+- `CLICKY_GL_LIVE_CONTINUOUS=1` — capture every 4-draw frame instead of the
+  first steady-state frame.
+
+Scope preserved:
+- texture row order preserved;
+- captured UVs and guest geometry preserved;
+- internal 320×240 rasterizer framebuffer kept in native (unflipped) order;
+- vertical flip is a presentation/serialization convenience only, not a
+  confirmed ABI rule.
+
+Gate A output (Tetris, live guest, default mode):
+```text
+frame=4 draws=4
+internal_hash  = 0xdc2cbe3857ad3483   # == offline real_draws_1_3
+presented_hash = 0x55462dde9fead727     # internal + present_vflip
+pixel_diff_vs_offline(internal vs draws_1_3) = 0 / 76800  (EXACT MATCH)
+```
+
+Live draw summary (matches offline frame-4 analysis):
+
+| live draw | handle | inferred dim | bounds | coverage | status |
+|---|---|---|---|---:|---|
+| 1 | `0x13`(19) | 320×240 RGB565 | (0,0)-(320,240) | 76800 | rasterized |
+| 2 | `0xe`(14) | 250×162 RGBA4444 | (42,76)-(278,238) | 38070 | rasterized |
+| 3 | `0x1b`(27) | 50×50 RGBA5551 | (235,79)-(285,129) | 2500 | rasterized |
+| 4 | `0x3` | 1×1 | (0,0)-(320,240) | 0 | skipped (unresolved overlay) |
+
+Artifacts:
+- `/tmp/tetris_live_gl_hle_internal.ppm` (native order)
+- `/tmp/tetris_live_gl_hle_presented.ppm` (with optional vflip)
+
+Live-vs-offline conclusion: the live composition **structurally matches** the
+offline replay and is **pixel-exact** for the three resolved draws (background,
+Tetris logo, EA logo). The only delta is the unresolved handle-3 full-screen
+overlay (draw 4), which is intentionally skipped live and remains unresolved in
+both the live and offline analysis. It therefore also matches
+`/tmp/tetris_frame4_orientation_screen_origin_best.ppm` structurally (same four
+draws, same bounds/formats/handles), differing only by that overlay tint.
+
+Gate B (`CLICKY_GL_GATE_B=1`) copies the presented buffer to the eapp render
+state; confirmed firing under its flag. Window presentation orientation is left
+configurable via `CLICKY_GL_PRESENT_VFLIP` pending visual confirmation.
+
+Handle→upload association is still *inferred* by live upload dimensions/format
+(logged as inferred), not a proven handle-creation path; the exact ordinal-159
+handle-to-upload mapping remains open.
+
 ### Unresolved-state list
 
 - exact descriptor/object → handle write/load path for `Ordinal45`/`Ordinal4`/`Ordinal99` → `Ordinal159`
