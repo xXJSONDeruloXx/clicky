@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,8 @@ use crate::gui::{ButtonCallback, RenderCallback, ScrollCallback, TakeControls};
 use crate::memory::{armv4t_adaptor::MemoryAdapter, Memory};
 
 const FILE_VMA_BASE: u32 = 0x1800_0000;
+const RECENT_PC_LIMIT: usize = 64;
+const BOOTSTRAP_RETURN_PC: u32 = 0x1eff_fffc;
 const WORK_RAM_BASE: u32 = 0x1000_0000;
 const WORK_RAM_SIZE: usize = 8 * 1024 * 1024;
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
@@ -106,13 +108,25 @@ pub struct Eapp {
     cpu: Cpu,
     bus: EappBus,
     metadata: EappMetadata,
+    header: EappHeader,
     imports: Vec<BoundImport>,
     trampoline_to_import: HashMap<u32, usize>,
     logged_imports: HashSet<(String, u32)>,
+    recent_pcs: VecDeque<u32>,
     input_state: Arc<Mutex<EappInputState>>,
     render_state: Arc<Mutex<Vec<u32>>>,
     controls: Option<EappBinds>,
     next_alloc: u32,
+    bootstrap_phase: BootstrapPhase,
+    app_object: u32,
+    halted: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum BootstrapPhase {
+    Entry,
+    Aux,
+    Done,
 }
 
 #[derive(Debug)]
@@ -159,7 +173,7 @@ impl Eapp {
         cpu.reg_set(ArmMode::User, reg::PC, image.header.entry_addr);
         cpu.reg_set(ArmMode::User, reg::CPSR, 0xd3);
         cpu.reg_set(ArmMode::Supervisor, reg::SP, STACK_TOP);
-        cpu.reg_set(ArmMode::User, reg::LR, 0);
+        cpu.reg_set(ArmMode::User, reg::LR, BOOTSTRAP_RETURN_PC);
 
         let mut patched_image = image.image.clone();
         let mut imports = Vec::new();
@@ -201,13 +215,18 @@ impl Eapp {
                 work_ram,
             },
             metadata: image.metadata,
+            header: image.header,
             imports,
             trampoline_to_import,
             logged_imports: HashSet::new(),
+            recent_pcs: VecDeque::with_capacity(RECENT_PC_LIMIT),
             input_state,
             render_state,
             controls: Some(controls),
             next_alloc: WORK_RAM_BASE + 0x1000,
+            bootstrap_phase: BootstrapPhase::Entry,
+            app_object: 0,
+            halted: false,
         })
     }
 
@@ -229,20 +248,32 @@ impl Eapp {
     }
 
     pub fn run(&mut self) -> FatalMemResult<()> {
-        loop {
+        while !self.halted {
             self.step()?;
         }
+        Ok(())
     }
 
     pub fn run_cycles(&mut self, cycles: usize) -> FatalMemResult<()> {
         for _ in 0..cycles {
+            if self.halted {
+                break;
+            }
             self.step()?;
         }
         Ok(())
     }
 
     pub fn step(&mut self) -> FatalMemResult<()> {
+        if self.halted {
+            return Ok(());
+        }
         let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+        self.record_pc(pc);
+        if pc == BOOTSTRAP_RETURN_PC || (pc == 0 && self.bootstrap_phase != BootstrapPhase::Done) {
+            self.handle_bootstrap_return();
+            return Ok(());
+        }
         if let Some(&import_idx) = self.trampoline_to_import.get(&pc) {
             self.handle_import(import_idx)?;
             return Ok(());
@@ -251,10 +282,12 @@ impl Eapp {
         let mut mem = MemoryAdapter::new(&mut self.bus);
         self.cpu.step(&mut mem);
         if let Some((access, e)) = mem.exception.take() {
+            let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+            warn!(target: "EAPP", "recent pc trace: {}", self.format_recent_pcs());
             e.resolve(
                 "EAPP",
                 MemExceptionCtx {
-                    pc: self.cpu.reg_get(self.cpu.mode(), reg::PC),
+                    pc,
                     access,
                     in_device: format!("eapp, {}", self.bus.probe(access.offset)),
                 },
@@ -266,6 +299,7 @@ impl Eapp {
     fn handle_import(&mut self, import_idx: usize) -> FatalMemResult<()> {
         let import = self.imports[import_idx].clone();
         let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+        self.record_pc(pc);
         let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
         let args = [
             self.cpu.reg_get(self.cpu.mode(), 0),
@@ -382,6 +416,39 @@ impl Eapp {
         frame.fill(color);
     }
 
+    fn handle_bootstrap_return(&mut self) {
+        match self.bootstrap_phase {
+            BootstrapPhase::Entry => {
+                info!(
+                    target: "EAPP",
+                    "bootstrap entry returned; invoking aux constructor at {:#010x}",
+                    self.header.aux_addr
+                );
+                self.app_object = self.alloc_zeroed(0x2000);
+                let empty_arg = self.alloc_zeroed(0x10);
+                self.cpu.reg_set(self.cpu.mode(), 0, self.app_object);
+                self.cpu.reg_set(self.cpu.mode(), 1, empty_arg);
+                self.cpu.reg_set(self.cpu.mode(), reg::LR, BOOTSTRAP_RETURN_PC);
+                self.cpu.reg_set(self.cpu.mode(), reg::PC, self.header.aux_addr);
+                self.bootstrap_phase = BootstrapPhase::Aux;
+                self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
+            }
+            BootstrapPhase::Aux => {
+                info!(
+                    target: "EAPP",
+                    "bootstrap aux returned; app_object={:#010x}",
+                    self.app_object
+                );
+                self.bootstrap_phase = BootstrapPhase::Done;
+                self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
+                self.halted = true;
+            }
+            BootstrapPhase::Done => {
+                self.halted = true;
+            }
+        }
+    }
+
     fn alloc_zeroed(&mut self, len: u32) -> u32 {
         let len = (len + 0xf) & !0xf;
         let addr = self.next_alloc;
@@ -413,6 +480,24 @@ impl Eapp {
             return None;
         }
         String::from_utf8(bytes).ok()
+    }
+
+    fn record_pc(&mut self, pc: u32) {
+        if self.recent_pcs.back().copied() == Some(pc) {
+            return;
+        }
+        if self.recent_pcs.len() == RECENT_PC_LIMIT {
+            self.recent_pcs.pop_front();
+        }
+        self.recent_pcs.push_back(pc);
+    }
+
+    fn format_recent_pcs(&self) -> String {
+        self.recent_pcs
+            .iter()
+            .map(|pc| format!("{:#010x}", pc))
+            .collect::<Vec<_>>()
+            .join(" -> ")
     }
 }
 
