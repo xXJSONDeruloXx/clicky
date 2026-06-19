@@ -1087,6 +1087,9 @@ fn load_local_asset(
 
 /// Replace the generated placeholder textures for draws 1-3 with the supplied
 /// local-asset textures, matching each draw by its captured dimensions/format.
+///
+/// This local replay path still does **not** prove a direct handle→asset link;
+/// it uses the captured size/format metadata as the current best match.
 fn apply_local_assets(draws: &mut [DrawReplay], assets: &[LocalAsset], textures: &[Texture]) {
     for draw in draws.iter_mut().take(3) {
         let (w, h) = (
@@ -1247,4 +1250,297 @@ fn extract_pix_payload_handles_zero_dimensions() {
     let payload =
         extract_pix_payload(&file, 4, 0, 0, TextureFormat::A8).expect("zero-sized payload");
     assert!(payload.is_empty());
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum OrientationVariant {
+    Current,
+    TextureVFlip,
+    UvVFlip,
+    FramebufferVFlip,
+    HFlipControl,
+    BothAxisControl,
+}
+
+fn flip_v_for_height(v: f32, height: usize) -> f32 {
+    height as f32 - v
+}
+
+fn flip_texture_vertical(texture: &Texture) -> Texture {
+    let mut pixels = texture.pixels.clone();
+    for row in 0..(texture.height / 2) {
+        let top = row * texture.width;
+        let bottom = (texture.height - 1 - row) * texture.width;
+        for col in 0..texture.width {
+            pixels.swap(top + col, bottom + col);
+        }
+    }
+    Texture {
+        width: texture.width,
+        height: texture.height,
+        pixels,
+    }
+}
+
+fn flip_texture_horizontal(texture: &Texture) -> Texture {
+    let mut pixels = texture.pixels.clone();
+    for row in 0..texture.height {
+        let base = row * texture.width;
+        for col in 0..(texture.width / 2) {
+            pixels.swap(base + col, base + (texture.width - 1 - col));
+        }
+    }
+    Texture {
+        width: texture.width,
+        height: texture.height,
+        pixels,
+    }
+}
+
+fn flip_texture_both_axes(texture: &Texture) -> Texture {
+    flip_texture_horizontal(&flip_texture_vertical(texture))
+}
+
+fn flip_draw_uvs_vertical(draw: &mut DrawReplay) {
+    let height = draw.texture.height;
+    for (u, v) in &mut draw.uv_or_aux {
+        *v = flip_v_for_height(*v, height);
+        let _ = u;
+    }
+}
+
+fn render_orientation_variant(draws: &[DrawReplay], variant: OrientationVariant) -> Vec<Rgba8> {
+    let mut variant_draws = draws.to_vec();
+    match variant {
+        OrientationVariant::Current => {}
+        OrientationVariant::TextureVFlip => {
+            for draw in &mut variant_draws {
+                draw.texture = flip_texture_vertical(&draw.texture);
+            }
+        }
+        OrientationVariant::UvVFlip => {
+            for draw in &mut variant_draws {
+                flip_draw_uvs_vertical(draw);
+            }
+        }
+        OrientationVariant::FramebufferVFlip => {}
+        OrientationVariant::HFlipControl => {
+            for draw in &mut variant_draws {
+                draw.texture = flip_texture_horizontal(&draw.texture);
+            }
+        }
+        OrientationVariant::BothAxisControl => {
+            for draw in &mut variant_draws {
+                draw.texture = flip_texture_both_axes(&draw.texture);
+            }
+        }
+    }
+
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+    for draw in &variant_draws {
+        draw.rasterize(&mut fb);
+    }
+    if matches!(variant, OrientationVariant::FramebufferVFlip) {
+        let mut flipped = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+        for y in 0..240 {
+            let src = &fb[y * 320..(y + 1) * 320];
+            let dst_y = 239 - y;
+            flipped[dst_y * 320..(dst_y + 1) * 320].copy_from_slice(src);
+        }
+        fb = flipped;
+    }
+    fb
+}
+
+fn write_orientation_artifact(name: &str, path: &str, fb: &[Rgba8]) {
+    framebuffer_to_ppm(std::path::Path::new(path), fb, 320, 240);
+    println!(
+        "orientation_artifact={name} output={path} hash={:016x}",
+        framebuffer_hash(fb)
+    );
+}
+
+#[test]
+fn orientation_helpers_respect_corner_markers_and_global_vertical_origin() {
+    let tex = Texture::from_bytes(
+        &[
+            0x00, 0xf8, // top-left red
+            0xe0, 0x07, // top-right green
+            0x1f, 0x00, // bottom-left blue
+            0xff, 0xff, // bottom-right white
+        ],
+        2,
+        2,
+        TextureFormat::Rgb565,
+        Rgba8::rgba(255, 255, 255, 255),
+    );
+    let quad = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)];
+    let uvs = [(0.5, 0.5), (0.5, 1.5), (1.5, 1.5), (1.5, 0.5)];
+
+    let mut current_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+    let current_cov = rasterize_quad(&mut current_fb, 2, 2, &tex, &quad, &uvs);
+    assert_eq!(current_cov, 4);
+    assert_eq!(current_fb[0], Rgba8::rgba(255, 0, 0, 255));
+    assert_eq!(current_fb[1], Rgba8::rgba(0, 255, 0, 255));
+    assert_eq!(current_fb[2], Rgba8::rgba(0, 0, 255, 255));
+    assert_eq!(current_fb[3], Rgba8::rgba(255, 255, 255, 255));
+
+    let vflip_tex = flip_texture_vertical(&tex);
+    let mut texture_vflip_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+    rasterize_quad(&mut texture_vflip_fb, 2, 2, &vflip_tex, &quad, &uvs);
+    assert_eq!(texture_vflip_fb[0], Rgba8::rgba(0, 0, 255, 255));
+    assert_eq!(texture_vflip_fb[1], Rgba8::rgba(255, 255, 255, 255));
+    assert_eq!(texture_vflip_fb[2], Rgba8::rgba(255, 0, 0, 255));
+    assert_eq!(texture_vflip_fb[3], Rgba8::rgba(0, 255, 0, 255));
+
+    let mut uv_vflip_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+    let mut uv_flipped = uvs;
+    for uv in &mut uv_flipped {
+        uv.1 = flip_v_for_height(uv.1, tex.height);
+    }
+    rasterize_quad(&mut uv_vflip_fb, 2, 2, &tex, &quad, &uv_flipped);
+    assert_eq!(uv_vflip_fb, texture_vflip_fb);
+
+    let hflip_tex = flip_texture_horizontal(&tex);
+    let mut hflip_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+    rasterize_quad(&mut hflip_fb, 2, 2, &hflip_tex, &quad, &uvs);
+    assert_eq!(hflip_fb[0], Rgba8::rgba(0, 255, 0, 255));
+    assert_eq!(hflip_fb[1], Rgba8::rgba(255, 0, 0, 255));
+    assert_eq!(hflip_fb[2], Rgba8::rgba(255, 255, 255, 255));
+    assert_eq!(hflip_fb[3], Rgba8::rgba(0, 0, 255, 255));
+
+    let both_tex = flip_texture_both_axes(&tex);
+    let mut both_fb = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+    rasterize_quad(&mut both_fb, 2, 2, &both_tex, &quad, &uvs);
+    assert_eq!(both_fb[0], Rgba8::rgba(255, 255, 255, 255));
+    assert_eq!(both_fb[1], Rgba8::rgba(0, 0, 255, 255));
+    assert_eq!(both_fb[2], Rgba8::rgba(0, 255, 0, 255));
+    assert_eq!(both_fb[3], Rgba8::rgba(255, 0, 0, 255));
+
+    let fb_vflip = {
+        let mut out = vec![Rgba8::rgba(0, 0, 0, 0); 4];
+        for y in 0..2 {
+            let src = &current_fb[y * 2..(y + 1) * 2];
+            let dst_y = 1 - y;
+            out[dst_y * 2..(dst_y + 1) * 2].copy_from_slice(src);
+        }
+        out
+    };
+    assert_eq!(fb_vflip[0], current_fb[2]);
+    assert_eq!(fb_vflip[1], current_fb[3]);
+    assert_eq!(fb_vflip[2], current_fb[0]);
+    assert_eq!(fb_vflip[3], current_fb[1]);
+
+    assert_eq!(flip_v_for_height(49.5, 50), 0.5);
+    assert_eq!(flip_v_for_height(-0.5, 50), 50.5);
+}
+
+#[test]
+fn replay_frame4_real_asset_orientation_when_requested() {
+    let asset_dir = match std::env::var_os("CLICKY_TETRIS_ASSET_DIR") {
+        Some(value) => std::path::PathBuf::from(value),
+        None => return,
+    };
+
+    let fixture = load_fixture();
+    let uploads = texture_upload_candidates(&fixture);
+    let targets = [
+        "screenBG_565.pix",
+        "tetrisLogoT_4444.pix",
+        "eaLogo_5551.pix",
+    ];
+
+    let mut assets = Vec::new();
+    let mut textures = Vec::new();
+    for filename in targets {
+        let (asset, texture) = load_local_asset(&asset_dir, &uploads, filename)
+            .unwrap_or_else(|err| panic!("load {}: {}", filename, err));
+        assets.push(asset);
+        textures.push(texture);
+    }
+
+    let (_, mut current_draws) = replay_frame4();
+    apply_local_assets(&mut current_draws, &assets, &textures);
+
+    let current_fb = render_orientation_variant(&current_draws, OrientationVariant::Current);
+    write_orientation_artifact(
+        "current",
+        "/tmp/tetris_frame4_real_orientation_current.ppm",
+        &current_fb,
+    );
+
+    let texture_vflip_fb =
+        render_orientation_variant(&current_draws, OrientationVariant::TextureVFlip);
+    write_orientation_artifact(
+        "texture_vflip",
+        "/tmp/tetris_frame4_real_orientation_texture_vflip.ppm",
+        &texture_vflip_fb,
+    );
+
+    let uv_vflip_fb = render_orientation_variant(&current_draws, OrientationVariant::UvVFlip);
+    write_orientation_artifact(
+        "uv_vflip",
+        "/tmp/tetris_frame4_real_orientation_uv_vflip.ppm",
+        &uv_vflip_fb,
+    );
+
+    let framebuffer_vflip_fb =
+        render_orientation_variant(&current_draws, OrientationVariant::FramebufferVFlip);
+    write_orientation_artifact(
+        "framebuffer_vflip",
+        "/tmp/tetris_frame4_real_orientation_framebuffer_vflip.ppm",
+        &framebuffer_vflip_fb,
+    );
+
+    let hflip_control_fb =
+        render_orientation_variant(&current_draws, OrientationVariant::HFlipControl);
+    write_orientation_artifact(
+        "hflip_control",
+        "/tmp/tetris_frame4_real_orientation_hflip_control.ppm",
+        &hflip_control_fb,
+    );
+
+    let both_axis_fb =
+        render_orientation_variant(&current_draws, OrientationVariant::BothAxisControl);
+    write_orientation_artifact(
+        "both_axis_control",
+        "/tmp/tetris_frame4_real_orientation_both_axis_control.ppm",
+        &both_axis_fb,
+    );
+
+    let best_fb = texture_vflip_fb.clone();
+    write_orientation_artifact(
+        "best_orientation",
+        "/tmp/tetris_frame4_real_best_orientation.ppm",
+        &best_fb,
+    );
+
+    assert_ne!(
+        framebuffer_hash(&current_fb),
+        framebuffer_hash(&texture_vflip_fb)
+    );
+    assert_ne!(
+        framebuffer_hash(&current_fb),
+        framebuffer_hash(&uv_vflip_fb)
+    );
+    assert_ne!(
+        framebuffer_hash(&current_fb),
+        framebuffer_hash(&framebuffer_vflip_fb)
+    );
+    assert_ne!(
+        framebuffer_hash(&current_fb),
+        framebuffer_hash(&hflip_control_fb)
+    );
+    assert_ne!(
+        framebuffer_hash(&current_fb),
+        framebuffer_hash(&both_axis_fb)
+    );
+    assert_ne!(
+        framebuffer_hash(&texture_vflip_fb),
+        framebuffer_hash(&uv_vflip_fb)
+    );
+    assert_eq!(
+        framebuffer_hash(&best_fb),
+        framebuffer_hash(&texture_vflip_fb)
+    );
 }

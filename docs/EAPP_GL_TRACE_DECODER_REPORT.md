@@ -305,11 +305,13 @@ The standalone replay now renders the complete steady-state frame-4 stream using
 
 ### Conservative mapping table
 
+The standalone local replay currently maps these assets by captured dimensions/format rather than a proven handle→asset write path; the handle linkage remains inferred from the trace.
+
 | upload triplet | source file | descriptor/object ptr | candidate handle | frame-4 draw | confidence | missing evidence |
 |---|---|---:|---:|---|---:|---|
 | `9→10→11` | `screenBG_565.pix` | `0x1802d57c` | `19` | draw 1 | 0.93 | exact table write not captured; matched by size + fullscreen state blob |
-| `12→13→14` | `eaLogo_5551.pix` | `0x1802d5b4` | `14` | draw 2 | 0.84 | exact table write not captured; matched by size + state blob |
-| `15→16→17` | `tetrisLogoT_4444.pix` | `0x1802d73c` | `27` | draw 3 | 0.87 | exact table write not captured; matched by size + state blob |
+| `12→13→14` | `tetrisLogoT_4444.pix` | `0x1802d5b4` | `14` | draw 2 | 0.84 | exact table write not captured; matched by size + state blob |
+| `15→16→17` | `eaLogo_5551.pix` | `0x1802d73c` | `27` | draw 3 | 0.87 | exact table write not captured; matched by size + state blob |
 | none captured | none captured | `0x101b7260` | `3` | draw 4 | 0.28 | no matching upload triplet; appears to be a generated full-screen overlay/material blob |
 
 ### Deterministic replay artifacts
@@ -325,6 +327,22 @@ Optional inspection artifact:
 - set `CLICKY_WRITE_TETRIS_FRAME4_PPM=1`
 - run `cargo test -p clicky-core --test eapp_gl_decode replay_frame4_produces_complete_artifact_and_hash -- --nocapture`
 - it writes `/tmp/tetris_frame4_replay.ppm`
+
+### Orientation investigation (local real assets)
+
+The real-asset replay was tested against the extracted `Games_RO/66666` .pix files with six shared-orientation variants. The captured UV evidence for draw 3 is consistent with a global vertical-origin mismatch: values like `v = 49.5` and `v = -0.5` map to rows `49` and `0` under the current top-down sampler, while the vertical normalization `v' = height - v` swaps them to `0.5` and `50.5` (which clamp to rows `0` and `49` respectively).
+
+```text
+current           = 0xaae9cac7ffba5133
+texture_vflip     = 0x868dea7c858c11b2
+uv_vflip          = 0xd6264f7a5e9d0156
+framebuffer_vflip = 0xce8b5d920ca880cb
+hflip_control     = 0xac56d21fe8cbd5bd
+both_axis_control = 0xebcfdc66fa6b385d
+best_orientation   = 0x868dea7c858c11b2
+```
+
+Selected convention: **vertical texture-row normalization at local asset load** (`texture_vflip`). It keeps the reusable rasterizer unchanged, preserves the generated-texture deterministic tests, and matches the GL-style captured UVs better than the display-only/framebuffer control variants.
 
 ### Unresolved-state list
 
