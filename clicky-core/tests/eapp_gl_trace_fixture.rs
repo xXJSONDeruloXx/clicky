@@ -1,4 +1,4 @@
-use clicky_core::sys::eapp::GlTraceFixture;
+use clicky_core::sys::eapp::{GlMemoryRegion, GlTraceFixture};
 
 #[test]
 fn tetris_gl_trace_fixture_has_expected_shape() {
@@ -39,7 +39,29 @@ fn tetris_gl_trace_fixture_has_expected_shape() {
         for record in &frame.records {
             assert_eq!(record.registers.len(), 16);
             assert!(record.stack.len >= 0x80);
+            assert_eq!(record.stack.requested_len, 0x80);
+            assert_eq!(record.stack.region, GlMemoryRegion::WorkRam);
             assert!(record.stack.bytes_hex.len() >= 0x80 * 2);
+            assert_eq!(record.stack_words.len(), 0x80 / 4);
         }
     }
+
+    let upload = frame2
+        .records
+        .iter()
+        .find(|record| record.ordinal == 99)
+        .expect("texture upload record");
+    let source_word = upload
+        .stack_words
+        .iter()
+        .find(|word| word.offset == 0x10)
+        .expect("source pointer stack word");
+    let source_snapshot = source_word
+        .snapshot
+        .as_ref()
+        .expect("followed source pointer");
+    assert_eq!(source_snapshot.region, GlMemoryRegion::WorkRam);
+    let file = source_snapshot.file_backing.as_ref().expect("file backing");
+    assert_eq!(file.path, "screenBG_565.pix");
+    assert_eq!(file.offset, 70);
 }

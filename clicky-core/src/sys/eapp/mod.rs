@@ -6,11 +6,17 @@ use std::sync::{Arc, Mutex};
 use armv4t_emu::{reg, Cpu, Mode as ArmMode};
 use thiserror::Error;
 
+mod gl_decode;
 mod gl_trace;
+pub use gl_decode::{
+    bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
+    float_words_from_snapshot, register, stack_word, texture_upload_candidates,
+    words_from_snapshot, TextureUploadCandidate,
+};
 use gl_trace::hex_bytes;
 pub use gl_trace::{
-    GlFrameRecord, GlImportRecord, GlMemorySnapshot, GlRegisterSnapshot, GlTraceFixture,
-    GlTraceRecorder, GlValueClass,
+    GlFileBacking, GlFrameRecord, GlImportRecord, GlMemoryRegion, GlMemorySnapshot,
+    GlRegisterSnapshot, GlStackWordSnapshot, GlTraceFixture, GlTraceRecorder, GlValueClass,
 };
 
 use crate::devices::generic::Ram;
@@ -142,11 +148,15 @@ pub struct Eapp {
     gl_trace_frames: Option<(u64, u64)>,
     /// Optional bounded OpenGLES capture recorder for machine-readable traces.
     gl_capture: Option<GlTraceRecorder>,
+    staged_file_generation: u64,
     halted: bool,
 }
 
 #[derive(Debug, Clone)]
 struct StagedFile {
+    /// Monotonic host-side generation so overlapping reused buffers can be
+    /// attributed to the most recent AsyncFileIO delivery.
+    generation: u64,
     /// Guest address where the file payload bytes have been copied.
     payload_addr: u32,
     /// Length in bytes.
@@ -274,6 +284,7 @@ impl Eapp {
             import_call_counts: HashMap::new(),
             gl_trace_frames: None,
             gl_capture: None,
+            staged_file_generation: 0,
             halted: false,
         })
     }
@@ -391,7 +402,8 @@ impl Eapp {
             .unwrap_or(0x80);
         let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         let registers = self.capture_registers(pc, lr, sp, args, pointer_len);
-        let stack = self.snapshot_memory(sp, stack_len);
+        let (stack, stack_bytes) = self.snapshot_memory_with_bytes(sp, stack_len);
+        let stack_words = self.capture_stack_words(&stack_bytes, pointer_len);
         let record = GlImportRecord {
             seq: 0,
             seq_in_frame: 0,
@@ -402,6 +414,7 @@ impl Eapp {
             sp,
             return_value: ret,
             stack,
+            stack_words,
             registers,
         };
 
@@ -443,7 +456,11 @@ impl Eapp {
         let name = name.into();
         let class = self.classify_trace_value(value);
         let float_value = matches!(class, GlValueClass::Float).then(|| f32::from_bits(value));
-        let snapshot = if allow_snapshot && matches!(class, GlValueClass::MappedPointer) {
+        let snapshot = if allow_snapshot
+            && matches!(
+                class,
+                GlValueClass::MappedPointer | GlValueClass::CodePointer
+            ) {
             Some(self.snapshot_memory(value, pointer_len))
         } else {
             None
@@ -457,29 +474,82 @@ impl Eapp {
         }
     }
 
+    fn capture_stack_words(
+        &mut self,
+        stack_bytes: &[u8],
+        pointer_len: usize,
+    ) -> Vec<GlStackWordSnapshot> {
+        let mut words = Vec::with_capacity(stack_bytes.len() / 4);
+        for (index, chunk) in stack_bytes.chunks_exact(4).enumerate() {
+            let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let class = self.classify_trace_value(value);
+            let float_value = matches!(class, GlValueClass::Float).then(|| f32::from_bits(value));
+            let snapshot = if matches!(
+                class,
+                GlValueClass::MappedPointer | GlValueClass::CodePointer
+            ) {
+                Some(self.snapshot_memory(value, pointer_len))
+            } else {
+                None
+            };
+            words.push(GlStackWordSnapshot {
+                offset: index * 4,
+                value,
+                class,
+                float_value,
+                snapshot,
+            });
+        }
+        words
+    }
+
     fn classify_trace_value(&self, value: u32) -> GlValueClass {
+        match self.memory_region(value) {
+            GlMemoryRegion::WorkRam => GlValueClass::MappedPointer,
+            GlMemoryRegion::Image | GlMemoryRegion::Trampoline => GlValueClass::CodePointer,
+            GlMemoryRegion::Unmapped => {
+                if value & 0x7f80_0000 != 0 {
+                    GlValueClass::Float
+                } else {
+                    GlValueClass::Scalar
+                }
+            }
+        }
+    }
+
+    fn memory_region(&self, value: u32) -> GlMemoryRegion {
         let work_end = WORK_RAM_BASE.saturating_add(WORK_RAM_SIZE as u32);
         let image_end = FILE_VMA_BASE.saturating_add(self.bus.image_len);
         if (WORK_RAM_BASE..work_end).contains(&value) {
-            GlValueClass::MappedPointer
-        } else if (FILE_VMA_BASE..image_end).contains(&value)
-            || (TRAMPOLINE_BASE..TRAMPOLINE_BASE.saturating_add(0x10000)).contains(&value)
-        {
-            GlValueClass::CodePointer
-        } else if value & 0x7f80_0000 != 0 {
-            GlValueClass::Float
+            GlMemoryRegion::WorkRam
+        } else if (FILE_VMA_BASE..image_end).contains(&value) {
+            GlMemoryRegion::Image
+        } else if (TRAMPOLINE_BASE..TRAMPOLINE_BASE.saturating_add(0x10000)).contains(&value) {
+            GlMemoryRegion::Trampoline
         } else {
-            GlValueClass::Scalar
+            GlMemoryRegion::Unmapped
         }
     }
 
     fn snapshot_memory(&mut self, addr: u32, len: usize) -> GlMemorySnapshot {
+        self.snapshot_memory_with_bytes(addr, len).0
+    }
+
+    fn snapshot_memory_with_bytes(&mut self, addr: u32, len: usize) -> (GlMemorySnapshot, Vec<u8>) {
+        let region = self.memory_region(addr);
         if addr == 0 || len == 0 {
-            return GlMemorySnapshot {
-                addr,
-                len: 0,
-                bytes_hex: String::new(),
-            };
+            return (
+                GlMemorySnapshot {
+                    addr,
+                    requested_len: len,
+                    len: 0,
+                    truncated: false,
+                    region,
+                    file_backing: None,
+                    bytes_hex: String::new(),
+                },
+                Vec::new(),
+            );
         }
 
         let mut bytes = Vec::with_capacity(len);
@@ -489,12 +559,45 @@ impl Eapp {
                 None => break,
             }
         }
-        let len = bytes.len();
-        GlMemorySnapshot {
+        let snapshot = GlMemorySnapshot {
             addr,
-            len,
+            requested_len: len,
+            len: bytes.len(),
+            truncated: bytes.len() < len,
+            region,
+            file_backing: self.file_backing_for_addr(addr),
             bytes_hex: hex_bytes(&bytes),
+        };
+        (snapshot, bytes)
+    }
+
+    fn file_backing_for_addr(&self, addr: u32) -> Option<GlFileBacking> {
+        self.staged_files
+            .values()
+            .filter(|staged| {
+                let end = staged.payload_addr.saturating_add(staged.len);
+                (staged.payload_addr..end).contains(&addr)
+            })
+            .max_by_key(|staged| staged.generation)
+            .map(|staged| GlFileBacking {
+                path: self.describe_host_path(&staged.host_path),
+                base_addr: staged.payload_addr,
+                len: staged.len,
+                offset: addr.saturating_sub(staged.payload_addr),
+            })
+    }
+
+    fn describe_host_path(&self, host_path: &Path) -> String {
+        if let Ok(rel) = host_path.strip_prefix(&self.metadata.bundle_dir) {
+            return rel.display().to_string();
         }
+        if let Ok(rel) = host_path.strip_prefix(self.metadata.bundle_dir.join(".clicky-saves")) {
+            return format!(".clicky-saves/{}", rel.display());
+        }
+        host_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| host_path.display().to_string())
     }
 
     /// Scan guest work RAM for large contiguous non-zero regions and report
@@ -816,9 +919,12 @@ impl Eapp {
                                     n,
                                     dest
                                 );
+                                self.staged_file_generation =
+                                    self.staged_file_generation.wrapping_add(1);
                                 self.staged_files.insert(
                                     req,
                                     StagedFile {
+                                        generation: self.staged_file_generation,
                                         payload_addr: dest,
                                         len: n as u32,
                                         host_path: host_path.clone(),

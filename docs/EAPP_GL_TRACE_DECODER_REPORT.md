@@ -1,139 +1,272 @@
 # Tetris OpenGLES Trace Decoder Report
 
-## Scope
-
-This report is based on the captured Tetris trace fixture:
-
+Fixture:
 - `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json`
-- bundle: `Games_RO/66666`
-- executable: `Executables/Tetris_1_1_2563292.bin`
-- capture window: frames `0..=50`
-- deduplication: identical repeated frames are merged
+- extracted renderer texture fixture: `clicky-core/tests/fixtures/eapp/eaLogo_5551_50x50_rgba5551.bin`
 
-The fixture contains 5 unique frame records. Frame `4` repeats `47` times and is the steady-state render loop.
+This report reflects the deeper capture pass that follows pointer-like stack words and records bounded snapshots, mapped regions, truncation status, and AsyncFileIO-backed file relationships.
+
+---
+
+## Frame signatures
+
+Unique frames captured in `0..=50`:
+
+| first..last | repeat | signature |
+|---|---:|---|
+| `0..0` | 1 | `649fcb2a79cab13c` |
+| `1..1` | 1 | `c8b7f6e2987be4f5` |
+| `2..2` | 1 | `c56e4b07b6eb9661` |
+| `3..3` | 1 | `731b6601b1e54632` |
+| `4..50` | 47 | `bd2ed153e8273927` |
+
+Deduplication is **exact full-frame deduplication only**. Repeated calls inside a frame are preserved verbatim.
 
 ---
 
 ## Confirmed facts
 
-### 1) The game enters a repeated frame loop after initialization
+### Ordinal 37
+Confirmed by disassembly:
+- `r0 = 7`
+- `r1 = 0`
+- `r2 = 4`
+- call site sets these directly immediately before the import
 
-Captured frame sequence:
+So ordinal 37 is a confirmed `DrawArrays(7, 0, 4)` boundary.
 
-- frame `0`: ordinals `13`, `12`, `157`
-- frame `1`: ordinals `35`, `165`, `167`, `165`, `157`
-- frame `2`: texture-load burst plus frame setup
-- frame `3`: transitional draw/setup frame
-- frame `4`: stable repeating frame, repeated `47` times
+### Ordinal 99 argument layout
+Confirmed by disassembly at the upload site:
 
-This confirms that the runtime reaches a recurring render pass and does not stall after asset loading. The fixture `frame` value is the completed-frame counter observed when the import executed.
+```text
+r0 = target
+r1 = level
+r2 = internal_format
+r3 = width
+sp+0x00 = height
+sp+0x04 = border
+sp+0x08 = format
+sp+0x0c = pixel_type
+sp+0x10 = source_ptr
+```
 
-### 2) Ordinal `37` is `glDrawArrays`-like quad drawing
+This is direct call-site evidence, not just pattern matching.
 
-Direct disassembly from the Tetris binary shows:
-
-- `mov r0, #7`
-- `mov r1, #0`
-- `mov r2, #4`
-- `bl` import trampoline
-
-The trace for that call records `r0=7`, `r1=0`, `r2=4`, which matches `glDrawArrays(GL_QUADS, 0, 4)`.
-
-### 3) Ordinal `99` is the texture upload call
-
-Evidence:
-
-- called once per loaded asset in frame `2`
-- receives a GL-style target in `r0` (`0x0de1`)
-- receives a GL-style format enum in `r2` (`0x1906/0x1907/0x1908` depending on asset)
-- receives width/height values and stack arguments consistent with upload metadata
-- traced immediately after texture setup ordinals
-
-### 4) Ordinal `158` is a present/swap-like frame boundary call
-
-Evidence:
-
-- called once per frame
-- carries the constant surface token `0x0003f001` in `r0`
-- carries a work-RAM pointer in `r2`
-- occurs before the per-frame draw setup
-
-### 5) Ordinal `169` is a translation/position-like call
-
-Evidence:
-
-- called with float-looking values (for example `160.0`, `240.0`)
-- disassembly around the call site shows sign-bit XOR on float registers
-- used as part of the per-sprite draw sequence
-
-### 6) Ordinals `137` and `40` configure fixed-point vertex arrays
-
-Evidence:
-
-- `137` receives component counts and `0x140c` (`GL_FIXED`)
-- `40` follows immediately and toggles array enables
-- the pair appears repeatedly around each quad draw
-
-### 7) Frame `4` is the stable render loop
-
-Frame `4` contains one frame boundary call, one begin call, four draw clusters, and one submit call. The captured record repeats `47` times with the same signature.
+### Ordinal 137/40/159/175 direct arguments vs stale stack locals
+From disassembly:
+- `137`: direct args are `r0..r3` plus stack args at `sp+0`, `sp+4`
+- `40`: direct arg is only `r0`; `r1..r3` and stack are caller leftovers
+- `159`: direct args are only `r0`, `r1`; `r2..r3` are caller leftovers
+- `175`: direct args are `r0`, `r1`, `r2`; `r3=0`
+- `37`: direct args are `r0`, `r1`, `r2`; `r3` and stack are caller leftovers
 
 ---
 
-## High-confidence interpretations
+## One fully decoded texture upload candidate
 
-These are not fully proven by a single disassembly site, but the trace shape is consistent enough to treat them as likely:
+Chosen candidate: the `50 × 50` RGBA5551 upload used by the standalone renderer test.
 
-- `45` = texture-object preparation / creation
-- `4` = texture-state / bind step in the upload pipeline
-- `165` = begin-frame / context binding
-- `159` = bind texture + set vertex buffer
-- `175` = bind draw state
-- `125` = prepare draw
-- `36` = post-draw cleanup
-- `157` = frame submit / end-frame
+Triplet in frame 2:
+- seq 12: ordinal 45
+- seq 13: ordinal 4
+- seq 14: ordinal 99
 
-Also likely:
+Decoded upload:
 
-- the `OpenGLES` ABI is a compact Apple graphics wrapper, not a full generic GLES entrypoint surface
-- the game parses `.pix` data itself; the emulator only needs to deliver file bytes and support the runtime ABI
+```text
+Ordinal45Prep
+  r0 = 1
+  r1 = 0x1802d5b4   descriptor_ptr
+  r2 = 50           prep_width
+  r3 = 50           prep_height
+  ret = 0
+
+Ordinal4State
+  r0 = 0x0de1       target = GL_TEXTURE_2D
+  r1 = 0
+  r2 = 50
+  r3 = 50
+  ret = 0
+
+Ordinal99Upload
+  r0      = 0x0de1  target = GL_TEXTURE_2D
+  r1      = 0       level = 0
+  r2      = 0x1908  internal_format = GL_RGBA
+  r3      = 50      width
+  sp+0x00 = 50      height
+  sp+0x04 = 0       border
+  sp+0x08 = 0x1908  format = GL_RGBA
+  sp+0x0c = 0x8034  pixel_type = GL_UNSIGNED_SHORT_5_5_5_1
+  sp+0x10 = 0x100145d6 source_ptr
+  ret     = 0
+```
+
+Source-pointer relationship to AsyncFileIO:
+
+```text
+source_ptr  = 0x100145d6
+file        = eaLogo_5551.pix
+buffer_base = 0x10014590
+offset      = 70
+file_len    = 5072
+mapped_region = work_ram
+truncated   = false for the bounded source snapshot
+```
+
+This is the clearest fully decoded upload candidate in the trace.
 
 ---
 
-## Unresolved fields
+## One fully decoded four-vertex position array
 
-These still need more tracing before being treated as facts:
+Chosen candidate: frame 4, quad 3, seq 32, ordinal 137, stack pointer at `sp+0x04`.
 
-1. **Exact signature of ordinal `4`**
-   - it clearly participates in the texture pipeline
-   - exact API name and argument order are still unclear
+```text
+pointer = 0x101b7068
+components = 4
+format = 0x140c (GL_FIXED)
+```
 
-2. **Exact signature of ordinal `99`**
-   - upload-like behavior is clear
-   - the precise meaning of the stack arguments is still unresolved
+Snapshot decoded as signed 16.16 fixed-point, grouped as XYZW per vertex:
 
-3. **Exact signature of ordinals `45`, `165`, `175`, `125`, `36`, `157`**
-   - each is render-critical
-   - none has a fully confirmed semantic name yet
+```text
+v0 = (  0.0,   0.0, 0.0, 1.0)
+v1 = (  0.0,  50.0, 0.0, 1.0)
+v2 = ( 50.0,  50.0, 0.0, 1.0)
+v3 = ( 50.0,   0.0, 0.0, 1.0)
+```
 
-4. **Meaning of the `frame` field in the fixture**
-   - it is a completed-frame counter observed at import time
-   - it is not the same thing as a wall-clock or host VSync frame index
-
-5. **Image-range pointer classification**
-   - the capture currently labels file-image addresses as `code_pointer`
-   - some of those pointers may actually refer to read-only data, not executable code
+This is a clean four-vertex local-space rectangle.
 
 ---
 
-## Why this matters
+## One fully decoded four-vertex UV array
 
-This trace is enough to stop guessing and start building the renderer around the actual ABI shape:
+Chosen candidate: frame 4, quad 3, seq 35, ordinal 137, stack pointer at `sp+0x04`.
 
-- frame boundary token present
-- texture upload path visible
-- fixed-point vertex arrays visible
-- four-vertex quad draw confirmed
-- stable frame loop captured
+```text
+pointer = 0x101b70a8
+components = 2
+format = 0x140c (GL_FIXED)
+```
 
-That is enough to justify a renderer built from semantic commands, but not enough yet to hard-code exact ordinals without more evidence.
+Decoded as signed 16.16 fixed-point pairs:
+
+```text
+uv0 = ( 0.5, 49.5)
+uv1 = ( 0.5, -0.5)
+uv2 = (50.5, -0.5)
+uv3 = (50.5, 49.5)
+```
+
+This is consistent with texel-centered nearest-neighbor UVs for a `50 × 50` texture.
+
+---
+
+## Translation values and texture identifier
+
+For the same quad, the preceding state calls are:
+
+```text
+seq 29: ordinal 169   r1 = 260.0   r2 = 129.0
+seq 30: ordinal 169   r1 = -25.0   r2 = -50.0
+seq 31: ordinal 159   r0 = 0x1b    texture/state identifier
+```
+
+Conservative decoded translation used by the standalone test:
+
+```text
+translation = (260.0 + -25.0, 129.0 + -50.0)
+            = (235.0, 79.0)
+```
+
+Applied to the local position array, this yields final screen-space corners:
+
+```text
+(235,  79)
+(235, 129)
+(285, 129)
+(285,  79)
+```
+
+The `0x1b` texture/state identifier is real fixture data. Its exact mapping back to the upload sequence remains an interpretation, but the dimensions strongly match the `50 × 50` upload above.
+
+---
+
+## Exact sequence connecting this quad to the confirmed draw
+
+Frame 4, quad 3:
+
+```text
+29  Ordinal169State   r1=260.0   r2=129.0
+30  Ordinal169State   r1=-25.0   r2=-50.0
+31  Ordinal159State   r0=0x1b    r1=0x101b6fc0
+32  Ordinal137Array   r0=0 r1=4 r2=0x140c sp+4=0x101b7068   position XYZW
+33  Ordinal40State    r0=0
+34  Ordinal40State    r0=1
+35  Ordinal137Array   r0=1 r1=2 r2=0x140c sp+4=0x101b70a8   UV ST
+36  Ordinal175State   r0=0x18025508 r1=0x18025488 r2=0x180254c8
+37  Ordinal125State   r0=0 r1=1 r2=0 r3=0x18025508
+38  DrawArrays        r0=7 r1=0 r2=4
+39  Ordinal36State    r0=1
+```
+
+This is the smallest verified dataflow from decoded arrays to the confirmed draw boundary.
+
+---
+
+## Ordinal meanings: status labels
+
+### Confirmed by disassembly or direct argument evidence
+- `37` = `DrawArrays(7, 0, 4)`
+- `99` = upload-like call with the exact argument layout documented above
+- `137` = array-format call with direct stack arguments at `sp+0`, `sp+4`
+- `40` = state call with only `r0` directly set at the call site
+- `159` = state call with only `r0`, `r1` directly set at the call site
+- `175` = state call with direct `r0`, `r1`, `r2`
+
+### High-confidence interpretation
+- `45` = upload preparation / descriptor setup
+- `4` = target/state setup preceding upload
+- the `50 × 50` upload candidate above is the likely backing texture for quad 3
+- the summed translation `(235, 79)` is the correct placement for quad 3
+
+### Unresolved
+- exact semantic names for `45`, `4`, `159`, `169`, `175`, `125`, `36`
+- whether `0x1b` is a texture handle, descriptor index, or another state identifier
+- exact semantic role of the third/other array slots in quads 1 and 4
+- whether 158/157 should be called “present” / “submit” independent of ordering evidence
+
+---
+
+## Conservative semantic model
+
+Keep only the confirmed draw name. Use neutral names elsewhere:
+
+```text
+Ordinal169State(...)
+Ordinal159State(...)
+Ordinal137Array(index, components, format, stack_args...)
+Ordinal40State(index)
+Ordinal175State(...)
+Ordinal125State(...)
+DrawArrays(7, 0, 4)
+Ordinal36State(...)
+```
+
+---
+
+## Standalone renderer result
+
+A standalone test now decodes the real `50 × 50` upload candidate, the real frame-4 quad-3 position/UV arrays, applies the real translation values above, rasterizes with nearest-neighbor sampling, and hashes the 320×240 framebuffer.
+
+Deterministic framebuffer hash:
+
+```text
+fnv1a64 = 0xc6913d1457cb5696
+```
+
+Optional inspection artifact:
+- set `CLICKY_WRITE_TETRIS_QUAD_PPM=1`
+- run the render test
+- it writes `/tmp/tetris_quad3.ppm`

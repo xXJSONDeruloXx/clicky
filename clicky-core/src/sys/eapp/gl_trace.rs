@@ -13,16 +13,50 @@ pub enum GlValueClass {
     Float,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum GlMemoryRegion {
+    WorkRam,
+    Image,
+    Trampoline,
+    Unmapped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlFileBacking {
+    pub path: String,
+    pub base_addr: u32,
+    pub len: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlMemorySnapshot {
     pub addr: u32,
+    pub requested_len: usize,
     pub len: usize,
+    pub truncated: bool,
+    pub region: GlMemoryRegion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_backing: Option<GlFileBacking>,
     pub bytes_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlRegisterSnapshot {
     pub name: String,
+    pub value: u32,
+    pub class: GlValueClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub float_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<GlMemorySnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlStackWordSnapshot {
+    pub offset: usize,
     pub value: u32,
     pub class: GlValueClass,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,6 +76,7 @@ pub struct GlImportRecord {
     pub sp: u32,
     pub return_value: u32,
     pub stack: GlMemorySnapshot,
+    pub stack_words: Vec<GlStackWordSnapshot>,
     pub registers: Vec<GlRegisterSnapshot>,
 }
 
@@ -192,15 +227,21 @@ fn frame_signature(records: &[GlImportRecord]) -> String {
             if let Some(f) = reg.float_value {
                 f.to_bits().hash(&mut hasher);
             }
-            if let Some(snapshot) = &reg.snapshot {
-                snapshot.addr.hash(&mut hasher);
-                snapshot.len.hash(&mut hasher);
-                snapshot.bytes_hex.hash(&mut hasher);
-            }
         }
         record.stack.addr.hash(&mut hasher);
+        record.stack.requested_len.hash(&mut hasher);
         record.stack.len.hash(&mut hasher);
+        record.stack.truncated.hash(&mut hasher);
+        (record.stack.region as u8).hash(&mut hasher);
         record.stack.bytes_hex.hash(&mut hasher);
+        for word in &record.stack_words {
+            word.offset.hash(&mut hasher);
+            word.value.hash(&mut hasher);
+            (word.class as u8).hash(&mut hasher);
+            if let Some(f) = word.float_value {
+                f.to_bits().hash(&mut hasher);
+            }
+        }
     }
     format!("{:016x}", hasher.finish())
 }
