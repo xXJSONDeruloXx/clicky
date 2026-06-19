@@ -123,7 +123,22 @@ pub struct Eapp {
     frame_context: u32,
     frame_counter: u64,
     pending_guest_calls: VecDeque<PendingGuestCall>,
+    /// Host file contents staged for delivery to the guest, keyed by the guest
+    /// request-object address that asked for them.
+    staged_files: HashMap<u32, StagedFile>,
+    /// Request objects we've already dumped once, to keep logs tractable.
+    dumped_requests: HashSet<u32>,
     halted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StagedFile {
+    /// Guest address where the file payload bytes have been copied.
+    payload_addr: u32,
+    /// Length in bytes.
+    len: u32,
+    /// Host path the bytes came from.
+    host_path: PathBuf,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -240,6 +255,8 @@ impl Eapp {
             frame_context: 0,
             frame_counter: 0,
             pending_guest_calls: VecDeque::new(),
+            staged_files: HashMap::new(),
+            dumped_requests: HashSet::new(),
             halted: false,
         })
     }
@@ -442,15 +459,66 @@ impl Eapp {
             self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
 
             if ordinal == 3 {
+                let req = args[2];
+                self.dump_request_object(req);
                 if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    // Request-object protocol (observed):
+                    //   [req+0x14] = guest-provided destination buffer
+                    //   [req+0x18] = expected byte count
+                    //   [req+0x34] = completion callback pc
+                    //   [req+0x38] = completion callback context
+                    // We are the I/O layer, so we fill the guest's buffer.
+                    let dest = self.read_guest_u32(req.wrapping_add(0x14)).unwrap_or(0);
+                    let want = self.read_guest_u32(req.wrapping_add(0x18)).unwrap_or(0);
+                    match fs::read(&host_path) {
+                        Ok(bytes) => {
+                            let n = if want != 0 {
+                                bytes.len().min(want as usize)
+                            } else {
+                                bytes.len()
+                            };
+                            let delivered = dest != 0 && self.write_guest_bytes(dest, &bytes[..n]);
+                            if delivered {
+                                info!(
+                                    target: "EAPP_IMPORT",
+                                    "AsyncFileIO:3 loaded {} ({} bytes) -> guest dest {:#010x}",
+                                    host_path.display(),
+                                    n,
+                                    dest
+                                );
+                                self.staged_files.insert(
+                                    req,
+                                    StagedFile {
+                                        payload_addr: dest,
+                                        len: n as u32,
+                                        host_path: host_path.clone(),
+                                    },
+                                );
+                            } else {
+                                warn!(
+                                    target: "EAPP_IMPORT",
+                                    "AsyncFileIO:3 no dest buffer for {} (want {} bytes)",
+                                    host_path.display(),
+                                    want
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "EAPP_IMPORT",
+                                "AsyncFileIO:3 read error for {}: {}",
+                                host_path.display(),
+                                e
+                            );
+                        }
+                    }
                     info!(target: "EAPP_IMPORT", "AsyncFileIO:3 resolved={}", host_path.display());
-                    if let Some(callback_pc) = self.read_guest_u32(args[2].wrapping_add(0x34)) {
-                        let callback_ctx =
-                            self.read_guest_u32(args[2].wrapping_add(0x38)).unwrap_or(0);
+                    if let Some(callback_pc) = self.read_guest_u32(req.wrapping_add(0x34)) {
+                        let callback_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
                         if callback_pc != 0 {
                             self.pending_guest_calls.push_back(PendingGuestCall {
                                 pc: callback_pc,
-                                arg0: args[2],
+                                arg0: req,
                                 arg1: callback_ctx,
                             });
                         }
@@ -565,6 +633,50 @@ impl Eapp {
         self.bus.w32(addr, val).is_ok()
     }
 
+    fn write_guest_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        for (i, &b) in bytes.iter().enumerate() {
+            if self.bus.w8(addr.wrapping_add(i as u32), b).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Best-effort diagnostic dump of the AsyncFileIO request-object layout.
+    /// Used to reverse-engineer where the guest expects file payload/length to
+    /// be written. Logged once per request object address.
+    fn dump_request_object(&mut self, req: u32) {
+        if req == 0 || !self.dumped_requests.insert(req) {
+            return;
+        }
+        let fields: [(usize, &str); 16] = [
+            (0x00, "[0x00]"),
+            (0x04, "[0x04] type"),
+            (0x08, "[0x08]"),
+            (0x0c, "[0x0c]"),
+            (0x10, "[0x10]"),
+            (0x14, "[0x14] arg2"),
+            (0x18, "[0x18] arg3"),
+            (0x1c, "[0x1c]"),
+            (0x20, "[0x20]"),
+            (0x24, "[0x24]"),
+            (0x28, "[0x28]"),
+            (0x2c, "[0x2c]"),
+            (0x30, "[0x30]"),
+            (0x34, "[0x34] cb_pc"),
+            (0x38, "[0x38] cb_ctx"),
+            (0x3c, "[0x3c]"),
+        ];
+        let mut rendered = String::new();
+        for (off, label) in fields.iter() {
+            let val = self
+                .read_guest_u32(req.wrapping_add(*off as u32))
+                .unwrap_or(0xdeadbeef);
+            rendered.push_str(&format!("\n    {} {:#010x}", label, val));
+        }
+        info!(target: "EAPP", "request object @ {:#010x}:{}", req, rendered);
+    }
+
     fn handle_guest_svc(&mut self, pc: u32) -> bool {
         if self.read_guest_u32(pc) != Some(0xef12_3456) {
             return false;
@@ -667,7 +779,11 @@ impl Eapp {
             return None;
         }
 
-        let writable = self.metadata.bundle_dir.join(".clicky-saves").join(normalized);
+        let writable = self
+            .metadata
+            .bundle_dir
+            .join(".clicky-saves")
+            .join(normalized);
         if let Some(parent) = writable.parent() {
             fs::create_dir_all(parent).ok()?;
         }

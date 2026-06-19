@@ -280,13 +280,21 @@ What is **NOT working** (and why it is a green screen):
   - no draw calls, no vertex data, no matrices
   - no clear / viewport / scissor
   - no guest-drawn framebuffer at all
-- File contents never reach guest memory. `AsyncFileIO:3` resolves the path and
-  fires a completion callback, but the actual bytes of `Strings.dta`, `*.pix`,
-  `*.wav`, etc. are never read from disk into any guest-accessible buffer.
-- The completion callback is synthetic. We call the guest's open-done callback
-  with the request object, but do not populate the resource/data fields the game
-  expects. The Tetris placeholder-slot hack exists precisely because those fields
-  stay null.
+- ~~File contents never reach guest memory.~~ **Now fixed as of the latest
+  commit:** `AsyncFileIO:3` reads the host file and copies the bytes directly
+  into the guest-provided destination buffer (`[req+0x14]`, length `[req+0x18]`)
+  before firing the completion callback. Reverse-engineered request-object layout:
+  - `[req+0x04]` call type (=6)
+  - `[req+0x14]` destination buffer pointer (guest-allocated; reused as a
+    staging buffer across loads)
+  - `[req+0x18]` expected byte count (matches file size)
+  - `[req+0x34]` completion callback pc
+  - `[req+0x38]` completion callback context
+  The guest's own `.pix` / `.tga` / `.wav` parsers now receive real bytes.
+- The completion callback is still synthetic in the sense that we drive it
+  directly, but it now runs against a request object whose destination buffer
+  is genuinely populated. The Tetris placeholder-slot hack is still in place for
+  a separate late menu/resource null-deref path.
 - `Audio` is fully stubbed (returns 0, nothing plays).
 - `InputEvents:0` is wired to host keys but unverifiable because nothing renders.
 - `Metadata` / `Settings` return dummy zeros (fine for startup, may matter later).
@@ -297,11 +305,12 @@ What is **NOT working** (and why it is a green screen):
 
 In order:
 
-1. Make `AsyncFileIO:3` actually load file bytes into a guest buffer the
-   resource layer points at (replace the placeholder-slot hack).
+1. ~~Make `AsyncFileIO:3` actually load file bytes into a guest buffer the
+   resource layer points at~~ **Done.** The guest's own resource parsers now
+   receive real file bytes.
 2. Implement the handful of `OpenGLES` ordinals needed to blit a texture:
    texture upload, texcoord/vertex setup, draw, and a real framebuffer the game
-   writes into instead of our green fill.
+   writes into instead of our green fill. (This is now the active blocker.)
 
 Step 1 unblocks step 2.
 
