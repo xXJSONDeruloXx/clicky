@@ -89,12 +89,38 @@ struct Watchdog {
     last_sample: std::time::Instant,
     /// Recent (cpu_pc, cop_pc) pairs for tight-loop detection.
     pc_history: std::collections::VecDeque<(u32, u32)>,
+    /// Optional CPU PC focus range for targeted hang detection.
+    focus_cpu_pc_range: Option<(u32, u32)>,
+    /// Optional watched addresses to trace once the CPU enters the focus range.
+    trace_addrs: Vec<u32>,
 }
 
 const WATCHDOG_HISTORY: usize = 256;
-const WATCHDOG_LOOP_RADIUS: u32 = 0x80;
 
 impl Watchdog {
+    fn parse_u32(s: &str) -> Option<u32> {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            s.parse().ok()
+        }
+    }
+
+    fn parse_u32_range(s: &str) -> Option<(u32, u32)> {
+        let s = s.trim();
+        let (start, end) = s
+            .split_once("..")
+            .or_else(|| s.split_once('-'))?;
+        Some((Self::parse_u32(start)?, Self::parse_u32(end)?))
+    }
+
+    fn focus_contains(&self, pc: u32) -> bool {
+        self.focus_cpu_pc_range
+            .map(|(start, end)| start <= pc && pc <= end)
+            .unwrap_or(true)
+    }
+
     fn from_env() -> Option<Watchdog> {
         let wd_ms: Option<u64> = std::env::var("CLICKY_WATCHDOG_MS")
             .ok()
@@ -102,10 +128,25 @@ impl Watchdog {
         let sample_ms: Option<u64> = std::env::var("CLICKY_SAMPLE_MS")
             .ok()
             .and_then(|s| s.parse().ok());
-        // Activate if either the stall detector or the sampler is requested.
-        // If only the sampler is on, use an effectively-infinite threshold so
-        // the stall detector never fires.
-        let activate = wd_ms.is_some() || sample_ms.is_some();
+        let focus_cpu_pc_range = std::env::var("CLICKY_WATCH_CPU_PC_RANGE")
+            .ok()
+            .and_then(|s| Self::parse_u32_range(&s));
+        let trace_addrs: Vec<u32> = std::env::var("CLICKY_TRACE_ADDRS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(Self::parse_u32)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Activate if any diagnostic probe is requested. If only the sampler or
+        // focused trace is on, use an effectively-infinite threshold so the
+        // generic stall detector never fires.
+        let activate = wd_ms.is_some()
+            || sample_ms.is_some()
+            || focus_cpu_pc_range.is_some()
+            || !trace_addrs.is_empty();
         if !activate {
             return None;
         }
@@ -119,6 +160,8 @@ impl Watchdog {
             sample_every: sample_ms.map(std::time::Duration::from_millis),
             last_sample: now,
             pc_history: std::collections::VecDeque::new(),
+            focus_cpu_pc_range,
+            trace_addrs,
         })
     }
 }
@@ -170,8 +213,8 @@ impl Ipod4g {
 
         if let Some(w) = &sys.watchdog {
             eprintln!(
-                "[watchdog] active: threshold={:?}, sample_every={:?}",
-                w.threshold, w.sample_every
+                "[watchdog] active: threshold={:?}, sample_every={:?}, focus_cpu_pc_range={:?}, trace_addrs={:?}",
+                w.threshold, w.sample_every, w.focus_cpu_pc_range, w.trace_addrs
             );
         }
 
@@ -275,10 +318,15 @@ impl Ipod4g {
             false
         };
 
-        // `progressing` is false only when the guest is in a tight loop (or
-        // exact-PC stall). PC movement inside the loop does NOT count as
-        // progress; only escaping to a new region resets the timer.
-        let progressing = !tight_loop;
+        // Optional focus range lets us ignore transient tight loops elsewhere
+        // and only fire once the CPU reaches the interesting region.
+        let in_focus = w.focus_contains(cpu_pc);
+
+        // `progressing` is false only when the guest is in a tight loop inside
+        // the focus range (or, if no focus is configured, anywhere). PC
+        // movement inside the loop does NOT count as progress; only escaping to
+        // a new region resets the timer.
+        let progressing = !tight_loop || !in_focus;
         if progressing {
             w.last_cpu_pc = cpu_pc;
             w.last_cop_pc = cop_pc;
@@ -336,6 +384,12 @@ impl Ipod4g {
 
         self.watchdog_observe();
 
+        let (diag_focus_range, diag_trace_addrs) = self
+            .watchdog
+            .as_ref()
+            .map(|w| (w.focus_cpu_pc_range, w.trace_addrs.clone()))
+            .unwrap_or((None, Vec::new()));
+
         let devices = &mut self.devices;
         for (cpu, cpuid) in [(&mut self.cpu, CpuId::Cpu), (&mut self.cop, CpuId::Cop)].iter_mut() {
             if !devices.cpucon.is_cpu_running(*cpuid) {
@@ -351,8 +405,28 @@ impl Ipod4g {
             devices.memcon.set_cpuid(*cpuid);
             devices.mailbox.set_cpuid(*cpuid);
 
-            let mut sniffer = MemSniffer::new(devices, sniff_memory.0, |access| {
-                sniff_memory.1(*cpuid, access)
+            let cpuid = *cpuid;
+            let step_pc = cpu.reg_get(cpu.mode(), reg::PC);
+            let trace_enabled = !diag_trace_addrs.is_empty()
+                && diag_focus_range
+                    .map(|(start, end)| start <= step_pc && step_pc <= end)
+                    .unwrap_or(true);
+            let mut sniff_addrs = sniff_memory.0.to_vec();
+            if trace_enabled {
+                for &addr in &diag_trace_addrs {
+                    if !sniff_addrs.contains(&addr) {
+                        sniff_addrs.push(addr);
+                    }
+                }
+            }
+
+            let mut sniffer = MemSniffer::new(devices, &sniff_addrs, |access| {
+                if sniff_memory.0.contains(&access.offset) {
+                    sniff_memory.1(cpuid, access);
+                }
+                if trace_enabled && diag_trace_addrs.contains(&access.offset) {
+                    eprintln!("[watchdog] TRACE {} pc={:#010x} {}", cpuid, step_pc, access);
+                }
             });
             let mut mem = MemoryAdapter::new(&mut sniffer);
             cpu.step(&mut mem);
