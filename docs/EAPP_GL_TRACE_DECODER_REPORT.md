@@ -258,11 +258,17 @@ Ordinal36State(...)
 
 ## Frame 4 replay summary
 
-The standalone replay now renders the complete steady-state frame-4 draw stream using generated textures only:
-- draw 1: generated `320 × 240` RGB565 background
-- draw 2: generated `250 × 162` RGBA4444 sprite
-- draw 3: generated `50 × 50` RGBA5551 sprite
-- draw 4: generated `1 × 1` A8 placeholder for the unresolved handle `3`
+The standalone replay now renders the complete steady-state frame-4 stream using generated textures only.
+
+### Artifact comparison
+
+| artifact | hash | nonzero | bbox | alpha range | draw4 effect |
+|---|---|---:|---|---|---|
+| draws 1–3 only | `0xb1b233a9858cfcc3` | 76800 | `0,0–319,239` | `255..255` | baseline |
+| all draws with draw4 disabled | `0xb1b233a9858cfcc3` | 76800 | `0,0–319,239` | `255..255` | same as baseline |
+| all draws (current unresolved draw4 probe) | `0x3514598dae7f1fe2` | 76800 | `0,0–319,239` | `255..255` | full-screen overlay changes 76796 pixels vs baseline |
+| draw4 only (A8 placeholder / alpha probe) | `0x05c580c350a40325` | 76800 | `0,0–319,239` | `128..128` | blends |
+| draw4 only (opaque probe) | `0x24cda718d8961325` | 76800 | `0,0–319,239` | `255..255` | overwrites |
 
 ### Per-draw summary
 
@@ -271,16 +277,23 @@ The standalone replay now renders the complete steady-state frame-4 draw stream 
 | 1 | `15` | `19` | `(0.0, 0.0)` | `(0,0)–(320,240)` | `screenBG_565.pix` / `320×240` / `RGB565` | 0.93 | 76800 |
 | 2 | `27` | `14` | `(42.5, 76.0)` | `(42.5,76.0)–(277.5,238.0)` | `tetrisLogo_4444.pix` / `250×162` / `RGBA4444` | 0.84 | 38070 |
 | 3 | `38` | `27` | `(235.0, 79.0)` | `(235,79)–(285,129)` | `eaLogo_5551.pix` / `50×50` / `RGBA5551` | 0.87 | 2500 |
-| 4 | `48` | `3` | `(0.0, 0.0)` | `(0,0)–(320,240)` | unresolved handle `3` / generated `1×1` A8 placeholder | 0.28 | 76800 |
+| 4 | `48` | `3` | `(0.0, 0.0)` | `(0,0)–(320,240)` | unresolved full-screen overlay/material blob | 0.28 | 76800 |
 
 ### Relevant state grouped with each draw
 
 - **Draw 1**: `169×3` → `159` → `137`/`40`/`137`/`40`/`137` → `175` → `125` → `37` → `36` → `36`
-  - aux `137` seq `11` is present and currently unresolved as a secondary 4-component array.
+  - aux `137` seq `11` is present and still unresolved as a secondary 4-component array.
 - **Draw 2**: `169×2` → `159` → `137` → `40` → `40` → `137` → `175` → `125` → `37` → `36`
 - **Draw 3**: `169×2` → `159` → `137` → `40` → `40` → `137` → `175` → `125` → `37` → `36`
 - **Draw 4**: `169` → `159` → `137` → `40` → `137` → `40` → `175` → `125` → `37` → `36`
-  - the second `137` seq `44` currently decodes as an all-ones 4-component array; exact semantic role remains unresolved.
+  - the second `137` seq `44` decodes as an all-ones 4-component array, which fits a white/tint/identity-style overlay more than an ordinary textured quad.
+
+### Dataflow notes
+
+- `Ordinal159State` is best read as a small-handle selector for a texture/material composite; `r1` carries the per-draw state blob.
+- The three obvious frame-4 handles (`19`, `14`, `27`) line up with the earlier upload triplets by size and file-backed payload.
+- Handle `3` does **not** line up with a captured upload triplet; its state blob looks generated and full-screen.
+- I still did not capture the exact table write / later load that stores the small handle into the `Ordinal159` call path.
 
 ### Replay semantics recovered so far
 
@@ -290,10 +303,22 @@ The standalone replay now renders the complete steady-state frame-4 draw stream 
 - `A8`, `RGB565`, `RGBA5551`, and `RGBA4444` are all supported in the standalone renderer.
 - Alpha-bearing textures use source-over compositing.
 
-### Deterministic replay artifact
+### Conservative mapping table
+
+| upload triplet | source file | descriptor/object ptr | candidate handle | frame-4 draw | confidence | missing evidence |
+|---|---|---:|---:|---|---:|---|
+| `9→10→11` | `screenBG_565.pix` | `0x1802d57c` | `19` | draw 1 | 0.93 | exact table write not captured; matched by size + fullscreen state blob |
+| `12→13→14` | `eaLogo_5551.pix` | `0x1802d5b4` | `14` | draw 2 | 0.84 | exact table write not captured; matched by size + state blob |
+| `15→16→17` | `tetrisLogoT_4444.pix` | `0x1802d73c` | `27` | draw 3 | 0.87 | exact table write not captured; matched by size + state blob |
+| none captured | none captured | `0x101b7260` | `3` | draw 4 | 0.28 | no matching upload triplet; appears to be a generated full-screen overlay/material blob |
+
+### Deterministic replay artifacts
 
 ```text
-frame4_hash = 0x3514598dae7f1fe2
+draws_1_3_hash = 0xb1b233a9858cfcc3
+all_draws_hash = 0x3514598dae7f1fe2
+draw4_alpha_hash = 0x05c580c350a40325
+draw4_opaque_hash = 0x24cda718d8961325
 ```
 
 Optional inspection artifact:
@@ -303,8 +328,8 @@ Optional inspection artifact:
 
 ### Unresolved-state list
 
-- exact descriptor/object → handle mapping for `Ordinal45`/`Ordinal4`/`Ordinal99` → `Ordinal159`
+- exact descriptor/object → handle write/load path for `Ordinal45`/`Ordinal4`/`Ordinal99` → `Ordinal159`
 - draw 1 secondary `137` seq `11` role
-- draw 4 secondary `137` seq `44` role
-- whether the `handle 3` overlay is a texture, color pass, or another state object
+- draw 4 secondary `137` seq `44` role beyond the identity/tint interpretation
+- whether the `handle 3` overlay is fade, tint, clear-replacement, or post-process rather than a normal textured quad
 - whether the generated replay textures correspond to the real game art (they do not attempt to)

@@ -1,7 +1,7 @@
 use clicky_core::sys::eapp::{
     blend_src_over, decode_fixed_16_16, first_frame, framebuffer_hash, framebuffer_to_ppm,
-    rasterize_quad, register, sample_nearest, stack_word, words_from_snapshot, GlImportRecord,
-    GlTraceFixture, Rgba8, Texture, TextureFormat,
+    rasterize_quad, register, sample_nearest, stack_word, texture_upload_candidates,
+    words_from_snapshot, GlImportRecord, GlTraceFixture, Rgba8, Texture, TextureFormat,
 };
 
 fn load_fixture() -> GlTraceFixture {
@@ -655,4 +655,265 @@ fn replay_frame4_produces_complete_artifact_and_hash() {
 
     assert_eq!(hash, 0x3514_598d_ae7f_1fe2);
     assert_eq!(bytes.len(), 320 * 240 * 4);
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Draw4ProbeMode {
+    AlphaOnly,
+    Opaque,
+}
+
+fn draw4_probe_texture(mode: Draw4ProbeMode) -> (Texture, ProposedTexture) {
+    match mode {
+        Draw4ProbeMode::AlphaOnly => (
+            make_texture(TextureFormat::A8, 1, 1, make_raw_a8(1, 1)),
+            ProposedTexture::unresolved(
+                "handle 3 / full-screen overlay",
+                "identity/overlay probe; not a final asset mapping",
+                TextureFormat::A8,
+                0.28,
+            ),
+        ),
+        Draw4ProbeMode::Opaque => (
+            make_texture(TextureFormat::Rgba5551, 1, 1, vec![0xff, 0xff]),
+            ProposedTexture::unresolved(
+                "handle 3 / full-screen overlay",
+                "identity/overlay probe; not a final asset mapping",
+                TextureFormat::Rgba5551,
+                0.28,
+            ),
+        ),
+    }
+}
+
+fn replay_frame4_with_probe(mode: Draw4ProbeMode) -> Vec<DrawReplay> {
+    let (_, mut draws) = replay_frame4();
+    let (texture, proposed_texture) = draw4_probe_texture(mode);
+    draws[3].texture = texture;
+    draws[3].proposed_texture = proposed_texture;
+    draws
+}
+
+fn render_draws(draws: &[DrawReplay], include_draw4: bool) -> Vec<Rgba8> {
+    let mut fb = vec![Rgba8::rgba(0, 0, 0, 0); 320 * 240];
+    for (idx, draw) in draws.iter().enumerate() {
+        if !include_draw4 && idx == 3 {
+            continue;
+        }
+        draw.rasterize(&mut fb);
+    }
+    fb
+}
+
+fn framebuffer_stats(
+    fb: &[Rgba8],
+    width: usize,
+    height: usize,
+) -> (usize, Option<(usize, usize, usize, usize)>, (u8, u8)) {
+    let mut nonzero = 0usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut alpha_min = u8::MAX;
+    let mut alpha_max = 0u8;
+
+    for y in 0..height {
+        for x in 0..width {
+            let px = fb[y * width + x];
+            if px.r != 0 || px.g != 0 || px.b != 0 || px.a != 0 {
+                nonzero += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+            alpha_min = alpha_min.min(px.a);
+            alpha_max = alpha_max.max(px.a);
+        }
+    }
+
+    (
+        nonzero,
+        if nonzero == 0 {
+            None
+        } else {
+            Some((min_x, min_y, max_x, max_y))
+        },
+        (alpha_min, alpha_max),
+    )
+}
+
+fn diff_pixels(a: &[Rgba8], b: &[Rgba8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .filter(|(lhs, rhs)| lhs != rhs)
+        .count()
+}
+
+fn print_draw_summary(
+    name: &str,
+    fb: &[Rgba8],
+    draws: &[DrawReplay],
+    include_draw4: bool,
+    draw_index_offset: usize,
+) {
+    let (nonzero, bbox, alpha_range) = framebuffer_stats(fb, 320, 240);
+    println!("artifact={name}");
+    println!("  hash={:016x}", framebuffer_hash(fb));
+    println!("  nonzero_pixels={nonzero}");
+    match bbox {
+        Some((min_x, min_y, max_x, max_y)) => {
+            println!("  bbox=({}, {})-({}, {})", min_x, min_y, max_x, max_y)
+        }
+        None => println!("  bbox=none"),
+    }
+    println!("  alpha_range=({}, {})", alpha_range.0, alpha_range.1);
+    for (idx, draw) in draws.iter().enumerate() {
+        if !include_draw4 && idx == 3 {
+            continue;
+        }
+        println!(
+            "  draw{} handle={} coverage={} bounds=({:.1},{:.1})-({:.1},{:.1}) tex={} kind={} format={:?}",
+            idx + 1 + draw_index_offset,
+            draw.ordinal159_handle,
+            draw.coverage,
+            draw.screen_bounds.0,
+            draw.screen_bounds.1,
+            draw.screen_bounds.2,
+            draw.screen_bounds.3,
+            draw.proposed_texture.label,
+            draw.proposed_texture.kind,
+            draw.proposed_texture.format,
+        );
+    }
+}
+
+#[test]
+fn frame4_artifact_comparison_and_handle_mapping() {
+    let fixture = load_fixture();
+    let uploads = texture_upload_candidates(&fixture);
+    let (_, base_draws) = replay_frame4();
+    let draws_1_to_3 = render_draws(&base_draws, false);
+    let all_draws = render_draws(&base_draws, true);
+
+    let draw4_alpha = replay_frame4_with_probe(Draw4ProbeMode::AlphaOnly);
+    let draw4_alpha_fb = render_draws(&draw4_alpha[3..4], true);
+    let draw4_opaque = replay_frame4_with_probe(Draw4ProbeMode::Opaque);
+    let draw4_opaque_fb = render_draws(&draw4_opaque[3..4], true);
+    let draw4_only = render_draws(&base_draws[3..4], true);
+
+    if std::env::var_os("CLICKY_PRINT_FRAME4_ARTIFACTS").is_some() {
+        print_draw_summary("draws_1_to_3_only", &draws_1_to_3, &base_draws, false, 0);
+        print_draw_summary(
+            "all_draws_draw4_disabled",
+            &draws_1_to_3,
+            &base_draws,
+            false,
+            0,
+        );
+        print_draw_summary("all_draws_placeholder", &all_draws, &base_draws, true, 0);
+        println!(
+            "  overwrite_vs_draws_1_to_3={} diff_pixels={}",
+            if diff_pixels(&draws_1_to_3, &all_draws) > 0 {
+                "yes"
+            } else {
+                "no"
+            },
+            diff_pixels(&draws_1_to_3, &all_draws)
+        );
+
+        print_draw_summary(
+            "draw4_only_placeholder",
+            &draw4_only,
+            &base_draws[3..4],
+            true,
+            3,
+        );
+        print_draw_summary(
+            "draw4_only_alpha",
+            &draw4_alpha_fb,
+            &draw4_alpha[3..4],
+            true,
+            3,
+        );
+        print_draw_summary(
+            "draw4_only_opaque",
+            &draw4_opaque_fb,
+            &draw4_opaque[3..4],
+            true,
+            3,
+        );
+    }
+
+    // Conservative handle mapping from upload candidates to frame-4 ord159 draws.
+    let mapping_rows = [
+        (
+            "screenBG_565.pix",
+            19u32,
+            "frame4 draw1",
+            Some(0.93f32),
+            "exact table write not captured; matched by size + fullscreen state blob",
+        ),
+        (
+            "tetrisLogoT_4444.pix",
+            14u32,
+            "frame4 draw2",
+            Some(0.84f32),
+            "exact table write not captured; matched by size + state blob",
+        ),
+        (
+            "eaLogo_5551.pix",
+            27u32,
+            "frame4 draw3",
+            Some(0.87f32),
+            "exact table write not captured; matched by size + state blob",
+        ),
+        (
+            "no upload candidate",
+            3u32,
+            "frame4 draw4",
+            Some(0.28f32),
+            "no matching upload triplet; appears to be a generated fullscreen overlay/material blob",
+        ),
+    ];
+
+    if std::env::var_os("CLICKY_PRINT_FRAME4_MAPPING").is_some() {
+        println!("mapping_table");
+        for row in &mapping_rows {
+            println!(
+                "  source_file={} handle={} draw={} confidence={:.2} missing={}",
+                row.0,
+                row.1,
+                row.2,
+                row.3.unwrap_or(0.0),
+                row.4,
+            );
+        }
+        println!("  uploads={}", uploads.len());
+        for upload in uploads.iter().take(4) {
+            println!(
+                "  upload seqs={}→{}→{} file={} desc={:#x} object_tag={} target={:#x} fmt={:#x} type={:#x} src={:#x}",
+                upload.ordinal45_seq,
+                upload.ordinal4_seq,
+                upload.ordinal99_seq,
+                upload
+                    .source_file
+                    .as_ref()
+                    .map(|f| f.path.as_str())
+                    .unwrap_or("<unknown>"),
+                upload.descriptor_ptr,
+                upload.object_tag,
+                upload.target,
+                upload.internal_format,
+                upload.pixel_type,
+                upload.source_ptr,
+            );
+        }
+    }
+
+    assert!(diff_pixels(&draws_1_to_3, &all_draws) > 0);
+    assert_eq!(draw4_only.len(), 320 * 240);
+    assert_eq!(draw4_alpha_fb.len(), 320 * 240);
+    assert_eq!(draw4_opaque_fb.len(), 320 * 240);
 }
