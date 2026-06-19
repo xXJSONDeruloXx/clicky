@@ -22,6 +22,8 @@ log = "0.4"
 num_enum = "0.5"
 static_assertions = "1.1"
 thiserror = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # emulation related
 armv4t_emu = { git = "https://github.com/daniel5151/armv4t_emu.git" }

@@ -142,6 +142,28 @@ fn main() -> DynResult<()> {
     }
     let title = format!("{} [eapp]", system.title());
 
+    let capture_path = std::env::var_os("EAPP_GL_CAPTURE_JSON").map(PathBuf::from);
+    if let Some(_) = capture_path.as_ref() {
+        let (start, end) = std::env::var("EAPP_GL_CAPTURE_FRAMES")
+            .ok()
+            .and_then(|spec| {
+                spec.split_once('-')
+                    .map(|(s, e)| (s.to_string(), e.to_string()))
+            })
+            .and_then(|(s, e)| Some((s.parse::<u64>().ok()?, e.parse::<u64>().ok()?)))
+            .unwrap_or((0, 60));
+        let stack_len = std::env::var("EAPP_GL_CAPTURE_STACK_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0x80);
+        let pointer_len = std::env::var("EAPP_GL_CAPTURE_POINTER_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0x80);
+        system.enable_gl_capture(start, end, stack_len, pointer_len);
+        info!(target: "EAPP", "GL capture enabled for frames {}..={} -> {}", start, end, capture_path.as_ref().unwrap().display());
+    }
+
     if args.headless {
         let result = match args.cycles {
             Some(cycles) => system.run_cycles(cycles),
@@ -150,6 +172,11 @@ fn main() -> DynResult<()> {
         system.log_top_imports(25);
         if std::env::var("EAPP_RAMSCAN").is_ok() {
             system.scan_for_framebuffer();
+        }
+        if let Some(path) = capture_path {
+            system
+                .write_gl_trace_fixture(&path)
+                .map_err(|err| format!("failed to write GL capture {}: {}", path.display(), err))?;
         }
         if let Err(err) = result {
             return Err(format!("fatal eapp error: {:#010x?}", err).into());

@@ -6,6 +6,13 @@ use std::sync::{Arc, Mutex};
 use armv4t_emu::{reg, Cpu, Mode as ArmMode};
 use thiserror::Error;
 
+mod gl_trace;
+use gl_trace::hex_bytes;
+pub use gl_trace::{
+    GlFrameRecord, GlImportRecord, GlMemorySnapshot, GlRegisterSnapshot, GlTraceFixture,
+    GlTraceRecorder, GlValueClass,
+};
+
 use crate::devices::generic::Ram;
 use crate::devices::{Device, Probe};
 use crate::error::*;
@@ -133,6 +140,8 @@ pub struct Eapp {
     /// Optional inclusive frame window in which to log every OpenGLES call
     /// with full args + return address, for reverse-engineering the GL stream.
     gl_trace_frames: Option<(u64, u64)>,
+    /// Optional bounded OpenGLES capture recorder for machine-readable traces.
+    gl_capture: Option<GlTraceRecorder>,
     halted: bool,
 }
 
@@ -264,6 +273,7 @@ impl Eapp {
             dumped_requests: HashSet::new(),
             import_call_counts: HashMap::new(),
             gl_trace_frames: None,
+            gl_capture: None,
             halted: false,
         })
     }
@@ -318,6 +328,173 @@ impl Eapp {
     /// full args + return address. Used for Option A diagnostics.
     pub fn set_gl_trace_window(&mut self, start: u64, end: u64) {
         self.gl_trace_frames = Some((start, end));
+    }
+
+    /// Enable bounded JSON-friendly OpenGLES trace capture.
+    pub fn enable_gl_capture(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+        stack_snapshot_len: usize,
+        pointer_snapshot_len: usize,
+    ) {
+        self.gl_capture = Some(GlTraceRecorder::new(
+            start_frame,
+            end_frame,
+            stack_snapshot_len,
+            pointer_snapshot_len,
+        ));
+    }
+
+    /// Drain the current GL capture into a fixture with metadata filled in.
+    pub fn take_gl_trace_fixture(&mut self) -> Option<GlTraceFixture> {
+        let recorder = self.gl_capture.take()?;
+        let mut fixture = recorder.finalize();
+        fixture.title = self.metadata.title.clone();
+        fixture.bundle_dir = self.metadata.bundle_dir.display().to_string();
+        fixture.executable_path = self.metadata.executable_path.display().to_string();
+        fixture.file_vma_base = FILE_VMA_BASE;
+        fixture.work_ram_base = WORK_RAM_BASE;
+        fixture.work_ram_size = WORK_RAM_SIZE;
+        Some(fixture)
+    }
+
+    /// Serialize the active GL capture as JSON.
+    pub fn write_gl_trace_fixture(&mut self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let fixture = match self.take_gl_trace_fixture() {
+            Some(fixture) => fixture,
+            None => return Ok(()),
+        };
+        let json = serde_json::to_vec_pretty(&fixture).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("serde_json: {}", err))
+        })?;
+        fs::write(path, json)
+    }
+
+    fn capture_open_gl_import(&mut self, ordinal: u32, pc: u32, lr: u32, args: [u32; 4], ret: u32) {
+        let Some((start, end)) = self.gl_capture.as_ref().map(|r| r.capture_range()) else {
+            return;
+        };
+        if self.frame_counter < start || self.frame_counter > end {
+            return;
+        }
+
+        let stack_len = self
+            .gl_capture
+            .as_ref()
+            .map(|r| r.stack_snapshot_len())
+            .unwrap_or(0x80);
+        let pointer_len = self
+            .gl_capture
+            .as_ref()
+            .map(|r| r.pointer_snapshot_len())
+            .unwrap_or(0x80);
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let registers = self.capture_registers(pc, lr, sp, args, pointer_len);
+        let stack = self.snapshot_memory(sp, stack_len);
+        let record = GlImportRecord {
+            seq: 0,
+            seq_in_frame: 0,
+            frame: self.frame_counter,
+            ordinal,
+            pc,
+            lr,
+            sp,
+            return_value: ret,
+            stack,
+            registers,
+        };
+
+        if let Some(recorder) = self.gl_capture.as_mut() {
+            recorder.capture_record(self.frame_counter, record);
+        }
+    }
+
+    fn capture_registers(
+        &mut self,
+        pc: u32,
+        lr: u32,
+        sp: u32,
+        args: [u32; 4],
+        pointer_len: usize,
+    ) -> Vec<GlRegisterSnapshot> {
+        let mut registers = Vec::with_capacity(16);
+        for idx in 0..13u32 {
+            let value = if idx < 4 {
+                args[idx as usize]
+            } else {
+                self.cpu.reg_get(self.cpu.mode(), idx as u8)
+            };
+            registers.push(self.capture_register(format!("r{}", idx), value, pointer_len, idx < 4));
+        }
+        registers.push(self.capture_register("sp", sp, pointer_len, true));
+        registers.push(self.capture_register("lr", lr, pointer_len, false));
+        registers.push(self.capture_register("pc", pc, pointer_len, false));
+        registers
+    }
+
+    fn capture_register(
+        &mut self,
+        name: impl Into<String>,
+        value: u32,
+        pointer_len: usize,
+        allow_snapshot: bool,
+    ) -> GlRegisterSnapshot {
+        let name = name.into();
+        let class = self.classify_trace_value(value);
+        let float_value = matches!(class, GlValueClass::Float).then(|| f32::from_bits(value));
+        let snapshot = if allow_snapshot && matches!(class, GlValueClass::MappedPointer) {
+            Some(self.snapshot_memory(value, pointer_len))
+        } else {
+            None
+        };
+        GlRegisterSnapshot {
+            name,
+            value,
+            class,
+            float_value,
+            snapshot,
+        }
+    }
+
+    fn classify_trace_value(&self, value: u32) -> GlValueClass {
+        let work_end = WORK_RAM_BASE.saturating_add(WORK_RAM_SIZE as u32);
+        let image_end = FILE_VMA_BASE.saturating_add(self.bus.image_len);
+        if (WORK_RAM_BASE..work_end).contains(&value) {
+            GlValueClass::MappedPointer
+        } else if (FILE_VMA_BASE..image_end).contains(&value)
+            || (TRAMPOLINE_BASE..TRAMPOLINE_BASE.saturating_add(0x10000)).contains(&value)
+        {
+            GlValueClass::CodePointer
+        } else if value & 0x7f80_0000 != 0 {
+            GlValueClass::Float
+        } else {
+            GlValueClass::Scalar
+        }
+    }
+
+    fn snapshot_memory(&mut self, addr: u32, len: usize) -> GlMemorySnapshot {
+        if addr == 0 || len == 0 {
+            return GlMemorySnapshot {
+                addr,
+                len: 0,
+                bytes_hex: String::new(),
+            };
+        }
+
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            match self.read_guest_u8(addr.wrapping_add(i as u32)) {
+                Some(b) => bytes.push(b),
+                None => break,
+            }
+        }
+        let len = bytes.len();
+        GlMemorySnapshot {
+            addr,
+            len,
+            bytes_hex: hex_bytes(&bytes),
+        }
     }
 
     /// Scan guest work RAM for large contiguous non-zero regions and report
@@ -496,6 +673,10 @@ impl Eapp {
                 0
             }
         };
+
+        if import.module == "OpenGLES" {
+            self.capture_open_gl_import(import.ordinal, pc, lr, args, ret);
+        }
 
         self.cpu.reg_set(self.cpu.mode(), 0, ret);
         self.cpu.reg_set(self.cpu.mode(), reg::PC, lr & !1);

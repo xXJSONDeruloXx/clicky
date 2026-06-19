@@ -6,6 +6,8 @@ iPod clickwheel games (`.ipg` packages) contain native ARM executables in Apple'
 
 This document captures the reverse-engineered runtime interface needed to implement high-level emulation (HLE) for these games.
 
+> Note: ordinal names and argument layouts below are research notes unless backed by the trace fixture and decoder report. See `docs/EAPP_GL_TRACE_DECODER_REPORT.md` and `clicky-core/tests/fixtures/eapp/tetris_gl_trace.json` for confirmed evidence.
+
 ---
 
 ## 1. Package Structure (.ipg)
