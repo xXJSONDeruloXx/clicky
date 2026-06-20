@@ -1200,6 +1200,11 @@ impl Eapp {
 
     /// Ordinal 137: record an array definition (direct args + sp+0, sp+4).
     /// Unknown array slots are preserved without semantic naming.
+    ///
+    /// Cross-title evidence (Cubis 2, Mahjong, Ms. PAC-MAN) shows some games
+    /// issue `DrawArrays` immediately after ordinal 137 without a separate
+    /// explicit enable for array 0. To match observed behavior, defining a
+    /// valid client array also marks that slot enabled.
     fn live_handle_array_def(&mut self, args: [u32; 4]) {
         let array_index = args[0];
         let component_count = args[1];
@@ -1224,6 +1229,9 @@ impl Eapp {
                 material_epoch: lg.current_material_epoch,
             };
             lg.arrays.insert(array_index, def);
+            if valid {
+                lg.enabled_arrays.insert(array_index);
+            }
         }
         // Diagnostic: dump array contents once per unique pointer when the
         // current material is pointer-backed. Helps decode glyph/UV layouts.
