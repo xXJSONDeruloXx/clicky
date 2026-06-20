@@ -1757,8 +1757,67 @@ impl Eapp {
             ),
             |acc, (u, v)| (acc.0.min(*u), acc.1.min(*v), acc.2.max(*u), acc.3.max(*v)),
         );
-        let nondegenerate = max_u > min_u && max_v > min_v;
-        Some((out, nondegenerate))
+        if max_u > min_u && max_v > min_v {
+            return Some((out, true));
+        }
+        self.live_decode_generated_text_uvs(state_ptr)
+    }
+
+    fn live_decode_generated_text_uvs(
+        &mut self,
+        state_ptr: u32,
+    ) -> Option<([(f32, f32); 4], bool)> {
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let text_obj = self.read_guest_u32(sp.wrapping_add(0x0c))?;
+        let text_ptr = self.read_guest_u32(sp.wrapping_add(0x10))?;
+        let font_obj = self.read_guest_u32(text_obj.wrapping_add(0x14))?;
+        let table_a = self.read_guest_u32(font_obj.wrapping_add(0x0c))?;
+        if table_a == 0 {
+            return None;
+        }
+        let ch = u16::from_le_bytes([
+            self.read_guest_u8(text_ptr)?,
+            self.read_guest_u8(text_ptr.wrapping_add(1))?,
+        ]) as u32;
+        let glyph_index = self.read_guest_u32(table_a.wrapping_add(ch.wrapping_mul(4)))?;
+        let cell_w = f32::from_bits(self.read_guest_u32(state_ptr.wrapping_add(0x28))?);
+        let cell_h = f32::from_bits(self.read_guest_u32(state_ptr.wrapping_add(0x1c))?);
+        if !cell_w.is_finite() || !cell_h.is_finite() || cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let columns = self.live_guess_font_columns(font_obj).unwrap_or(98);
+        if columns == 0 {
+            return None;
+        }
+        let col = (glyph_index % columns) as f32;
+        let row = (glyph_index / columns) as f32;
+        let left = col * cell_w + 0.5;
+        let top = row * cell_h + 0.5;
+        let right = (col + 1.0) * cell_w - 0.5;
+        let bottom = (row + 1.0) * cell_h - 0.5;
+        let uvs = [(left, bottom), (left, top), (right, top), (right, bottom)];
+        Some((uvs, true))
+    }
+
+    fn live_guess_font_columns(&mut self, font_obj: u32) -> Option<u32> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for off in [0x60_u32, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x80, 0x84, 0x88] {
+            let ptr = self.read_guest_u32(font_obj.wrapping_add(off))?;
+            if ptr == 0 || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr) {
+                continue;
+            }
+            let words = self.read_guest_words(ptr, 24);
+            for &word in &words {
+                if (8..=256).contains(&word) {
+                    *counts.entry(word).or_default() += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|(value, hits)| *value >= 32 && *hits >= 2)
+            .max_by_key(|(value, hits)| (*hits, *value))
+            .map(|(value, _)| value)
     }
 
     fn live_decode_font_tint(&mut self) -> Option<Rgba8> {

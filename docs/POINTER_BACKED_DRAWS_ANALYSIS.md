@@ -276,9 +276,10 @@ The text helper path is:
 4. `0x180161cc` applies ±0.5 texel-center adjustments
 5. `0x1801d9e4` stores the four UV corners into the active state object
 
-### 7.5 Why generated UVs still collapse today
+### 7.5 Current status of the recovered texgen path
 
-The per-segment arrays used by the recovered helper are:
+The per-segment arrays used by the recovered helper are still visible in the
+font object dumps:
 
 - `font+0x60`
 - `font+0x64`
@@ -286,40 +287,36 @@ The per-segment arrays used by the recovered helper are:
 - `font+0x6c`
 - `font+0x74` (segment widths/counts)
 
-For the live 10×12 and 16×16 font objects, the critical scale/translation arrays
-at `+0x60/+0x64/+0x68/+0x6c` are still zero at draw time. As a result, the
-recovered helper's output collapses to the default texel-centered unit values:
+Those arrays are still the right place to keep studying, but the renderer now has
+a narrow evidence-backed fallback for the UTF-16 pointer-backed loop:
 
-```
-(0.5, -0.5), (0.5, -0.5), (0.5, -0.5), (0.5, -0.5)
-```
-
-That is why the generated-UV decode currently remains degenerate even after the
-renderer reads the guest-prepared state block directly.
+- `draw21–29` now rasterize using recovered text/font lookup data when the guest
+  state UVs are degenerate
+- the scalar-formatted menu group (`draw9–14`) still skips on the first visible
+  draw, so that path remains unfinished
 
 ### 7.6 Directly isolated next missing sub-primitive
 
 The next missing sub-primitive is now more precise than “generic texgen”:
 
-> **Initialization of the font segment metric arrays at `font+0x60..0x74`, so the
-> recovered guest UV builder at `0x180161cc` can produce non-degenerate atlas
-> rectangles.**
+> **Initialization / capture of the scalar-formatted text path that feeds
+> `draw9–14`, plus the font segment metric arrays at `font+0x60..0x74` if we
+> want the guest helper to generate the same UVs natively.**
 
 This may be driven by an earlier guest/runtime initialization path, or by an
 OpenGLES import with side effects not yet modeled. The current `ordinal 148`
 no-op remains suspicious because its call record looks like a generic
 “descriptor → target object/page” initializer, but the direct evidence here is
-that the text draw helper already exists and fails only because the per-segment
-metric arrays remain zero.
+that the UTF-16 loop can be recovered in the renderer while the scalar formatter
+path still needs work.
 
 ## 8. Next Missing Primitive
 
-**Initialization of the font-page metric arrays feeding the recovered texgen
-helper.**
+**Scalar-formatted menu text capture / texgen fallback.**
 
-The recovered draw-time texgen path is now known. What remains missing is the
-population of the font object's per-segment metric arrays (`+0x60..0x74`) so
-that the helper can convert `table_a/table_b` into real atlas rectangles.
+The recovered draw-time texgen path is now partly usable: one pointer-backed
+text group renders, while the scalar formatter group still lacks a non-degenerate
+UV source.
 
 This should NOT be shortcut by hardcoding glyph rectangles or strings.
 

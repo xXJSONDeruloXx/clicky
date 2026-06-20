@@ -330,37 +330,26 @@ Follow-up after fixing the array-enable assumption:
 
 Before → after headed results:
 
-- `77777` **Mahjong**
-  - before: repeated `position array unusable`
-  - after: no position-array failures; next blocker is zero/degenerate UVs
-    (`no live upload matched UV span None`)
-- `99999` **Cubis 2**
-  - before: repeated `position array unusable`
-  - after: thousands of real rasterized draws in a 12s headed run
-  - new surfaced gap: some uploads still use unsupported `src_fmt=0x190a,
-    pix_type=0x1401`
-- `14004` **Ms. PAC-MAN**
-  - before: repeated `position array unusable`
-  - after: thousands of rasterized draws in a 12s headed run
-  - some handle-2 / handle-19 draws still have zero UVs and skip
-- `88888` **Mini Golf**
-  - remains stable and rendering with no mode-7 or position-array failures
-
-Additional headed smoke samples after the array fix:
-
-- `1500C` **The Sims Bowling**: stable 12s run, no position-array failure, but
-  no completed GL frame diagnostics yet
-- `1500E` **The Sims Pool**: same as Sims Bowling
-- `50513` **Sudoku**: stable 12s run, no position-array failure, but no
-  completed GL frame diagnostics yet
-- `33333` **Texas Hold'em**: position arrays are fine; next blocker is separate
-  `OpenGLES:37 mode=5 count=11`
+| Game | Before | After / current gap |
+|---|---|---|
+| `77777` Mahjong | repeated `position array unusable` | position arrays fixed; now blocked on degenerate UVs (`no live upload matched UV span None`) |
+| `99999` Cubis 2 | repeated `position array unusable` | thousands of rasterized draws; remaining gap is unsupported upload format `src_fmt=0x190a, pix_type=0x1401` |
+| `14004` Ms. PAC-MAN | repeated `position array unusable` | thousands of rasterized draws; some draws still have zero UVs and skip |
+| `88888` Mini Golf | mode-7 rejection / later skips | stable and rendering |
+| `1500C` Sims Bowling | not yet characterized | stable 12s run, no position-array failure, but no completed GL frame diagnostics yet |
+| `1500E` Sims Pool | not yet characterized | stable 12s run, no position-array failure, but no completed GL frame diagnostics yet |
+| `50513` Sudoku | not yet characterized | stable 12s run, no position-array failure, but no completed GL frame diagnostics yet |
+| `33333` Texas Hold'em | not yet characterized | position arrays are fine; next blocker is `OpenGLES:37 mode=5 count=11` |
 
 Tetris regression check:
 
 - `66666` **Tetris** still reaches the same stable headed state as before
-- pointer-text/texgen skips remain the known blocker; this cross-game array fix
-  did not regress the Tetris path
+- current split status:
+  - the UTF-16 pointer-backed text loop (`draw21–29`) now rasterizes via a
+    recovered texgen/text fallback
+  - the scalar-formatted pointer-backed group (`draw9–14`) still needs a
+    separate capture/fallback path; `draw9` remains the first visible skip
+- this cross-game array fix did not regress the Tetris path
 
 So the shared `position array unusable` blocker was a real engine bug and is now
 fixed. The next cross-title blockers are narrower and more valuable to tackle
@@ -370,6 +359,7 @@ individually:
 2. unsupported upload format `src_fmt=0x190a, pix_type=0x1401` (Cubis 2)
 3. unsupported draw token `mode=5` (Texas Hold'em)
 4. shared unmapped write at `0x1080000c` (Bejeweled / Zuma)
+5. Tetris scalar formatter text path (`draw9–14`) 
 
 #### Honest status (stable but green)
 
