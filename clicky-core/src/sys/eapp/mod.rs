@@ -1303,6 +1303,11 @@ impl Eapp {
             lg.current_handle = handle;
             lg.current_state_ptr = state_ptr;
             lg.current_material_epoch = lg.current_material_epoch.wrapping_add(1);
+            // A material bind starts a fresh transform context for the next
+            // draw group. Pointer text glyph loops then carry their own
+            // per-glyph translation between draws until the next bind.
+            lg.pointer_text_carry_handle = None;
+            lg.pointer_text_carry = (0.0, 0.0);
         }
         info!(
             target: "EAPP_GL",
@@ -1580,17 +1585,30 @@ impl Eapp {
                     explicit_uv_enabled,
                 )
             };
+        let pointer_handle =
+            (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle);
+        let effective_translation = if pointer_handle {
+            self.live_gl
+                .as_ref()
+                .and_then(|lg| {
+                    (lg.pointer_text_carry_handle == Some(handle)).then_some((
+                        lg.pointer_text_carry.0 + translation.0,
+                        lg.pointer_text_carry.1 + translation.1,
+                    ))
+                })
+                .unwrap_or(translation)
+        } else {
+            translation
+        };
         let state_words = self.read_guest_words(state_ptr, 16);
-        if texgen_verbose_enabled()
-            && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
-        {
+        if texgen_verbose_enabled() && pointer_handle {
             self.live_maybe_dump_texgen_stack_locals();
         }
 
         let positions = match self.live_decode_positions_range(
             &pos_def,
             pos_enabled,
-            translation,
+            effective_translation,
             first,
             count,
         ) {
@@ -1600,7 +1618,7 @@ impl Eapp {
                     draw_index,
                     handle,
                     state_ptr,
-                    translation,
+                    translation: effective_translation,
                     positions: [(0.0, 0.0); 4],
                     uvs: [(0.0, 0.0); 4],
                     has_uv: false,
@@ -1691,7 +1709,7 @@ impl Eapp {
                     draw_index + quad_idx,
                     handle,
                     state_ptr,
-                    translation,
+                    effective_translation,
                     positions,
                     uvs,
                     has_uv,
@@ -1707,6 +1725,16 @@ impl Eapp {
             record.state_words = state_words.clone();
             self.live_log_draw_record(&record);
             records.push(record);
+        }
+
+        if let Some(lg) = self.live_gl.as_mut() {
+            if pointer_handle && quad_groups == 1 {
+                lg.pointer_text_carry_handle = Some(handle);
+                lg.pointer_text_carry = effective_translation;
+            } else {
+                lg.pointer_text_carry_handle = None;
+                lg.pointer_text_carry = (0.0, 0.0);
+            }
         }
 
         self.live_finalize_draws(records);
@@ -2786,35 +2814,204 @@ impl Eapp {
         }
     }
 
-    fn handle_input_events_import(&mut self, ordinal: u32, _args: [u32; 4]) -> u32 {
-        let state = self.input_state.lock().unwrap().clone();
+    fn handle_input_events_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        let state = self.effective_input_state();
         match ordinal {
-            // Heuristic: titles often poll a compact directional / button bitfield.
+            // Observed Tetris callsite passes two stack pointers and then reads
+            // back [r1] after the import returns. Return the compact bitfield
+            // for callers that use r0, but also write it through both pointer
+            // args so pointer-output ABI users actually see host input.
             0 => {
-                let mut bits = 0u32;
-                if state.up {
-                    bits |= 1 << 0;
+                let bits = Self::input_state_bits(&state) | self.env_input_script_bits();
+                if args[0] != 0 {
+                    self.write_guest_u32(args[0], bits);
                 }
-                if state.down {
-                    bits |= 1 << 1;
+                if args[1] != 0 {
+                    self.write_guest_u32(args[1], bits);
                 }
-                if state.left {
-                    bits |= 1 << 2;
+                let event_list = self.build_input_event_list(&state);
+                let input_obj = self.cpu.reg_get(self.cpu.mode(), 4);
+                let input_ctx = self.cpu.reg_get(self.cpu.mode(), 5);
+                if event_list != 0
+                    && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&input_obj)
+                {
+                    // Tetris' post-import wrapper passes [input_obj+0x30] as
+                    // the event-list head to the event consumer. input_ctx+0x20
+                    // is a filter/state mask, not the list pointer.
+                    self.write_guest_u32(input_obj.wrapping_add(0x30), event_list);
                 }
-                if state.right {
-                    bits |= 1 << 3;
-                }
-                if state.action {
-                    bits |= 1 << 4;
-                }
-                if state.menu {
-                    bits |= 1 << 5;
+                if bits != 0 || event_list != 0 {
+                    info!(
+                        target: "EAPP_INPUT",
+                        "InputEvents:0 frame={} bits={:#010x} event_list={:#010x} input_obj={:#010x} input_ctx={:#010x} args=[{:#010x},{:#010x},{:#010x},{:#010x}] state={:?}",
+                        self.frame_counter,
+                        bits,
+                        event_list,
+                        input_obj,
+                        input_ctx,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3],
+                        state
+                    );
                 }
                 bits
             }
             1 => self.alloc_zeroed(0x40),
             _ => 0,
         }
+    }
+
+    fn effective_input_state(&self) -> EappInputState {
+        let mut state = self.input_state.lock().unwrap().clone();
+        self.apply_env_input_script(&mut state);
+        state
+    }
+
+    fn input_state_bits(state: &EappInputState) -> u32 {
+        let mut bits = 0u32;
+        if state.up {
+            bits |= 1 << 0;
+        }
+        if state.down {
+            bits |= 1 << 1;
+        }
+        if state.left {
+            bits |= 1 << 2;
+        }
+        if state.right {
+            bits |= 1 << 3;
+        }
+        if state.action {
+            bits |= 1 << 4;
+        }
+        if state.menu {
+            bits |= 1 << 5;
+        }
+        bits
+    }
+
+    /// Headless input smoke-test helper. Format:
+    /// `CLICKY_EAPP_INPUT_SCRIPT="menu:190-200,menu:230-240,action:260-270"`.
+    /// Raw masks can also be injected for ABI discovery, e.g.
+    /// `bits=0x40000001:190-195`. This intentionally layers on top of live host
+    /// input and is ignored when unset, so normal headed input remains
+    /// controlled by minifb callbacks.
+    fn apply_env_input_script(&self, state: &mut EappInputState) {
+        let Ok(script) = std::env::var("CLICKY_EAPP_INPUT_SCRIPT") else {
+            return;
+        };
+        for entry in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((key, range)) = entry.split_once(':') else {
+                continue;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>())
+            else {
+                continue;
+            };
+            if self.frame_counter < start || self.frame_counter > end {
+                continue;
+            }
+            match key.trim().to_ascii_lowercase().as_str() {
+                "up" => state.up = true,
+                "down" => state.down = true,
+                "left" => state.left = true,
+                "right" => state.right = true,
+                "action" | "select" | "enter" => state.action = true,
+                "menu" | "m" => state.menu = true,
+                _ => {}
+            }
+        }
+    }
+
+    fn env_input_script_bits(&self) -> u32 {
+        let mut bits = 0u32;
+        for (key, _range) in self.active_env_input_script_entries() {
+            let Some(raw) = key
+                .strip_prefix("bits=")
+                .or_else(|| key.strip_prefix("raw="))
+            else {
+                continue;
+            };
+            let parsed = u32::from_str_radix(raw.trim_start_matches("0x"), 16)
+                .or_else(|_| raw.parse::<u32>());
+            if let Ok(mask) = parsed {
+                bits |= mask;
+            }
+        }
+        bits
+    }
+
+    fn build_input_event_list(&mut self, state: &EappInputState) -> u32 {
+        let mut event_ids = Vec::new();
+        // Tetris' input wrapper consumes a linked list of button events at
+        // input_ctx+0x20. Event byte 0 is a button id; byte 1 is 2 for press and
+        // 1 for release. The id-to-mask table in the guest maps 1..5 to five
+        // logical buttons. These bindings are still provisional, but unlike the
+        // old return-only bitfield, they feed the structure the game actually
+        // traverses.
+        if state.menu {
+            event_ids.push(1);
+        }
+        if state.action {
+            event_ids.push(2);
+        }
+        if state.left {
+            event_ids.push(3);
+        }
+        if state.right {
+            event_ids.push(4);
+        }
+        if state.up || state.down {
+            event_ids.push(5);
+        }
+        for (key, _range) in self.active_env_input_script_entries() {
+            if let Some(raw) = key.strip_prefix("event=") {
+                if let Ok(id) = raw.parse::<u8>() {
+                    if (1..=5).contains(&id) {
+                        event_ids.push(id);
+                    }
+                }
+            }
+        }
+
+        let mut next = 0u32;
+        for id in event_ids.into_iter().rev() {
+            let node = self.alloc_zeroed(0x10);
+            let _ = self.write_guest_bytes(node, &[id, 2]);
+            let _ = self.write_guest_u32(node.wrapping_add(4), self.frame_counter as u32);
+            let _ = self.write_guest_u32(node.wrapping_add(8), next);
+            next = node;
+        }
+        next
+    }
+
+    fn active_env_input_script_entries(&self) -> Vec<(String, String)> {
+        let Ok(script) = std::env::var("CLICKY_EAPP_INPUT_SCRIPT") else {
+            return Vec::new();
+        };
+        let mut active = Vec::new();
+        for entry in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((key, range)) = entry.split_once(':') else {
+                continue;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>())
+            else {
+                continue;
+            };
+            if self.frame_counter < start || self.frame_counter > end {
+                continue;
+            }
+            active.push((key.trim().to_ascii_lowercase(), range.trim().to_string()));
+        }
+        active
     }
 
     fn handle_settings_import(&mut self, ordinal: u32, _args: [u32; 4]) -> u32 {
@@ -2828,12 +3025,38 @@ impl Eapp {
     }
 
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        // Observed after Tetris menu input: ordinal 14 is used with a numeric
+        // file handle and a guest buffer/length, not with a path string. Treat
+        // it as a successful synchronous byte-count operation for now so menu
+        // input does not fall into an error path after opening prefs.sav.
+        if ordinal == 14 {
+            if args[0] == u32::MAX {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 called with invalid handle args=[{:#010x},{:#010x},{:#010x},{:#010x}]", args[0], args[1], args[2], args[3]);
+                return 0;
+            }
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:14 handle={} buffer={:#010x} len={}", args[0], args[1], args[2]);
+            return args[2];
+        }
+
         let path = self
             .try_read_c_string(args[0], 256)
             .or_else(|| self.try_read_c_string(args[1], 256));
         if let Some(path) = path {
             info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path={}", ordinal, path);
             self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
+
+            if ordinal == 12 {
+                // Observed open-like call: r1=path, r2=out-handle pointer.
+                // Return and store a small positive synthetic handle.
+                let handle = 1u32;
+                if args[2] != 0 {
+                    self.write_guest_u32(args[2], handle);
+                }
+                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:12 opened {} -> handle {}", host_path.display(), handle);
+                }
+                return handle;
+            }
 
             if ordinal == 3 {
                 let req = args[2];

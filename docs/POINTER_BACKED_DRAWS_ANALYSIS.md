@@ -288,35 +288,62 @@ font object dumps:
 - `font+0x74` (segment widths/counts)
 
 Those arrays are still the right place to keep studying, but the renderer now has
-a narrow evidence-backed fallback for the UTF-16 pointer-backed loop:
+a narrow evidence-backed fallback for both observed pointer-backed text groups:
 
-- `draw21–29` now rasterize using recovered text/font lookup data when the guest
-  state UVs are degenerate
-- the scalar-formatted menu group (`draw9–14`) still skips on the first visible
-  draw, so that path remains unfinished
+- `draw21–29` rasterize using recovered text/font lookup data when the guest
+  state UVs are degenerate.
+- `draw9–14` also rasterize through the same generated-UV path once the text
+  object is validated against the active state pointer and bad stack cursors are
+  rejected.
 
-### 7.6 Directly isolated next missing sub-primitive
+### 7.6 Transform carry for glyph loops
+
+A later headed/menu trace showed another text-specific accuracy issue: the first
+pointer-backed glyph in a run had the correct base translation, while later
+glyphs collapsed to `y=0` because the HLE reset translation after every draw.
+The guest stream is more subtle:
+
+- normal sprite draws issue a full translation before each draw, so the generic
+  reset-after-draw behavior is fine;
+- pointer-backed text runs issue a full base translation for the first glyph,
+  then only per-glyph X deltas before subsequent `DrawArrays` calls;
+- the next material bind starts a fresh text/run context.
+
+The HLE now carries the accumulated translation only for work-RAM pointer-backed
+text handles, and clears that carry on the next material bind/frame reset. This
+keeps normal sprites isolated while allowing text glyphs to advance across the
+line:
+
+| group | before | after |
+|---|---|---|
+| `draw9–14` | first glyph near `(14,228)`, later glyphs near `(10,0)` | glyph bounds advance `(14,228)`, `(24,228)`, … `(64,228)` |
+| `draw21–28` | first glyph near `(68.8,52)`, later glyphs near `(20,0)` | glyph bounds advance `(68.8,52)`, `(88.8,52)`, … `(208.8,52)` |
+
+### 7.7 Directly isolated next missing sub-primitive
 
 The next missing sub-primitive is now more precise than “generic texgen”:
 
-> **Initialization / capture of the scalar-formatted text path that feeds
-> `draw9–14`, plus the font segment metric arrays at `font+0x60..0x74` if we
-> want the guest helper to generate the same UVs natively.**
+> **Replace the bounded text cursor/object fallback with the exact guest
+> formatter/texgen state transitions, especially around the scalar formatter path
+> feeding `draw9–14` and the font segment metric arrays at `font+0x60..0x74`.**
 
-This may be driven by an earlier guest/runtime initialization path, or by an
-OpenGLES import with side effects not yet modeled. The current `ordinal 148`
-no-op remains suspicious because its call record looks like a generic
-“descriptor → target object/page” initializer, but the direct evidence here is
-that the UTF-16 loop can be recovered in the renderer while the scalar formatter
-path still needs work.
+The fallback is evidence-backed and bounded, but still not the final model. The
+current `ordinal 148` no-op remains suspicious because its call record looks like
+a generic “descriptor → target object/page” initializer. The direct evidence is
+that draw-time text can now be recovered in the renderer, while the accurate
+runtime-side initialization still needs to be modeled.
 
 ## 8. Next Missing Primitive
 
-**Scalar-formatted menu text capture / texgen fallback.**
+**Accurate guest texgen/formatter modeling, not hardcoded strings.**
 
-The recovered draw-time texgen path is now partly usable: one pointer-backed
-text group renders, while the scalar formatter group still lacks a non-degenerate
-UV source.
+Pointer-backed text now rasterizes, advances in screen space, and selects the
+matching font atlas family (`f10x12*` / `f16x16*`) instead of unrelated small A8
+UI strips. However, the visible menu text is still not content-accurate: current
+headed evidence shows glyphs such as `9 ABCDE` where the real localized menu
+strings should appear. The next step is to trace and model the guest
+helper/state writes so both the cursor and generated UVs come from the same
+state the game intended.
 
 This should NOT be shortcut by hardcoding glyph rectangles or strings.
 

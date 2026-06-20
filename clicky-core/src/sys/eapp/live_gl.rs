@@ -121,6 +121,13 @@ pub struct LiveGlState {
     pub current_state_ptr: u32,
     pub current_material_epoch: u64,
     pub translation: (f32, f32),
+    /// Pointer-backed text materials issue one full base translation for the
+    /// first glyph, then only per-glyph deltas before subsequent DrawArrays
+    /// calls. Keep that accumulated text cursor separately so the generic
+    /// per-draw translation reset used by normal sprites does not collapse the
+    /// glyph run back to the origin.
+    pub pointer_text_carry_handle: Option<u32>,
+    pub pointer_text_carry: (f32, f32),
     pub framebuffer: Vec<Rgba8>,
     pub draws: Vec<LiveDrawRecord>,
     pub draw_count_in_frame: usize,
@@ -186,6 +193,8 @@ impl LiveGlState {
             current_state_ptr: 0,
             current_material_epoch: 0,
             translation: (0.0, 0.0),
+            pointer_text_carry_handle: None,
+            pointer_text_carry: (0.0, 0.0),
             framebuffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
             draws: Vec::new(),
             draw_count_in_frame: 0,
@@ -227,6 +236,8 @@ impl LiveGlState {
         self.arrays.clear();
         self.enabled_arrays.clear();
         self.translation = (0.0, 0.0);
+        self.pointer_text_carry_handle = None;
+        self.pointer_text_carry = (0.0, 0.0);
         self.framebuffer = vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS];
         self.draws.clear();
         self.draw_count_in_frame = 0;
@@ -456,6 +467,38 @@ impl LiveGlState {
             return Some(idx);
         }
 
+        self.select_smallest_containing_upload(max_u, max_v)
+    }
+
+    /// Generated text UVs describe one glyph cell inside a font atlas. Prefer
+    /// A8 uploads whose dimensions are exact multiples of that cell size before
+    /// falling back to the generic "smallest containing texture" rule. This
+    /// keeps Tetris text glyphs on f10x12/f16x16 font atlases instead of small
+    /// unrelated A8 UI strips that merely contain the same UV extents.
+    fn select_upload_for_generated_text_uvs(&self, uvs: &[(f32, f32); 4]) -> Option<usize> {
+        let (_min_u, _min_v, max_u, max_v) = uv_extents(uvs);
+        let (span_w, span_h) = infer_dims_from_uvs(uvs);
+        let cell_w = span_w.saturating_add(1).max(1);
+        let cell_h = span_h.saturating_add(1).max(1);
+        let need_w = max_u.ceil().max(1.0) as usize;
+        let need_h = max_v.ceil().max(1.0) as usize;
+        self.uploads
+            .iter()
+            .filter(|u| {
+                u.texture.is_some()
+                    && u.format == Some(TextureFormat::A8)
+                    && u.width >= need_w
+                    && u.height >= need_h
+                    && u.width % cell_w == 0
+                    && u.height % cell_h == 0
+                    && (u.width / cell_w) >= 32
+            })
+            .min_by_key(|u| (u.width * u.height, u.index))
+            .map(|u| u.index)
+            .or_else(|| self.select_smallest_containing_upload(max_u, max_v))
+    }
+
+    fn select_smallest_containing_upload(&self, max_u: f32, max_v: f32) -> Option<usize> {
         let need_w = max_u.ceil().max(1.0) as usize;
         let need_h = max_v.ceil().max(1.0) as usize;
         self.uploads
@@ -488,11 +531,14 @@ impl LiveGlState {
             None
         };
 
-        let selected_upload = if has_uv {
-            self.select_upload_for_uvs(&uvs)
-        } else {
-            None
-        };
+        let selected_upload =
+            if has_uv && used_generated_uvs && (0x1000_0000..0x1080_0000).contains(&handle) {
+                self.select_upload_for_generated_text_uvs(&uvs)
+            } else if has_uv {
+                self.select_upload_for_uvs(&uvs)
+            } else {
+                None
+            };
 
         let mut record = LiveDrawRecord {
             draw_index,
@@ -743,6 +789,56 @@ mod tests {
         ));
         let menu_strip_uvs = [(0.5, 37.5), (0.5, 3.5), (308.5, 3.5), (308.5, 37.5)];
         assert_eq!(lg.select_upload_for_uvs(&menu_strip_uvs), Some(1));
+    }
+
+    #[test]
+    fn generated_text_uvs_prefer_matching_font_cell_atlas() {
+        let mut lg = LiveGlState::new(true, false, false);
+        lg.uploads.push(LiveGlState::build_upload(
+            0,
+            0x0de1,
+            36,
+            20,
+            0x1906,
+            0x1401,
+            0x1000_0000,
+            &vec![0xff; 36 * 20],
+        ));
+        lg.uploads.push(LiveGlState::build_upload(
+            1,
+            0x0de1,
+            32,
+            32,
+            0x1906,
+            0x1401,
+            0x1000_0800,
+            &vec![0xff; 32 * 32],
+        ));
+        lg.uploads.push(LiveGlState::build_upload(
+            2,
+            0x0de1,
+            784,
+            20,
+            0x1906,
+            0x1401,
+            0x1000_1000,
+            &vec![0xff; 784 * 20],
+        ));
+        lg.uploads.push(LiveGlState::build_upload(
+            3,
+            0x0de1,
+            1568,
+            32,
+            0x1906,
+            0x1401,
+            0x1000_2000,
+            &vec![0xff; 1568 * 32],
+        ));
+        let glyph_16_uvs = [(400.5, 15.5), (400.5, 0.5), (415.5, 0.5), (415.5, 15.5)];
+        assert_eq!(
+            lg.select_upload_for_generated_text_uvs(&glyph_16_uvs),
+            Some(3)
+        );
     }
 
     #[test]

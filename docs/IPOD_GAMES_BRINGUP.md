@@ -343,13 +343,24 @@ Before → after headed results:
 
 Tetris regression check:
 
-- `66666` **Tetris** still reaches the same stable headed state as before
-- current split status:
-  - the UTF-16 pointer-backed text loop (`draw21–29`) now rasterizes via a
-    recovered texgen/text fallback
-  - the scalar-formatted pointer-backed group (`draw9–14`) still needs a
-    separate capture/fallback path; `draw9` remains the first visible skip
-- this cross-game array fix did not regress the Tetris path
+- `66666` **Tetris** reaches the stable headed startup/menu state with live GL
+  enabled.
+- Startup visuals now include the loading bar plus the splash → white flash/fade
+  transition.
+- Pointer-backed text groups now rasterize, use the right font-atlas families,
+  and advance in screen space:
+  - the UTF-16 pointer-backed loop (`draw21–29`) uses recovered texgen/text data
+  - the scalar-formatted pointer-backed group (`draw9–14`) uses the same bounded
+    generated-UV recovery after validating the active text object
+  - a pointer-text transform carry preserves per-glyph translation deltas inside
+    a glyph run, fixing the prior collapse of later glyphs to the top edge
+  - generated text atlas selection now prefers matching cell-grid A8 font
+    atlases, avoiding unrelated small A8 strips with the same UV extents
+- Remaining Tetris text work is accuracy-focused: the text is visible but not
+  content-correct yet (current evidence still shows placeholder/wrong glyphs
+  like `9 ABCDE` where menu strings should be). Replace the fallback cursor /
+  text-object recovery with the exact guest formatter/texgen state path.
+- This cross-game array fix did not regress the Tetris path.
 
 So the shared `position array unusable` blocker was a real engine bug and is now
 fixed. The next cross-title blockers are narrower and more valuable to tackle
@@ -359,7 +370,7 @@ individually:
 2. unsupported upload format `src_fmt=0x190a, pix_type=0x1401` (Cubis 2)
 3. unsupported draw token `mode=5` (Texas Hold'em)
 4. shared unmapped write at `0x1080000c` (Bejeweled / Zuma)
-5. Tetris scalar formatter text path (`draw9–14`) 
+5. Tetris exact formatter/texgen state modeling for pointer-backed text
 
 #### Honest status (stable but green)
 
@@ -402,7 +413,22 @@ What is **NOT working** (and why it is a green screen):
   is genuinely populated. The Tetris placeholder-slot hack is still in place for
   a separate late menu/resource null-deref path.
 - `Audio` is fully stubbed (returns 0, nothing plays).
-- `InputEvents:0` is wired to host keys but unverifiable because nothing renders.
+- `InputEvents:0` is now wired through both observed ABI shapes:
+  - it returns/writes the compact pointer-output bitfield for callers that read
+    the two out-pointers
+  - it also builds the guest button-event linked list consumed by Tetris'
+    wrapper (`input_obj+0x30`) instead of only returning a value in r0
+  - desktop mapping remains arrows = directional input, Enter = action/select,
+    `M` = iPod Menu, but the exact id-to-button mapping is still provisional
+- Empirical headless input smoke evidence:
+  - raw `event=1` at the menu is accepted by the guest and enters the menu/exit
+    path, including `prefs.sav` AsyncFileIO:12/14 calls, then currently crashes
+    in standalone teardown/refcount cleanup because there is no RetailOS shell
+    to return to and a later object destructor path is still unmapped
+  - raw `event=2` is also accepted and changes the rendered state, but the
+    resulting screen is mostly black due remaining graphics/state gaps
+  - old return-only bitfield injection (`bits=...`) produced no visible state
+    change, confirming the linked-list event path is the important one
 - `Metadata` / `Settings` return dummy zeros (fine for startup, may matter later).
 - Saves are empty shells: `.clicky-saves/*.sav` are created zero-byte; we never
   read or write real save data.
