@@ -516,6 +516,20 @@ impl LiveGlState {
             skipped_reason: None,
         };
 
+        if handle == 0x3 {
+            if let Some(color) = solid_color {
+                record.selected_upload = None;
+                record.coverage = rasterize_solid_quad(
+                    &mut self.framebuffer,
+                    FB_WIDTH,
+                    FB_HEIGHT,
+                    color,
+                    &positions,
+                );
+                return record;
+            }
+        }
+
         let Some(upload_idx) = selected_upload else {
             if let Some(color) = solid_color {
                 record.coverage = rasterize_solid_quad(

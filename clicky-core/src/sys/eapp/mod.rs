@@ -1639,7 +1639,7 @@ impl Eapp {
             first,
             count,
         );
-        let solid_color = if explicit.is_none() && handle == 0x3 {
+        let solid_color = if handle == 0x3 {
             self.live_decode_solid_color(&explicit_uv_def, explicit_uv_enabled, material_epoch)
         } else {
             None
@@ -1678,7 +1678,13 @@ impl Eapp {
             } else {
                 ([(0.0, 0.0); 4], false, false, explicit_uv_def.clone())
             };
-            let solid_color = if has_uv { None } else { solid_color };
+            let solid_color = if handle == 0x3 {
+                solid_color
+            } else if has_uv {
+                None
+            } else {
+                solid_color
+            };
 
             let mut record = match self.live_gl.as_mut() {
                 Some(lg) => lg.rasterize_draw(
@@ -1768,25 +1774,135 @@ impl Eapp {
         state_ptr: u32,
     ) -> Option<([(f32, f32); 4], bool)> {
         let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
-        let text_obj = self.read_guest_u32(sp.wrapping_add(0x0c))?;
-        let text_ptr = self.read_guest_u32(sp.wrapping_add(0x10))?;
-        let font_obj = self.read_guest_u32(text_obj.wrapping_add(0x14))?;
-        let table_a = self.read_guest_u32(font_obj.wrapping_add(0x0c))?;
-        if table_a == 0 {
+        let text_obj = match self.read_guest_u32(sp.wrapping_add(0x0c)) {
+            Some(ptr) if self.live_is_texgen_text_object(ptr, Some(state_ptr)) => ptr,
+            _ => self.live_find_texgen_text_object()?,
+        };
+        let text_ptr = self.live_find_texgen_text_cursor(text_obj).or_else(|| {
+            self.read_guest_u32(sp.wrapping_add(0x10))
+                .filter(|ptr| *ptr != 0)
+        })?;
+        let font_obj = match self.read_guest_u32(text_obj.wrapping_add(0x14)) {
+            Some(ptr) if ptr != 0 => ptr,
+            _ => {
+                if texgen_verbose_enabled() {
+                    info!(
+                        target: "EAPP_GL",
+                        "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} state_ptr={:#010x} reason=missing_font_obj",
+                        text_obj,
+                        text_ptr,
+                        state_ptr
+                    );
+                }
+                return None;
+            }
+        };
+        let table_a = match self.read_guest_u32(font_obj.wrapping_add(0x0c)) {
+            Some(ptr) if ptr != 0 => ptr,
+            _ => {
+                if texgen_verbose_enabled() {
+                    info!(
+                        target: "EAPP_GL",
+                        "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} state_ptr={:#010x} reason=missing_table_a",
+                        text_obj,
+                        text_ptr,
+                        font_obj,
+                        state_ptr
+                    );
+                }
+                return None;
+            }
+        };
+        let ch = match (
+            self.read_guest_u8(text_ptr),
+            self.read_guest_u8(text_ptr.wrapping_add(1)),
+        ) {
+            (Some(lo), Some(hi)) => u16::from_le_bytes([lo, hi]) as u32,
+            _ => {
+                if texgen_verbose_enabled() {
+                    info!(
+                        target: "EAPP_GL",
+                        "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} state_ptr={:#010x} reason=missing_text_bytes",
+                        text_obj,
+                        text_ptr,
+                        font_obj,
+                        table_a,
+                        state_ptr
+                    );
+                }
+                return None;
+            }
+        };
+        if ch == 0 || !Self::is_plausible_texgen_char(ch as u16) {
+            if texgen_verbose_enabled() {
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} ch={:#06x} state_ptr={:#010x} reason=unsupported_text_char",
+                    text_obj,
+                    text_ptr,
+                    font_obj,
+                    table_a,
+                    ch,
+                    state_ptr
+                );
+            }
             return None;
         }
-        let ch = u16::from_le_bytes([
-            self.read_guest_u8(text_ptr)?,
-            self.read_guest_u8(text_ptr.wrapping_add(1))?,
-        ]) as u32;
-        let glyph_index = self.read_guest_u32(table_a.wrapping_add(ch.wrapping_mul(4)))?;
+        let glyph_index = match self.read_guest_u32(table_a.wrapping_add(ch.wrapping_mul(4))) {
+            Some(idx) => idx,
+            None => {
+                if texgen_verbose_enabled() {
+                    info!(
+                        target: "EAPP_GL",
+                        "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} ch={:#06x} state_ptr={:#010x} reason=missing_glyph_index",
+                        text_obj,
+                        text_ptr,
+                        font_obj,
+                        table_a,
+                        ch,
+                        state_ptr
+                    );
+                }
+                return None;
+            }
+        };
         let cell_w = f32::from_bits(self.read_guest_u32(state_ptr.wrapping_add(0x28))?);
         let cell_h = f32::from_bits(self.read_guest_u32(state_ptr.wrapping_add(0x1c))?);
         if !cell_w.is_finite() || !cell_h.is_finite() || cell_w <= 0.0 || cell_h <= 0.0 {
+            if texgen_verbose_enabled() {
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} ch={:#06x} glyph_index={} state_ptr={:#010x} cell_w={:.3} cell_h={:.3} reason=bad_cell_metrics",
+                    text_obj,
+                    text_ptr,
+                    font_obj,
+                    table_a,
+                    ch,
+                    glyph_index,
+                    state_ptr,
+                    cell_w,
+                    cell_h
+                );
+            }
             return None;
         }
         let columns = self.live_guess_font_columns(font_obj).unwrap_or(98);
         if columns == 0 {
+            if texgen_verbose_enabled() {
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} ch={:#06x} glyph_index={} state_ptr={:#010x} cell_w={:.3} cell_h={:.3} reason=no_columns",
+                    text_obj,
+                    text_ptr,
+                    font_obj,
+                    table_a,
+                    ch,
+                    glyph_index,
+                    state_ptr,
+                    cell_w,
+                    cell_h
+                );
+            }
             return None;
         }
         let col = (glyph_index % columns) as f32;
@@ -1796,7 +1912,241 @@ impl Eapp {
         let right = (col + 1.0) * cell_w - 0.5;
         let bottom = (row + 1.0) * cell_h - 0.5;
         let uvs = [(left, bottom), (left, top), (right, top), (right, bottom)];
+        if texgen_verbose_enabled() {
+            info!(
+                target: "EAPP_GL",
+                "texgen_generated_uvs text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} ch={:#06x} glyph_index={} state_ptr={:#010x} columns={} cell_w={:.3} cell_h={:.3} uvs=[({:.1},{:.1}),({:.1},{:.1}),({:.1},{:.1}),({:.1},{:.1})]",
+                text_obj,
+                text_ptr,
+                font_obj,
+                table_a,
+                ch,
+                glyph_index,
+                state_ptr,
+                columns,
+                cell_w,
+                cell_h,
+                uvs[0].0,
+                uvs[0].1,
+                uvs[1].0,
+                uvs[1].1,
+                uvs[2].0,
+                uvs[2].1,
+                uvs[3].0,
+                uvs[3].1,
+            );
+        }
         Some((uvs, true))
+    }
+
+    fn live_is_texgen_text_object(&mut self, ptr: u32, expected_state_ptr: Option<u32>) -> bool {
+        if ptr == 0 || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr) {
+            return false;
+        }
+        let Some(font_ptr) = self.read_guest_u32(ptr.wrapping_add(0x14)) else {
+            return false;
+        };
+        let Some(state_ptr) = self.read_guest_u32(ptr.wrapping_add(0x18)) else {
+            return false;
+        };
+        if font_ptr == 0
+            || state_ptr == 0
+            || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&font_ptr)
+            || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&state_ptr)
+        {
+            return false;
+        }
+        if expected_state_ptr.is_some_and(|expected| expected != state_ptr) {
+            return false;
+        }
+        if self.read_guest_u32(state_ptr).unwrap_or(0) != 0x1802_3e24 {
+            return false;
+        }
+        matches!(
+            self.read_guest_u32(font_ptr.wrapping_add(0x0c)),
+            Some(table_ptr)
+                if table_ptr != 0
+                    && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&table_ptr)
+        )
+    }
+
+    fn live_find_texgen_text_object(&mut self) -> Option<u32> {
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let mut best: Option<(u32, usize)> = None;
+        for off in [
+            0x0c_u32, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c, 0x40,
+            0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x78,
+            0x7c,
+        ] {
+            let Some(ptr) = self.read_guest_u32(sp.wrapping_add(off)) else {
+                continue;
+            };
+            if ptr == 0 || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr) {
+                continue;
+            }
+            let Some(font_ptr) = self.read_guest_u32(ptr.wrapping_add(0x14)) else {
+                continue;
+            };
+            let Some(state_ptr) = self.read_guest_u32(ptr.wrapping_add(0x18)) else {
+                continue;
+            };
+            if font_ptr == 0
+                || state_ptr == 0
+                || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&font_ptr)
+                || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&state_ptr)
+                || self.read_guest_u32(state_ptr).unwrap_or(0) != 0x1802_3e24
+            {
+                continue;
+            }
+            let mut score = 0usize;
+            for sub_off in [
+                0x0c_u32, 0x10, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x80, 0x84, 0x88,
+            ] {
+                let Some(sub_ptr) = self.read_guest_u32(font_ptr.wrapping_add(sub_off)) else {
+                    continue;
+                };
+                if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&sub_ptr)
+                    && sub_ptr != ptr
+                {
+                    score += 1;
+                }
+            }
+            if best
+                .as_ref()
+                .map_or(true, |(_, best_score)| score > *best_score)
+            {
+                best = Some((ptr, score));
+            }
+        }
+        if let Some((ptr, score)) = best {
+            if texgen_verbose_enabled() {
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_text_obj_candidate ptr={:#010x} score={}",
+                    ptr,
+                    score
+                );
+            }
+            Some(ptr)
+        } else {
+            None
+        }
+    }
+
+    fn live_find_texgen_text_cursor(&mut self, text_obj: u32) -> Option<u32> {
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let mut best: Option<(&'static str, u32, u32, u32, usize, usize)> = None;
+        let mut candidates: Vec<(&'static str, u32, u32, u32)> = Vec::new();
+
+        for off in [
+            0x10_u32, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c, 0x40, 0x44,
+            0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x78, 0x7c,
+            0x80, 0x84, 0x88, 0x8c, 0x90, 0x94, 0x98, 0x9c, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4,
+            0xb8, 0xbc, 0xc0, 0xc4, 0xc8, 0xcc, 0xd0, 0xd4, 0xd8, 0xdc, 0xe0, 0xe4, 0xe8, 0xec,
+            0xf0, 0xf4, 0xf8, 0xfc,
+        ] {
+            if let Some(ptr) = self.read_guest_u32(sp.wrapping_add(off)) {
+                candidates.push(("stack", sp, off, ptr));
+            }
+        }
+
+        for off in (0_u32..0x400).step_by(4) {
+            if let Some(ptr) = self.read_guest_u32(text_obj.wrapping_add(off)) {
+                candidates.push(("text_obj", text_obj, off, ptr));
+            }
+        }
+
+        for (source, source_base, off, ptr) in candidates {
+            let inline = source_base.wrapping_add(off);
+            for seed in [ptr, inline] {
+                if seed == 0
+                    || seed == text_obj
+                    || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&seed)
+                {
+                    continue;
+                }
+                for delta in [0_u32, 2, 4, 6, 8, 12, 16] {
+                    let cursor = seed.wrapping_add(delta);
+                    if cursor == 0
+                        || cursor == text_obj
+                        || cursor % 2 != 0
+                        || !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&cursor)
+                    {
+                        continue;
+                    }
+                    let Some(bytes) = self.read_guest_bytes(cursor, 32) else {
+                        continue;
+                    };
+                    let u16s = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect::<Vec<_>>();
+                    let mut score = 0usize;
+                    let mut printable = 0usize;
+                    let first_is_plausible = u16s
+                        .first()
+                        .is_some_and(|ch| *ch != 0 && Self::is_plausible_texgen_char(*ch));
+                    for &ch in &u16s {
+                        if ch == 0 {
+                            break;
+                        }
+                        if Self::is_plausible_texgen_char(ch) {
+                            printable += 1;
+                            score += if ch <= 0x007f { 2 } else { 1 };
+                        } else {
+                            score = score.saturating_sub(2);
+                        }
+                    }
+                    if !first_is_plausible || printable < 2 {
+                        if texgen_verbose_enabled() && self.dumped_texgen_ptrs.insert(cursor) {
+                            self.live_dump_words_with_float_views(
+                                "texgen_cursor_probe",
+                                cursor,
+                                16,
+                            );
+                        }
+                        continue;
+                    }
+                    if texgen_verbose_enabled() && self.dumped_texgen_ptrs.insert(cursor) {
+                        self.live_dump_words_with_float_views("texgen_cursor_probe", cursor, 16);
+                    }
+                    if best
+                        .as_ref()
+                        .map_or(true, |(_, _, _, _, best_score, _)| score > *best_score)
+                    {
+                        best = Some((source, source_base, off, cursor, score, printable));
+                    }
+                }
+            }
+        }
+
+        if let Some((source, source_base, off, cursor, score, printable)) = best {
+            if texgen_verbose_enabled() {
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_text_cursor_candidate text_obj={:#010x} source={} source_base={:#010x} off={:#x} ptr={:#010x} score={} printable={}",
+                    text_obj,
+                    source,
+                    source_base,
+                    off,
+                    cursor,
+                    score,
+                    printable
+                );
+            }
+            Some(cursor)
+        } else {
+            None
+        }
+    }
+
+    fn is_plausible_texgen_char(ch: u16) -> bool {
+        matches!(
+            ch,
+            0x0020..=0x007e // ASCII printable
+                | 0x00a0..=0x00ff
+                | 0x0390..=0x03ff // Greek uppercase/lowercase used by the menu text
+        )
     }
 
     fn live_guess_font_columns(&mut self, font_obj: u32) -> Option<u32> {
