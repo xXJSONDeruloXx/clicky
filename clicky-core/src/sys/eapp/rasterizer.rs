@@ -160,12 +160,23 @@ fn is_top_left(ax: f32, ay: f32, bx: f32, by: f32) -> bool {
     dy > 0.0 || (dy == 0.0 && dx < 0.0)
 }
 
-pub fn rasterize_triangle(
+fn modulate(src: Rgba8, tint: Rgba8) -> Rgba8 {
+    let mul = |a: u8, b: u8| -> u8 { ((a as u16 * b as u16 + 127) / 255) as u8 };
+    Rgba8::rgba(
+        mul(src.r, tint.r),
+        mul(src.g, tint.g),
+        mul(src.b, tint.b),
+        mul(src.a, tint.a),
+    )
+}
+
+pub fn rasterize_triangle_tinted(
     fb: &mut [Rgba8],
     fb_width: usize,
     fb_height: usize,
     tex: &Texture,
     verts: &[(f32, f32, f32, f32); 3],
+    tint: Rgba8,
 ) -> u64 {
     let mut v = *verts;
     if edge(v[0].0, v[0].1, v[1].0, v[1].1, v[2].0, v[2].1) < 0.0 {
@@ -226,7 +237,7 @@ pub fn rasterize_triangle(
             let w2 = e2 * inv_area;
             let u = v[0].2 * w0 + v[1].2 * w1 + v[2].2 * w2;
             let vv = v[0].3 * w0 + v[1].3 * w1 + v[2].3 * w2;
-            let src = sample_nearest(tex, u, vv);
+            let src = modulate(sample_nearest(tex, u, vv), tint);
             let idx = y as usize * fb_width + x as usize;
             fb[idx] = blend_src_over(fb[idx], src);
             coverage += 1;
@@ -285,13 +296,14 @@ pub fn rasterize_solid_quad(
     coverage
 }
 
-pub fn rasterize_quad(
+pub fn rasterize_quad_tinted(
     fb: &mut [Rgba8],
     fb_width: usize,
     fb_height: usize,
     tex: &Texture,
     positions: &[(f32, f32); 4],
     uvs: &[(f32, f32); 4],
+    tint: Rgba8,
 ) -> u64 {
     let tri0 = [
         (positions[0].0, positions[0].1, uvs[0].0, uvs[0].1),
@@ -303,8 +315,44 @@ pub fn rasterize_quad(
         (positions[2].0, positions[2].1, uvs[2].0, uvs[2].1),
         (positions[3].0, positions[3].1, uvs[3].0, uvs[3].1),
     ];
-    rasterize_triangle(fb, fb_width, fb_height, tex, &tri0)
-        + rasterize_triangle(fb, fb_width, fb_height, tex, &tri1)
+    rasterize_triangle_tinted(fb, fb_width, fb_height, tex, &tri0, tint)
+        + rasterize_triangle_tinted(fb, fb_width, fb_height, tex, &tri1, tint)
+}
+
+pub fn rasterize_triangle(
+    fb: &mut [Rgba8],
+    fb_width: usize,
+    fb_height: usize,
+    tex: &Texture,
+    verts: &[(f32, f32, f32, f32); 3],
+) -> u64 {
+    rasterize_triangle_tinted(
+        fb,
+        fb_width,
+        fb_height,
+        tex,
+        verts,
+        Rgba8::rgba(255, 255, 255, 255),
+    )
+}
+
+pub fn rasterize_quad(
+    fb: &mut [Rgba8],
+    fb_width: usize,
+    fb_height: usize,
+    tex: &Texture,
+    positions: &[(f32, f32); 4],
+    uvs: &[(f32, f32); 4],
+) -> u64 {
+    rasterize_quad_tinted(
+        fb,
+        fb_width,
+        fb_height,
+        tex,
+        positions,
+        uvs,
+        Rgba8::rgba(255, 255, 255, 255),
+    )
 }
 
 pub fn framebuffer_hash(fb: &[Rgba8]) -> u64 {
@@ -343,5 +391,28 @@ mod tests {
             Rgba8::rgba(255, 255, 255, 255),
         );
         assert_eq!(tex.pixels[0], Rgba8::rgba(0x11, 0x22, 0x33, 0x44));
+    }
+
+    #[test]
+    fn rasterize_quad_tinted_modulates_rgb_and_alpha() {
+        let tex = Texture::from_bytes(
+            &[0xff],
+            1,
+            1,
+            TextureFormat::A8,
+            Rgba8::rgba(255, 255, 255, 255),
+        );
+        let mut fb = vec![Rgba8::rgba(0, 0, 0, 0)];
+        let cov = rasterize_quad_tinted(
+            &mut fb,
+            1,
+            1,
+            &tex,
+            &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)],
+            Rgba8::rgba(64, 128, 255, 128),
+        );
+        assert_eq!(cov, 1);
+        assert_eq!(fb[0], Rgba8::rgba(64, 128, 255, 128));
     }
 }

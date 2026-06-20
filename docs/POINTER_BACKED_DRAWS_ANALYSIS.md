@@ -182,27 +182,146 @@ exactly, confirming these are **text rendering draws**.
 
 ---
 
-## 7. Next Missing Primitive
+## 7. Recovered Text/Glyph Runtime Path
 
-**Texture coordinate generation (texgen) via the material state texture matrix.**
+Further tracing shows that both pointer-backed groups are **text builders**, not
+logo-piece quads.
 
-To render pointer-backed draws correctly, the renderer must:
+### 7.1 Draws 21–29: UTF-16 cursor on the caller stack
 
-1. Parse the material state block at `state_ptr`:
-   - Extract the texture matrix from offsets 0x1c–0x2c (glyph cell W/H and
-     atlas mapping parameters).
-2. Apply the ordinal-148 descriptor's per-glyph matrices:
-   - The 7 sub-pointers define per-glyph UV transforms.
-   - Each draw selects a glyph matrix based on draw index within the group.
-3. Generate per-vertex UVs by transforming the unit position quad (0..1) through
-   the combined texture matrix.
-4. Use the generated UVs to sample the correct sub-rectangle of the bound font
-   atlas.
+At the ordinal-137 callsite immediately before each draw, the caller stack
+contains:
 
-This requires implementing the OpenGL ES 1.1 fixed-function **texture coordinate
-generation** pipeline, which is a significant addition to the software
-rasterizer. It should NOT be shortcut by hardcoding glyph positions or string
-mappings.
+- `sp+0x08`: remaining-glyph counter (decrements 7,6,5,4,3,2,1,0)
+- `sp+0x0c`: text object pointer (`0x101a3670`)
+- `sp+0x10`: current UTF-16 cursor (`0x101a76c4`, `0x101a76c6`, ...)
+
+The text buffer decodes to:
+
+```
+0x101a76c2: [0x0039, 0x0394, 0x0395, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0000]
+            = "9ΔΕABCDE"
+```
+
+Per-draw advancement confirms this is a glyph loop:
+
+| draw | cursor | current code unit |
+|------|--------|-------------------|
+| 21 | 0x101a76c4 | 0x0394 (Δ) |
+| 22 | 0x101a76c6 | 0x0395 (Ε) |
+| 23 | 0x101a76c8 | 0x0041 (A) |
+| 24 | 0x101a76ca | 0x0042 (B) |
+| 25 | 0x101a76cc | 0x0043 (C) |
+| 26 | 0x101a76ce | 0x0044 (D) |
+| 27 | 0x101a76d0 | 0x0045 (E) |
+| 28 | 0x101a76d2 | 0x0000 (terminator after E) |
+
+Draw 29 is a trailing flush / final emit after the glyph loop reaches the
+terminator.
+
+### 7.2 Draws 9–14: generated text from a scalar formatter
+
+Disassembly around `0x18008480..0x1800857c` shows the guest is building a short
+formatted string by repeatedly:
+
+1. computing a character code (digits, `':'`, `'A'/'P'`, `'M'`),
+2. calling `0x1801616c(text_obj, char)`,
+3. then calling the draw helper through the import stub.
+
+This group is also text, not a fixed atlas/logo strip.
+
+### 7.3 Character lookup tables recovered from the font object
+
+The text object's font pointer (`text_obj+0x14`) feeds two direct lookup tables:
+
+- `font+0x0c` → `table_a[char]`
+- `font+0x10` → `table_b[char]`
+
+Recovered values for the draw-21 group:
+
+| char | code | table_a | table_b |
+|------|------|---------|---------|
+| `9` | 0x0039 | 25 | 0 |
+| `Δ` | 0x0394 | 0 | 5 |
+| `Ε` | 0x0395 | 1 | 5 |
+| `A` | 0x0041 | 33 | 0 |
+| `B` | 0x0042 | 34 | 0 |
+| `C` | 0x0043 | 35 | 0 |
+| `D` | 0x0044 | 36 | 0 |
+| `E` | 0x0045 | 37 | 0 |
+
+This is strong evidence that:
+
+- `table_a` is the **local glyph index / x-cell selector**
+- `table_b` is a **segment/page selector**
+
+### 7.4 Exact guest UV-generation helper recovered
+
+The guest helper at `0x180161cc` builds the four generated UV vertices and writes
+them into the state object via `0x1801d9e4`.
+
+`0x1801d9e4` writes per-vertex coordinate pairs to:
+
+- `state + 0x48 + vertex*8` → first coordinate
+- `state + 0x4c + vertex*8` → second coordinate
+
+for vertices 0..3.
+
+The text helper path is:
+
+1. `0x18007754(font, char)` → `table_a[char]`
+2. `0x18007778(font, char)` → `table_b[char]`
+3. `0x180074fc / 0x18007560 / 0x1800742c / 0x18007478` combine those table
+   outputs with per-segment arrays at `font+0x60..0x74`
+4. `0x180161cc` applies ±0.5 texel-center adjustments
+5. `0x1801d9e4` stores the four UV corners into the active state object
+
+### 7.5 Why generated UVs still collapse today
+
+The per-segment arrays used by the recovered helper are:
+
+- `font+0x60`
+- `font+0x64`
+- `font+0x68`
+- `font+0x6c`
+- `font+0x74` (segment widths/counts)
+
+For the live 10×12 and 16×16 font objects, the critical scale/translation arrays
+at `+0x60/+0x64/+0x68/+0x6c` are still zero at draw time. As a result, the
+recovered helper's output collapses to the default texel-centered unit values:
+
+```
+(0.5, -0.5), (0.5, -0.5), (0.5, -0.5), (0.5, -0.5)
+```
+
+That is why the generated-UV decode currently remains degenerate even after the
+renderer reads the guest-prepared state block directly.
+
+### 7.6 Directly isolated next missing sub-primitive
+
+The next missing sub-primitive is now more precise than “generic texgen”:
+
+> **Initialization of the font segment metric arrays at `font+0x60..0x74`, so the
+> recovered guest UV builder at `0x180161cc` can produce non-degenerate atlas
+> rectangles.**
+
+This may be driven by an earlier guest/runtime initialization path, or by an
+OpenGLES import with side effects not yet modeled. The current `ordinal 148`
+no-op remains suspicious because its call record looks like a generic
+“descriptor → target object/page” initializer, but the direct evidence here is
+that the text draw helper already exists and fails only because the per-segment
+metric arrays remain zero.
+
+## 8. Next Missing Primitive
+
+**Initialization of the font-page metric arrays feeding the recovered texgen
+helper.**
+
+The recovered draw-time texgen path is now known. What remains missing is the
+population of the font object's per-segment metric arrays (`+0x60..0x74`) so
+that the helper can convert `table_a/table_b` into real atlas rectangles.
+
+This should NOT be shortcut by hardcoding glyph rectangles or strings.
 
 ---
 

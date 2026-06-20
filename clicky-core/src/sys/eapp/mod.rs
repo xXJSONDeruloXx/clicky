@@ -247,6 +247,8 @@ pub struct Eapp {
     dumped_pointer_handles: HashSet<u32>,
     /// Array pointers already dumped for diagnostic analysis.
     dumped_array_ptrs: HashSet<u32>,
+    /// Nested text/font objects discovered from pointer-backed glyph draws.
+    dumped_texgen_ptrs: HashSet<u32>,
     /// (handle, reason) pairs for skipped draws, so we only warn once per
     /// unique pair and avoid flooding the headed-run log.
     skipped_draw_warnings: HashSet<(u32, String)>,
@@ -406,6 +408,7 @@ impl Eapp {
             startup_signature_reports: HashSet::new(),
             dumped_pointer_handles: HashSet::new(),
             dumped_array_ptrs: HashSet::new(),
+            dumped_texgen_ptrs: HashSet::new(),
             skipped_draw_warnings: HashSet::new(),
             host_start: Instant::now(),
             misc9_time_diag_count: 0,
@@ -1219,7 +1222,8 @@ impl Eapp {
         }
         // Diagnostic: dump array contents once per unique pointer when the
         // current material is pointer-backed. Helps decode glyph/UV layouts.
-        if valid
+        if texgen_verbose_enabled()
+            && valid
             && guest_ptr != 0
             && self.dumped_array_ptrs.insert(guest_ptr)
             && format == live_gl::GL_FIXED
@@ -1286,13 +1290,6 @@ impl Eapp {
             lg.current_handle = handle;
             lg.current_state_ptr = state_ptr;
             lg.current_material_epoch = lg.current_material_epoch.wrapping_add(1);
-
-            // For pointer-backed handles, the epoch seems to be misleading.
-            // Preliminary evidence: they use previously defined client arrays,
-            // not their own epoch. Keep the epoch at its previous value.
-            if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle) {
-                lg.current_material_epoch = lg.current_material_epoch.wrapping_sub(1);
-            }
         }
         info!(
             target: "EAPP_GL",
@@ -1300,7 +1297,8 @@ impl Eapp {
             handle, state_ptr
         );
         // Pointer handles are work-RAM addresses. Dump the object layout once.
-        if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
+        if texgen_verbose_enabled()
+            && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
             && self.dumped_pointer_handles.insert(handle)
         {
             self.live_dump_pointer_handle_object(handle, state_ptr);
@@ -1314,6 +1312,9 @@ impl Eapp {
     /// Semantics not yet confirmed; logged for analysis.
     fn live_handle_ordinal_148(&mut self, args: [u32; 4]) {
         let ptr_r2 = args[2];
+        if !texgen_verbose_enabled() {
+            return;
+        }
         info!(
             target: "EAPP_GL",
             "ordinal_148 r0={} r1={} r2={:#010x} r3={}",
@@ -1359,6 +1360,27 @@ impl Eapp {
     /// Dump guest memory structures for a pointer-backed material handle.
     /// This is a diagnostic called once per unique handle value observed at
     /// ordinal-159, so we can trace the object layout without flooding logs.
+    fn live_dump_words_with_float_views(&mut self, label: &str, addr: u32, count: usize) {
+        let words = self.read_guest_words(addr, count);
+        let rendered = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let fx = decode_fixed_16_16(*w);
+                let f = f32::from_bits(*w);
+                format!(
+                    "+{:#04x}={:#010x}/fixed({:.4})/float({:.4})",
+                    i * 4,
+                    w,
+                    fx,
+                    f
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(target: "EAPP_GL", "{} addr={:#010x} [{}]", label, addr, rendered);
+    }
+
     fn live_dump_pointer_handle_object(&mut self, handle: u32, state_ptr: u32) {
         // Dump the handle object itself (work-RAM pointer)
         let obj_words = self.read_guest_words(handle, 0x40);
@@ -1393,6 +1415,86 @@ impl Eapp {
                     target: "EAPP_GL",
                     "ptr_handle_follow handle={:#010x} obj[+{}]={:#010x} nz={}/16 words=[{}]",
                     handle, i * 4, word, nz, sub_hex.join(",")
+                );
+            }
+        }
+    }
+
+    fn live_maybe_dump_texgen_stack_locals(&mut self) {
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let text_obj = self.read_guest_u32(sp.wrapping_add(0x0c)).unwrap_or(0);
+        let text_ptr = self.read_guest_u32(sp.wrapping_add(0x10)).unwrap_or(0);
+        if text_obj != 0
+            && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&text_obj)
+            && self.dumped_texgen_ptrs.insert(text_obj)
+        {
+            self.live_dump_words_with_float_views("texgen_text_obj", text_obj, 32);
+            let font_obj = self
+                .read_guest_u32(text_obj.wrapping_add(0x14))
+                .unwrap_or(0);
+            let state_obj = self
+                .read_guest_u32(text_obj.wrapping_add(0x18))
+                .unwrap_or(0);
+            if font_obj != 0 {
+                self.live_dump_words_with_float_views("texgen_font_obj", font_obj, 48);
+                for off in [
+                    0x0c_u32, 0x10, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x80, 0x84, 0x88,
+                ] {
+                    let ptr = self.read_guest_u32(font_obj.wrapping_add(off)).unwrap_or(0);
+                    if ptr != 0
+                        && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr)
+                        && self.dumped_texgen_ptrs.insert(ptr)
+                    {
+                        self.live_dump_words_with_float_views(
+                            &format!("texgen_font_obj_ptr_{:#x}", off),
+                            ptr,
+                            24,
+                        );
+                    }
+                }
+            }
+            if state_obj != 0 {
+                self.live_dump_words_with_float_views("texgen_text_state_obj", state_obj, 32);
+            }
+        }
+        if text_ptr != 0
+            && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&text_ptr)
+            && self.dumped_texgen_ptrs.insert(text_ptr)
+        {
+            let bytes = self.read_guest_bytes(text_ptr, 32).unwrap_or_default();
+            let u16s = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>();
+            info!(target: "EAPP_GL", "texgen_text_ptr addr={:#010x} u16={:?}", text_ptr, u16s);
+            if let Some(&ch) = u16s.first() {
+                let font_obj = self
+                    .read_guest_u32(text_obj.wrapping_add(0x14))
+                    .unwrap_or(0);
+                let table_a = self
+                    .read_guest_u32(font_obj.wrapping_add(0x0c))
+                    .unwrap_or(0);
+                let table_b = self
+                    .read_guest_u32(font_obj.wrapping_add(0x10))
+                    .unwrap_or(0);
+                let lookup_a = if table_a != 0 {
+                    self.read_guest_u32(table_a.wrapping_add((ch as u32) * 4))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let lookup_b = if table_b != 0 {
+                    self.read_guest_u32(table_b.wrapping_add((ch as u32) * 4))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                info!(
+                    target: "EAPP_GL",
+                    "texgen_char_lookup char={:#06x} table_a={:#010x} table_b={:#010x}",
+                    ch,
+                    lookup_a,
+                    lookup_b
                 );
             }
         }
@@ -1454,6 +1556,11 @@ impl Eapp {
             )
         };
         let state_words = self.read_guest_words(state_ptr, 16);
+        if texgen_verbose_enabled()
+            && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
+        {
+            self.live_maybe_dump_texgen_stack_locals();
+        }
 
         let positions = match self.live_decode_positions(&pos_def, pos_enabled, translation) {
             Some(p) => p,
@@ -1467,6 +1574,8 @@ impl Eapp {
                     uvs: [(0.0, 0.0); 4],
                     has_uv: false,
                     solid_color: None,
+                    tint: Rgba8::rgba(255, 255, 255, 255),
+                    used_generated_uvs: false,
                     position_array: pos_def.clone(),
                     uv_array: uv_def.clone(),
                     enabled_arrays: enabled_arrays.clone(),
@@ -1487,50 +1596,38 @@ impl Eapp {
             }
         };
 
-        let (uv_def, uv_enabled) = {
-            // For pointer-backed handles, the UV array is often in slot 2,
-            // while slot 1 provides per-vertex color/tint (comps=4).
-            // Evidence: handle 0x100e5260 draws use array slot 1 (comps=4)
-            // as color and the actual UVs live in slot 2 (comps=2).
-            let is_pointer_handle =
-                (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle);
+        let explicit_uv_def = {
             let lg = self.live_gl.as_ref();
-            if is_pointer_handle {
-                if let Some(lg) = lg {
-                    // Prefer array slot 2 when it has 2-component UVs; fall
-                    // back to slot 1 if it has 2 components too.
-                    let slot2 = lg.arrays.get(&2).cloned();
-                    let slot1 = lg.arrays.get(&1).cloned();
-                    let chosen = slot2
-                        .as_ref()
-                        .filter(|d| {
-                            d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
-                        })
-                        .or_else(|| {
-                            slot1.as_ref().filter(|d| {
-                                d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
-                            })
-                        });
-                    if let Some(d) = chosen {
-                        (Some(d.clone()), true)
-                    } else {
-                        (uv_def.clone(), uv_enabled)
-                    }
-                } else {
-                    (uv_def.clone(), uv_enabled)
-                }
-            } else {
-                (uv_def.clone(), uv_enabled)
-            }
-        };
+            lg.and_then(|lg| {
+                lg.arrays.get(&1).cloned().or_else(|| {
+                    lg.arrays.get(&2).cloned().filter(|d| {
+                        d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                    })
+                })
+            })
+        }
+        .or_else(|| uv_def.clone());
 
-        let (uvs, has_uv) = self
-            .live_decode_uvs(&uv_def, uv_enabled, material_epoch)
-            .unwrap_or(([(0.0, 0.0); 4], false));
+        let generated = self.live_decode_generated_uvs(state_ptr);
+        let explicit = self.live_decode_uvs(&explicit_uv_def, uv_enabled, material_epoch);
+        let (uvs, has_uv, used_generated_uvs, active_uv_def) = if let Some((uvs, true)) = generated
+        {
+            (uvs, true, true, None)
+        } else if let Some((uvs, true)) = explicit {
+            (uvs, true, false, explicit_uv_def.clone())
+        } else {
+            ([(0.0, 0.0); 4], false, false, explicit_uv_def.clone())
+        };
         let solid_color = if has_uv || handle != 0x3 {
             None
         } else {
-            self.live_decode_solid_color(&uv_def, uv_enabled, material_epoch)
+            self.live_decode_solid_color(&explicit_uv_def, uv_enabled, material_epoch)
+        };
+        let tint = if used_generated_uvs {
+            self.live_decode_font_tint()
+                .unwrap_or(Rgba8::rgba(255, 255, 255, 255))
+        } else {
+            Rgba8::rgba(255, 255, 255, 255)
         };
 
         let mut record = match self.live_gl.as_mut() {
@@ -1543,11 +1640,13 @@ impl Eapp {
                 uvs,
                 has_uv,
                 solid_color,
+                tint,
+                used_generated_uvs,
             ),
             None => return,
         };
         record.position_array = pos_def.clone();
-        record.uv_array = uv_def.clone();
+        record.uv_array = active_uv_def.clone();
         record.enabled_arrays = enabled_arrays;
         record.state_words = state_words;
 
@@ -1603,6 +1702,47 @@ impl Eapp {
             (pts[2].0 + translation.0, pts[2].1 + translation.1),
             (pts[3].0 + translation.0, pts[3].1 + translation.1),
         ])
+    }
+
+    fn live_decode_generated_uvs(&mut self, state_ptr: u32) -> Option<([(f32, f32); 4], bool)> {
+        if state_ptr == 0 || self.read_guest_u32(state_ptr)? != 0x1802_3e24 {
+            return None;
+        }
+        let mut out = [(0.0f32, 0.0f32); 4];
+        for (idx, slot) in out.iter_mut().enumerate() {
+            let base = state_ptr.wrapping_add(0x48 + (idx as u32) * 8);
+            let u = f32::from_bits(self.read_guest_u32(base)?);
+            let v = f32::from_bits(self.read_guest_u32(base.wrapping_add(4))?);
+            if !u.is_finite() || !v.is_finite() {
+                return None;
+            }
+            *slot = (u, v);
+        }
+        let (min_u, min_v, max_u, max_v) = out.iter().fold(
+            (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            |acc, (u, v)| (acc.0.min(*u), acc.1.min(*v), acc.2.max(*u), acc.3.max(*v)),
+        );
+        let nondegenerate = max_u > min_u && max_v > min_v;
+        Some((out, nondegenerate))
+    }
+
+    fn live_decode_font_tint(&mut self) -> Option<Rgba8> {
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+        let text_obj = self.read_guest_u32(sp.wrapping_add(0x0c))?;
+        let font_obj = self.read_guest_u32(text_obj.wrapping_add(0x14))?;
+        let to_u8 =
+            |word: u32| -> u8 { (f32::from_bits(word).clamp(0.0, 1.0) * 255.0).round() as u8 };
+        Some(Rgba8::rgba(
+            to_u8(self.read_guest_u32(font_obj.wrapping_add(0x18))?),
+            to_u8(self.read_guest_u32(font_obj.wrapping_add(0x1c))?),
+            to_u8(self.read_guest_u32(font_obj.wrapping_add(0x20))?),
+            to_u8(self.read_guest_u32(font_obj.wrapping_add(0x24))?),
+        ))
     }
 
     /// Decode the 4-vertex UV array (array 1, GL_FIXED). Tetris also binds
@@ -1864,9 +2004,13 @@ impl Eapp {
                 .solid_color
                 .map(|c| format!("solid=rgba({},{},{},{})", c.r, c.g, c.b, c.a))
                 .unwrap_or_else(|| "solid=<none>".to_string());
+            let tint = format!(
+                "tint=rgba({},{},{},{}) texgen={}",
+                draw.tint.r, draw.tint.g, draw.tint.b, draw.tint.a, draw.used_generated_uvs
+            );
             info!(
                 target: "EAPP_GL",
-                "draw_detail guest_frame={} draw={} handle={:#x} state_ptr={:#010x} enabled={:?} pos_arr={} uv_arr={} translation=({:.2},{:.2}) bounds=({:.1},{:.1})-({:.1},{:.1}) uvs=[{}] inferred_dim={:?} {} {} coverage={} status={} state_words=[{}]",
+                "draw_detail guest_frame={} draw={} handle={:#x} state_ptr={:#010x} enabled={:?} pos_arr={} uv_arr={} translation=({:.2},{:.2}) bounds=({:.1},{:.1})-({:.1},{:.1}) uvs=[{}] inferred_dim={:?} {} {} {} coverage={} status={} state_words=[{}]",
                 self.frame_counter,
                 draw.draw_index + 1,
                 draw.handle,
@@ -1884,6 +2028,7 @@ impl Eapp {
                 draw.inferred_dim,
                 upload,
                 color,
+                tint,
                 draw.coverage,
                 draw.skipped_reason.as_deref().unwrap_or("rasterized"),
                 state_words
@@ -2874,6 +3019,12 @@ impl Eapp {
             .collect::<Vec<_>>()
             .join(" -> ")
     }
+}
+
+fn texgen_verbose_enabled() -> bool {
+    std::env::var_os("CLICKY_GL_TEXGEN_VERBOSE")
+        .map(|v| v.to_string_lossy() == "1")
+        .unwrap_or(false)
 }
 
 fn array_summary(def: Option<&live_gl::LiveArrayDef>) -> String {

@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::gl_decode::{format_from_gl, pix_payload_size};
 use super::rasterizer::{
-    framebuffer_hash, framebuffer_to_ppm, rasterize_quad, rasterize_solid_quad, Rgba8, Texture,
-    TextureFormat,
+    framebuffer_hash, framebuffer_to_ppm, rasterize_quad_tinted, rasterize_solid_quad, Rgba8,
+    Texture, TextureFormat,
 };
 
 pub const FB_WIDTH: usize = 320;
@@ -72,6 +72,8 @@ pub struct LiveDrawRecord {
     pub uvs: [(f32, f32); 4],
     pub has_uv: bool,
     pub solid_color: Option<Rgba8>,
+    pub tint: Rgba8,
+    pub used_generated_uvs: bool,
     pub position_array: Option<LiveArrayDef>,
     pub uv_array: Option<LiveArrayDef>,
     pub enabled_arrays: Vec<u32>,
@@ -465,6 +467,8 @@ impl LiveGlState {
         uvs: [(f32, f32); 4],
         has_uv: bool,
         solid_color: Option<Rgba8>,
+        tint: Rgba8,
+        used_generated_uvs: bool,
     ) -> LiveDrawRecord {
         let bounds = bounds_for(&positions);
         let inferred_dim = if has_uv {
@@ -489,6 +493,8 @@ impl LiveGlState {
             uvs,
             has_uv,
             solid_color,
+            tint,
+            used_generated_uvs,
             position_array: None,
             uv_array: None,
             enabled_arrays: Vec::new(),
@@ -522,13 +528,14 @@ impl LiveGlState {
             return record;
         };
 
-        record.coverage = rasterize_quad(
+        record.coverage = rasterize_quad_tinted(
             &mut self.framebuffer,
             FB_WIDTH,
             FB_HEIGHT,
             &texture,
             &positions,
             &uvs,
+            tint,
         );
         record
     }
