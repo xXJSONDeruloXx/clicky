@@ -61,6 +61,11 @@ const HLE_INFO_FRAMEBUFFER: u32 = 0xff203040;
 const HLE_WARN_FRAMEBUFFER: u32 = 0xff604020;
 const HLE_OPENGL_FRAMEBUFFER: u32 = 0xff205020;
 
+fn quad_from_slice(pts: &[(f32, f32)]) -> [(f32, f32); 4] {
+    debug_assert!(pts.len() >= 4);
+    [pts[0], pts[1], pts[2], pts[3]]
+}
+
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub enum EappKey {
     Up,
@@ -1500,14 +1505,15 @@ impl Eapp {
         }
     }
 
-    /// Ordinal 37: confirmed DrawArrays(7, 0, 4). Read the current position
-    /// and UV arrays, apply the accumulated translation, select the best live
-    /// texture, and rasterize in guest draw order.
+    /// Ordinal 37: observed `DrawArrays(mode=7, first=0, count=4*N)`. Tetris
+    /// uses the single-quad case; several sibling titles batch multiple quads
+    /// in one call. Read the current arrays, apply the accumulated translation,
+    /// and rasterize each logical quad in guest order.
     fn live_handle_draw(&mut self, args: [u32; 4]) {
         let mode = args[0];
         let first = args[1] as usize;
         let count = args[2] as usize;
-        if mode != live_gl::DRAW_MODE || count != 4 || first != 0 {
+        let Some(quad_groups) = live_gl::quad_group_count(mode, first, count) else {
             warn!(
                 target: "EAPP_GL",
                 "live_draw skipped: unsupported mode={} first={} count={}",
@@ -1515,7 +1521,7 @@ impl Eapp {
             );
             self.live_finalize_draw(None);
             return;
-        }
+        };
 
         if let Some(lg) = self.live_gl.as_mut() {
             if lg.continuous_capture && !lg.frame_active {
@@ -1529,32 +1535,43 @@ impl Eapp {
             state_ptr,
             translation,
             pos_def,
-            uv_def,
             pos_enabled,
-            uv_enabled,
             enabled_arrays,
             draw_index,
             material_epoch,
-        ) = {
-            let lg = match self.live_gl.as_ref() {
-                Some(lg) => lg,
-                None => return,
+            explicit_uv_def,
+            explicit_uv_enabled,
+        ) =
+            {
+                let lg = match self.live_gl.as_ref() {
+                    Some(lg) => lg,
+                    None => return,
+                };
+                let mut enabled_arrays: Vec<u32> = lg.enabled_arrays.iter().copied().collect();
+                enabled_arrays.sort_unstable();
+                let (explicit_uv_def, explicit_uv_enabled) =
+                    if let Some(def) = lg.arrays.get(&1).cloned() {
+                        (Some(def), lg.enabled_arrays.contains(&1))
+                    } else if let Some(def) = lg.arrays.get(&2).cloned().filter(|d| {
+                        d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                    }) {
+                        (Some(def), lg.enabled_arrays.contains(&2))
+                    } else {
+                        (None, false)
+                    };
+                (
+                    lg.current_handle,
+                    lg.current_state_ptr,
+                    lg.translation,
+                    lg.arrays.get(&0).cloned(),
+                    lg.enabled_arrays.contains(&0),
+                    enabled_arrays,
+                    lg.draws.len(),
+                    lg.current_material_epoch,
+                    explicit_uv_def,
+                    explicit_uv_enabled,
+                )
             };
-            let mut enabled_arrays: Vec<u32> = lg.enabled_arrays.iter().copied().collect();
-            enabled_arrays.sort_unstable();
-            (
-                lg.current_handle,
-                lg.current_state_ptr,
-                lg.translation,
-                lg.arrays.get(&0).cloned(),
-                lg.arrays.get(&1).cloned(),
-                lg.enabled_arrays.contains(&0),
-                lg.enabled_arrays.contains(&1),
-                enabled_arrays,
-                lg.draws.len(),
-                lg.current_material_epoch,
-            )
-        };
         let state_words = self.read_guest_words(state_ptr, 16);
         if texgen_verbose_enabled()
             && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
@@ -1562,7 +1579,13 @@ impl Eapp {
             self.live_maybe_dump_texgen_stack_locals();
         }
 
-        let positions = match self.live_decode_positions(&pos_def, pos_enabled, translation) {
+        let positions = match self.live_decode_positions_range(
+            &pos_def,
+            pos_enabled,
+            translation,
+            first,
+            count,
+        ) {
             Some(p) => p,
             None => {
                 let rec = live_gl::LiveDrawRecord {
@@ -1577,7 +1600,7 @@ impl Eapp {
                     tint: Rgba8::rgba(255, 255, 255, 255),
                     used_generated_uvs: false,
                     position_array: pos_def.clone(),
-                    uv_array: uv_def.clone(),
+                    uv_array: explicit_uv_def.clone(),
                     enabled_arrays: enabled_arrays.clone(),
                     state_words,
                     bounds: (0.0, 0.0, 0.0, 0.0),
@@ -1591,117 +1614,116 @@ impl Eapp {
                     "draw{} skipped: position array unusable handle={:#x}",
                     draw_index + 1, handle
                 );
-                self.live_finalize_draw(Some(rec));
+                self.live_finalize_draws(vec![rec]);
                 return;
             }
         };
 
-        let explicit_uv_def = {
-            let lg = self.live_gl.as_ref();
-            lg.and_then(|lg| {
-                lg.arrays.get(&1).cloned().or_else(|| {
-                    lg.arrays.get(&2).cloned().filter(|d| {
-                        d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
-                    })
-                })
-            })
-        }
-        .or_else(|| uv_def.clone());
-
-        let generated = self.live_decode_generated_uvs(state_ptr);
-        let explicit = self.live_decode_uvs(&explicit_uv_def, uv_enabled, material_epoch);
-        let (uvs, has_uv, used_generated_uvs, active_uv_def) = if let Some((uvs, true)) = generated
-        {
-            (uvs, true, true, None)
-        } else if let Some((uvs, true)) = explicit {
-            (uvs, true, false, explicit_uv_def.clone())
+        let generated = if quad_groups == 1 {
+            self.live_decode_generated_uvs(state_ptr)
         } else {
-            ([(0.0, 0.0); 4], false, false, explicit_uv_def.clone())
-        };
-        let solid_color = if has_uv || handle != 0x3 {
             None
-        } else {
-            self.live_decode_solid_color(&explicit_uv_def, uv_enabled, material_epoch)
         };
-        let tint = if used_generated_uvs {
+        let explicit = self.live_decode_uvs_range(
+            &explicit_uv_def,
+            explicit_uv_enabled,
+            material_epoch,
+            first,
+            count,
+        );
+        let solid_color = if explicit.is_none() && handle == 0x3 {
+            self.live_decode_solid_color(&explicit_uv_def, explicit_uv_enabled, material_epoch)
+        } else {
+            None
+        };
+        let tint = if generated.is_some() {
             self.live_decode_font_tint()
                 .unwrap_or(Rgba8::rgba(255, 255, 255, 255))
         } else {
             Rgba8::rgba(255, 255, 255, 255)
         };
 
-        let mut record = match self.live_gl.as_mut() {
-            Some(lg) => lg.rasterize_draw(
-                draw_index,
-                handle,
-                state_ptr,
-                translation,
-                positions,
-                uvs,
-                has_uv,
-                solid_color,
-                tint,
-                used_generated_uvs,
-            ),
-            None => return,
-        };
-        record.position_array = pos_def.clone();
-        record.uv_array = active_uv_def.clone();
-        record.enabled_arrays = enabled_arrays;
-        record.state_words = state_words;
+        let mut records = Vec::with_capacity(quad_groups);
+        for quad_idx in 0..quad_groups {
+            let base = quad_idx * 4;
+            let positions = quad_from_slice(&positions[base..base + 4]);
+            let (uvs, has_uv, used_generated_uvs, active_uv_def) = if quad_groups == 1 {
+                if let Some((uvs, true)) = generated {
+                    (uvs, true, true, None)
+                } else if let Some(explicit) = explicit.as_ref() {
+                    (
+                        quad_from_slice(&explicit[base..base + 4]),
+                        true,
+                        false,
+                        explicit_uv_def.clone(),
+                    )
+                } else {
+                    ([(0.0, 0.0); 4], false, false, explicit_uv_def.clone())
+                }
+            } else if let Some(explicit) = explicit.as_ref() {
+                (
+                    quad_from_slice(&explicit[base..base + 4]),
+                    true,
+                    false,
+                    explicit_uv_def.clone(),
+                )
+            } else {
+                ([(0.0, 0.0); 4], false, false, explicit_uv_def.clone())
+            };
+            let solid_color = if has_uv { None } else { solid_color };
 
-        if let Some(reason) = record.skipped_reason.clone() {
-            if let Some(lg) = self.live_gl.as_mut() {
-                lg.note_skipped_draw(reason.clone());
-            }
-            // Bounded skip warning: log the first occurrence per (handle, reason)
-            // pair so headed runs are not flooded. Verbose per-frame diagnostics
-            // remain available via `frame_signature_detail`.
-            let key = (handle, reason.clone());
-            if self.skipped_draw_warnings.insert(key) {
-                warn!(
-                    target: "EAPP_GL",
-                    "draw{} skipped: {} handle={:#x} (first occurrence; further same-reason skips suppressed)",
-                    draw_index + 1, reason, handle
-                );
-            }
-        } else if let Some(sel) = record.selected_upload {
-            info!(
-                target: "EAPP_GL",
-                "draw{} rasterized handle={:#x} inferred_upload={} dim={:?} bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
-                draw_index + 1, handle, sel, record.inferred_dim, record.bounds.0, record.bounds.1,
-                record.bounds.2, record.bounds.3, record.coverage
-            );
-        } else if let Some(color) = record.solid_color {
-            info!(
-                target: "EAPP_GL",
-                "draw{} rasterized solid handle={:#x} color=rgba({},{},{},{}) bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
-                draw_index + 1, handle, color.r, color.g, color.b, color.a, record.bounds.0,
-                record.bounds.1, record.bounds.2, record.bounds.3, record.coverage
-            );
+            let mut record = match self.live_gl.as_mut() {
+                Some(lg) => lg.rasterize_draw(
+                    draw_index + quad_idx,
+                    handle,
+                    state_ptr,
+                    translation,
+                    positions,
+                    uvs,
+                    has_uv,
+                    solid_color,
+                    tint,
+                    used_generated_uvs,
+                ),
+                None => return,
+            };
+            record.position_array = pos_def.clone();
+            record.uv_array = active_uv_def;
+            record.enabled_arrays = enabled_arrays.clone();
+            record.state_words = state_words.clone();
+            self.live_log_draw_record(&record);
+            records.push(record);
         }
-        self.live_finalize_draw(Some(record));
+
+        self.live_finalize_draws(records);
     }
 
-    /// Decode the 4-vertex position array (array 0, GL_FIXED) and apply the
-    /// current translation. Returns None if the array is not usable.
-    fn live_decode_positions(
+    /// Decode position vertices (array 0, GL_FIXED) and apply the current
+    /// translation. Returns None if the array is not usable.
+    fn live_decode_positions_range(
         &mut self,
         def: &Option<live_gl::LiveArrayDef>,
         enabled: bool,
         translation: (f32, f32),
-    ) -> Option<[(f32, f32); 4]> {
+        first: usize,
+        count: usize,
+    ) -> Option<Vec<(f32, f32)>> {
         let def = def.as_ref()?;
         if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count < 2 {
             return None;
         }
-        let pts = self.read_fixed_array(def.guest_ptr, def.component_count as usize, 4)?;
-        Some([
-            (pts[0].0 + translation.0, pts[0].1 + translation.1),
-            (pts[1].0 + translation.0, pts[1].1 + translation.1),
-            (pts[2].0 + translation.0, pts[2].1 + translation.1),
-            (pts[3].0 + translation.0, pts[3].1 + translation.1),
-        ])
+        let pts = self.read_fixed_array_range(
+            def.guest_ptr,
+            def.component_count as usize,
+            def.stride as usize,
+            first,
+            count,
+        )?;
+        Some(
+            pts.into_iter()
+                .map(|(x, y)| (x + translation.0, y + translation.1))
+                .collect(),
+        )
     }
 
     fn live_decode_generated_uvs(&mut self, state_ptr: u32) -> Option<([(f32, f32); 4], bool)> {
@@ -1745,16 +1767,18 @@ impl Eapp {
         ))
     }
 
-    /// Decode the 4-vertex UV array (array 1, GL_FIXED). Tetris also binds
-    /// 4-component arrays in slot 1 for color/tint-like data; those are not
-    /// texture coordinates. Epoch matching avoids reusing stale client arrays
-    /// after a later material bind that only redefines array 0.
-    fn live_decode_uvs(
+    /// Decode a GL_FIXED 2-component UV array. Tetris also binds 4-component
+    /// arrays in slot 1 for color/tint-like data; those are not texture
+    /// coordinates. Epoch matching avoids reusing stale client arrays after a
+    /// later material bind that only redefines array 0.
+    fn live_decode_uvs_range(
         &mut self,
         def: &Option<live_gl::LiveArrayDef>,
         enabled: bool,
         material_epoch: u64,
-    ) -> Option<([(f32, f32); 4], bool)> {
+        first: usize,
+        count: usize,
+    ) -> Option<Vec<(f32, f32)>> {
         let def = def.as_ref()?;
         if !enabled
             || !def.valid
@@ -1764,16 +1788,13 @@ impl Eapp {
         {
             return None;
         }
-        let pts = self.read_fixed_array(def.guest_ptr, def.component_count as usize, 4)?;
-        Some((
-            [
-                (pts[0].0, pts[0].1),
-                (pts[1].0, pts[1].1),
-                (pts[2].0, pts[2].1),
-                (pts[3].0, pts[3].1),
-            ],
-            true,
-        ))
+        self.read_fixed_array_range(
+            def.guest_ptr,
+            def.component_count as usize,
+            def.stride as usize,
+            first,
+            count,
+        )
     }
 
     /// Decode a 4-component GL_FIXED color/tint array as a conservative solid
@@ -1817,28 +1838,77 @@ impl Eapp {
         ))
     }
 
+    fn live_log_draw_record(&mut self, record: &live_gl::LiveDrawRecord) {
+        let handle = record.handle;
+        let draw_index = record.draw_index;
+        if let Some(reason) = record.skipped_reason.clone() {
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.note_skipped_draw(reason.clone());
+            }
+            let key = (handle, reason.clone());
+            if self.skipped_draw_warnings.insert(key) {
+                warn!(
+                    target: "EAPP_GL",
+                    "draw{} skipped: {} handle={:#x} (first occurrence; further same-reason skips suppressed)",
+                    draw_index + 1,
+                    reason,
+                    handle
+                );
+            }
+        } else if let Some(sel) = record.selected_upload {
+            info!(
+                target: "EAPP_GL",
+                "draw{} rasterized handle={:#x} inferred_upload={} dim={:?} bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
+                draw_index + 1,
+                handle,
+                sel,
+                record.inferred_dim,
+                record.bounds.0,
+                record.bounds.1,
+                record.bounds.2,
+                record.bounds.3,
+                record.coverage
+            );
+        } else if let Some(color) = record.solid_color {
+            info!(
+                target: "EAPP_GL",
+                "draw{} rasterized solid handle={:#x} color=rgba({},{},{},{}) bounds=({:.1},{:.1})-({:.1},{:.1}) cov={}",
+                draw_index + 1,
+                handle,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+                record.bounds.0,
+                record.bounds.1,
+                record.bounds.2,
+                record.bounds.3,
+                record.coverage
+            );
+        }
+    }
+
     /// Reset per-draw translation, increment the draw counter, and capture the
     /// first complete candidate frame (after the known steady-state four
     /// ordinal-37 draws) unless continuous capture is enabled.
     fn live_finalize_draw(&mut self, record: Option<live_gl::LiveDrawRecord>) {
+        self.live_finalize_draws(record.into_iter().collect());
+    }
+
+    fn live_finalize_draws(&mut self, records: Vec<live_gl::LiveDrawRecord>) {
         let should_capture;
         if let Some(lg) = self.live_gl.as_mut() {
-            if let Some(rec) = record {
-                lg.draws.push(rec);
-            }
+            let increment = records.len().max(1);
+            lg.draws.extend(records);
             lg.translation = (0.0, 0.0);
-            lg.draw_count_in_frame += 1;
+            lg.draw_count_in_frame += increment;
             if lg.continuous_capture {
-                // Ongoing rendering is driven by the observed 158→157 frame
-                // lifecycle, not by the one-shot repeated-signature heuristic.
                 return;
             }
             let four_draws = lg.draw_count_in_frame == 4;
             if !four_draws {
                 return;
             }
-            // One-shot diagnostic capture only: first consecutive repeat of
-            // the 4-draw handle signature is the stable frame.
             let current_handles: Vec<u32> = lg.draws.iter().map(|d| d.handle).collect();
             let steady = matches!(&lg.prev_draw_handles, Some(prev) if *prev == current_handles);
             lg.prev_draw_handles = Some(current_handles);
@@ -2782,20 +2852,30 @@ impl Eapp {
     }
 
     /// Decode `vertex_count` vertices of `components` signed-16.16 fixed-point
-    /// components each from guest memory. Returns the (x, y) of each vertex
-    /// (extra components beyond 2 are ignored for 2D rasterization). Used for
-    /// ordinal-137 position (4 comps) and UV (2 comps) arrays.
-    fn read_fixed_array(
+    /// components each from guest memory, honoring the client-array stride.
+    /// Returns the (x, y) of each vertex (extra components beyond 2 are ignored
+    /// for 2D rasterization). Used for ordinal-137 position (4 comps) and UV
+    /// (2 comps) arrays.
+    fn read_fixed_array_range(
         &mut self,
         guest_ptr: u32,
         components: usize,
+        stride_bytes: usize,
+        first_vertex: usize,
         vertex_count: usize,
     ) -> Option<Vec<(f32, f32)>> {
-        let words = vertex_count * components;
-        let bytes = self.read_guest_bytes(guest_ptr, words * 4)?;
+        let tight_stride = components * 4;
+        let stride = if stride_bytes == 0 {
+            tight_stride
+        } else {
+            stride_bytes.max(tight_stride)
+        };
+        let start = first_vertex.checked_mul(stride)?;
+        let total = vertex_count.checked_mul(stride)?;
+        let bytes = self.read_guest_bytes(guest_ptr.wrapping_add(start as u32), total)?;
         let mut pts = Vec::with_capacity(vertex_count);
         for v in 0..vertex_count {
-            let base = (v * components) * 4;
+            let base = v * stride;
             let x = decode_fixed_16_16(u32::from_le_bytes([
                 bytes[base],
                 bytes[base + 1],

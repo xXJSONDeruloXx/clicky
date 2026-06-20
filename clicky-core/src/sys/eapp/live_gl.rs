@@ -31,6 +31,16 @@ pub const GL_FIXED: u32 = 0x140c;
 /// Confirmed DrawArrays mode token observed at every ordinal-37 call site.
 pub const DRAW_MODE: u32 = 7;
 
+/// The observed `mode=7` stream behaves like batched quads: count is always a
+/// positive multiple of 4, and the existing Tetris path is the 1-quad case.
+pub fn quad_group_count(mode: u32, first: usize, count: usize) -> Option<usize> {
+    if mode != DRAW_MODE || first != 0 || count < 4 || count % 4 != 0 {
+        None
+    } else {
+        Some(count / 4)
+    }
+}
+
 /// A live texture upload captured at ordinal-99 call time. Pixel bytes are
 /// copied immediately from guest memory; row order is preserved as uploaded.
 #[derive(Debug, Clone)]
@@ -773,5 +783,20 @@ mod tests {
         assert_eq!(lg.draw_count_in_frame, 0);
         assert_eq!(lg.framebuffer[0], Rgba8::rgba(0, 0, 0, 0));
         assert_eq!(lg.uploads.len(), 1, "uploads persist across frames");
+    }
+
+    #[test]
+    fn quad_group_count_accepts_tight_and_batched_quads() {
+        assert_eq!(quad_group_count(DRAW_MODE, 0, 4), Some(1));
+        assert_eq!(quad_group_count(DRAW_MODE, 0, 8), Some(2));
+        assert_eq!(quad_group_count(DRAW_MODE, 0, 28), Some(7));
+    }
+
+    #[test]
+    fn quad_group_count_rejects_non_quad_shapes() {
+        assert_eq!(quad_group_count(DRAW_MODE, 1, 4), None);
+        assert_eq!(quad_group_count(DRAW_MODE, 0, 3), None);
+        assert_eq!(quad_group_count(DRAW_MODE, 0, 10), None);
+        assert_eq!(quad_group_count(4, 0, 4), None);
     }
 }

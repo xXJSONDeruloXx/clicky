@@ -255,6 +255,77 @@ Current observed behavior for **Tetris**:
   behavior, so this is a stability checkpoint rather than a genuinely playable
   title yet
 
+#### Cross-game headed smoke tests (2026-06-19)
+
+Short headed smoke runs against sibling `Games_RO/*` bundles show that the
+current Tetris-focused OpenGLES HLE does **not** regress every other title, but
+it also exposes two clear shared engine gaps.
+
+Tested with:
+
+- `CLICKY_EXPERIMENTAL_GL_HLE=1`
+- `CLICKY_GL_GATE_B=1`
+- `CLICKY_GL_LIVE_CONTINUOUS=1`
+- `CLICKY_GL_PRESENT_VFLIP=1`
+
+Observed results:
+
+- `55555` **Bejeweled**
+  - launches and presents frames
+  - repeatedly hits `OpenGLES:37 mode=7 count=28`
+  - then fatals on an unmapped write:
+    - `pc = 0x18001730`
+    - write to `0x1080000c`
+- `44444` **Zuma**
+  - same failure signature as Bejeweled:
+    - `pc = 0x18001730`
+    - write to `0x1080000c`
+- `77777` **Mahjong**
+  - survives a 12s headed run
+  - repeatedly hits `live_draw skipped: unsupported mode=7 first=0 count=16`
+- `99999` **Cubis 2**
+  - survives a 12s headed run
+  - repeatedly hits `live_draw skipped: unsupported mode=7 first=0 count=16/20/40`
+- `88888` **Mini Golf**
+  - survives a 12s headed run
+  - renders some solid quads
+  - then hits `live_draw skipped: unsupported mode=7 first=0 count=8`
+- `AAAAA` **PAC-MAN**
+  - survives a 12s headed run
+  - separate issue: `draw11..14 skipped: position array unusable handle=0x19`
+
+Most useful cross-title conclusion so far:
+
+- `OpenGLES:37 mode=7` is **not** a Tetris-specific oddity.
+- In sibling titles it appears as `count = 8, 16, 20, 28, 40`, which strongly
+  suggests the same primitive token is being used for **batched quads** rather
+  than only the single-quad Tetris case.
+- The shared unmapped write at `0x1080000c` is likely a broader runtime/device
+  mapping issue, not title-specific content corruption.
+
+That makes `mode=7` support and the `0x1080000c` path the highest-leverage
+non-Tetris bring-up targets.
+
+Follow-up after implementing grouped-quad handling for `OpenGLES:37 mode=7`:
+
+- `unsupported mode=7` warnings disappear in headed reruns of:
+  - `55555` Bejeweled
+  - `77777` Mahjong
+  - `99999` Cubis 2
+  - `88888` Mini Golf
+- **Bejeweled** now gets farther into real rasterization before still hitting the
+  same unmapped write at `0x1080000c`.
+- **Mini Golf** continues to render at least some quads/solid fills without the
+  old mode-7 rejection.
+- **Mahjong** and **Cubis 2** now expose the next blocker more clearly:
+  - `drawN skipped: position array unusable`
+  - so the old primitive-token problem was real, but not the last gap for those
+    titles.
+
+So `mode=7` was successfully identified as a shared batched-quad path, and the
+next cross-title blockers are now narrower: array decoding/layout for some
+bundles, plus the shared unmapped write path.
+
 #### Honest status (stable but green)
 
 Running the desktop (non-headless) runner today shows a flat green window. That
