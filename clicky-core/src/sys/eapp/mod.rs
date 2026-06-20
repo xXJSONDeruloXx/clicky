@@ -243,6 +243,13 @@ pub struct Eapp {
     startup_progress: StartupProgressTrace,
     startup_capture: StartupArtifactCapture,
     startup_signature_reports: HashSet<String>,
+    /// Guest-RAM pointer handles seen at ordinal-159, for one-shot dumping.
+    dumped_pointer_handles: HashSet<u32>,
+    /// Array pointers already dumped for diagnostic analysis.
+    dumped_array_ptrs: HashSet<u32>,
+    /// (handle, reason) pairs for skipped draws, so we only warn once per
+    /// unique pair and avoid flooding the headed-run log.
+    skipped_draw_warnings: HashSet<(u32, String)>,
     host_start: Instant,
     misc9_time_diag_count: u64,
     misc9_last_pointed_value: Option<u32>,
@@ -397,6 +404,9 @@ impl Eapp {
             startup_progress: StartupProgressTrace::from_env(),
             startup_capture: StartupArtifactCapture::from_env(),
             startup_signature_reports: HashSet::new(),
+            dumped_pointer_handles: HashSet::new(),
+            dumped_array_ptrs: HashSet::new(),
+            skipped_draw_warnings: HashSet::new(),
             host_start: Instant::now(),
             misc9_time_diag_count: 0,
             misc9_last_pointed_value: None,
@@ -1029,6 +1039,10 @@ impl Eapp {
             165 => {}
             // Draw-adjacent state ordinals; recorded by observation only.
             175 | 125 | 36 => {}
+            // Ordinal 148 appears before pointer-backed material draws in the
+            // menu phase. Evidence: r0=4, r1=1, r2=0x101029e8 (work RAM ptr).
+            // Semantics not yet confirmed — capture args for analysis.
+            148 => self.live_handle_ordinal_148(args),
             // Upload prep/bind ordinals; not required for dimension-based
             // live texture selection.
             45 | 4 => {}
@@ -1203,6 +1217,44 @@ impl Eapp {
             };
             lg.arrays.insert(array_index, def);
         }
+        // Diagnostic: dump array contents once per unique pointer when the
+        // current material is pointer-backed. Helps decode glyph/UV layouts.
+        if valid
+            && guest_ptr != 0
+            && self.dumped_array_ptrs.insert(guest_ptr)
+            && format == live_gl::GL_FIXED
+        {
+            let words_per_vertex = component_count as usize;
+            // Dump up to 16 vertices (enough to see 4 quads of glyph data)
+            let vertex_count = 16;
+            let total_words = words_per_vertex * vertex_count;
+            let words = self.read_guest_words(guest_ptr, total_words);
+            // Render as vertices for readability
+            let mut rendered = String::new();
+            for v in 0..vertex_count {
+                let base = v * words_per_vertex;
+                if base >= words.len() {
+                    break;
+                }
+                let comps: Vec<String> = words[base..(base + words_per_vertex).min(words.len())]
+                    .iter()
+                    .map(|w| {
+                        // Render as both hex and fixed-point float for diagnosis
+                        let f = decode_fixed_16_16(*w);
+                        format!("{:#010x}({:.2})", w, f)
+                    })
+                    .collect();
+                if !rendered.is_empty() {
+                    rendered.push(',');
+                }
+                rendered.push_str(&format!("v{}=[{}]", v, comps.join(",")));
+            }
+            info!(
+                target: "EAPP_GL",
+                "array_dump idx={} ptr={:#010x} comps={} stride={} vertices=[{}]",
+                array_index, guest_ptr, component_count, stride, rendered
+            );
+        }
     }
 
     /// Ordinal 40: enable/select an array by index (direct arg r0 only).
@@ -1234,12 +1286,116 @@ impl Eapp {
             lg.current_handle = handle;
             lg.current_state_ptr = state_ptr;
             lg.current_material_epoch = lg.current_material_epoch.wrapping_add(1);
+
+            // For pointer-backed handles, the epoch seems to be misleading.
+            // Preliminary evidence: they use previously defined client arrays,
+            // not their own epoch. Keep the epoch at its previous value.
+            if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle) {
+                lg.current_material_epoch = lg.current_material_epoch.wrapping_sub(1);
+            }
         }
         info!(
             target: "EAPP_GL",
             "live_bind_material handle={:#x} state_ptr={:#010x}",
             handle, state_ptr
         );
+        // Pointer handles are work-RAM addresses. Dump the object layout once.
+        if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
+            && self.dumped_pointer_handles.insert(handle)
+        {
+            self.live_dump_pointer_handle_object(handle, state_ptr);
+        }
+    }
+
+    /// Ordinal 148: observed immediately before pointer-backed material
+    /// draws in the menu phase. Evidence from first live observation:
+    ///   r0=4, r1=1, r2=0x101029e8 (work RAM ptr), r3=0
+    /// Appears between `159(handle=0x8)` and the next `137` array def.
+    /// Semantics not yet confirmed; logged for analysis.
+    fn live_handle_ordinal_148(&mut self, args: [u32; 4]) {
+        let ptr_r2 = args[2];
+        info!(
+            target: "EAPP_GL",
+            "ordinal_148 r0={} r1={} r2={:#010x} r3={}",
+            args[0], args[1], ptr_r2, args[3]
+        );
+        // Dump guest memory at r2 when it is a valid work-RAM pointer.
+        if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr_r2) && ptr_r2 != 0 {
+            let words = self.read_guest_words(ptr_r2, 32);
+            let hex: Vec<String> = words.iter().map(|w| format!("{:#010x}", w)).collect();
+            info!(target: "EAPP_GL", "ordinal_148 r2_dump addr={:#010x} words=[{}]", ptr_r2, hex.join(","));
+            // The descriptor has 7 sub-pointers at offsets [13..19] (words).
+            // Dump each one to see glyph vertex/UV tables.
+            for slot in 13..20usize {
+                if slot >= words.len() {
+                    break;
+                }
+                let sub_ptr = words[slot];
+                if !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&sub_ptr)
+                    || sub_ptr == 0
+                {
+                    continue;
+                }
+                // Dump 16 words (enough for 4 vertices of 4 comps).
+                let sub = self.read_guest_words(sub_ptr, 16);
+                let sub_rendered: Vec<String> = sub
+                    .iter()
+                    .map(|w| {
+                        let f = decode_fixed_16_16(*w);
+                        format!("{:#010x}({:.2})", w, f)
+                    })
+                    .collect();
+                info!(
+                    target: "EAPP_GL",
+                    "ordinal_148 glyph_table slot={} ptr={:#010x} words=[{}]",
+                    slot,
+                    sub_ptr,
+                    sub_rendered.join(",")
+                );
+            }
+        }
+    }
+
+    /// Dump guest memory structures for a pointer-backed material handle.
+    /// This is a diagnostic called once per unique handle value observed at
+    /// ordinal-159, so we can trace the object layout without flooding logs.
+    fn live_dump_pointer_handle_object(&mut self, handle: u32, state_ptr: u32) {
+        // Dump the handle object itself (work-RAM pointer)
+        let obj_words = self.read_guest_words(handle, 0x40);
+        let obj_hex: Vec<String> = obj_words.iter().map(|w| format!("{:#010x}", w)).collect();
+        info!(
+            target: "EAPP_GL",
+            "ptr_handle_object handle={:#010x} addr={:#010x} words=[{}]",
+            handle, handle, obj_hex.join(",")
+        );
+
+        // Dump state_ptr (up to 0x40 words)
+        let state_words = self.read_guest_words(state_ptr, 0x10);
+        let state_hex: Vec<String> = state_words.iter().map(|w| format!("{:#010x}", w)).collect();
+        info!(
+            target: "EAPP_GL",
+            "ptr_handle_state handle={:#010x} state_ptr={:#010x} words=[{}]",
+            handle, state_ptr, state_hex.join(",")
+        );
+
+        // Follow any work-RAM pointers in the object with bounded depth.
+        for (i, &word) in obj_words.iter().take(16).enumerate() {
+            if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&word)
+                && word != handle
+                && word != 0
+            {
+                let sub = self.read_guest_words(word, 16);
+                // Quick check: is it likely pixel data (many nonzero bytes) or
+                // a structure (mix of pointers, floats, small ints)?
+                let nz = sub.iter().filter(|w| **w != 0).count();
+                let sub_hex: Vec<String> = sub.iter().map(|w| format!("{:#010x}", w)).collect();
+                info!(
+                    target: "EAPP_GL",
+                    "ptr_handle_follow handle={:#010x} obj[+{}]={:#010x} nz={}/16 words=[{}]",
+                    handle, i * 4, word, nz, sub_hex.join(",")
+                );
+            }
+        }
     }
 
     /// Ordinal 37: confirmed DrawArrays(7, 0, 4). Read the current position
@@ -1331,6 +1487,43 @@ impl Eapp {
             }
         };
 
+        let (uv_def, uv_enabled) = {
+            // For pointer-backed handles, the UV array is often in slot 2,
+            // while slot 1 provides per-vertex color/tint (comps=4).
+            // Evidence: handle 0x100e5260 draws use array slot 1 (comps=4)
+            // as color and the actual UVs live in slot 2 (comps=2).
+            let is_pointer_handle =
+                (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle);
+            let lg = self.live_gl.as_ref();
+            if is_pointer_handle {
+                if let Some(lg) = lg {
+                    // Prefer array slot 2 when it has 2-component UVs; fall
+                    // back to slot 1 if it has 2 components too.
+                    let slot2 = lg.arrays.get(&2).cloned();
+                    let slot1 = lg.arrays.get(&1).cloned();
+                    let chosen = slot2
+                        .as_ref()
+                        .filter(|d| {
+                            d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                        })
+                        .or_else(|| {
+                            slot1.as_ref().filter(|d| {
+                                d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                            })
+                        });
+                    if let Some(d) = chosen {
+                        (Some(d.clone()), true)
+                    } else {
+                        (uv_def.clone(), uv_enabled)
+                    }
+                } else {
+                    (uv_def.clone(), uv_enabled)
+                }
+            } else {
+                (uv_def.clone(), uv_enabled)
+            }
+        };
+
         let (uvs, has_uv) = self
             .live_decode_uvs(&uv_def, uv_enabled, material_epoch)
             .unwrap_or(([(0.0, 0.0); 4], false));
@@ -1362,11 +1555,17 @@ impl Eapp {
             if let Some(lg) = self.live_gl.as_mut() {
                 lg.note_skipped_draw(reason.clone());
             }
-            warn!(
-                target: "EAPP_GL",
-                "draw{} skipped: {} handle={:#x}",
-                draw_index + 1, reason, handle
-            );
+            // Bounded skip warning: log the first occurrence per (handle, reason)
+            // pair so headed runs are not flooded. Verbose per-frame diagnostics
+            // remain available via `frame_signature_detail`.
+            let key = (handle, reason.clone());
+            if self.skipped_draw_warnings.insert(key) {
+                warn!(
+                    target: "EAPP_GL",
+                    "draw{} skipped: {} handle={:#x} (first occurrence; further same-reason skips suppressed)",
+                    draw_index + 1, reason, handle
+                );
+            }
         } else if let Some(sel) = record.selected_upload {
             info!(
                 target: "EAPP_GL",
