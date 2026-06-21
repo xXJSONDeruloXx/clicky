@@ -128,17 +128,27 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       and draw5/6 use `arrows_a8` instead of `f16x16menu3`/`eaLogo`.
 - [ ] **Find why expected menu labels are not issued as draws.** User supplied
       oracle shows expected English menu labels (`MENU`, `PLAY`, `VOLUME`,
-      `OPTIONS`, `RECORDS`, `HELP`, `EXIT`). After texture-selection fix the
-      background/strips are correct, but steady frames still only push/draw the
-      decorative/sample text `89/ABCDE` and the bad clock `':.0AM`; no menu-label
-      strings are emitted through `0x1801616c` and no other label draw path is
-      currently visible. `EAPP_STRING_SCAN=1` confirms expected labels exist
-      only in raw `Strings.dta` buffer, not in parsed/draw cache.
+      `OPTIONS`, `RECORDS`, `HELP`, `EXIT`). After texture-selection and clock
+      fixes the background/strips/clock are correct, but steady frames still
+      only push/draw the decorative/sample text `89/ABCDE` and the clock; no
+      menu-label strings are emitted through `0x1801616c` and no other label
+      draw path is currently visible. Iteration 7 enhanced `EAPP_STRING_SCAN=1`:
+      expected rows decode correctly from raw `Strings.dta` (`Play`, `Volume`,
+      `Options`, etc.), but there are **no work-RAM u32 pointers into those rows
+      or English value spans** at run end, so the guest has the raw file but has
+      not materialized/drawn these labels in the current state/path.
 - [x] **Fix newly exposed localtime downstream blocker.** Root cause was my
       initial 9-word `struct tm` proof write: Tetris passed a stack slot with
       room for six words; writing `wday/yday/isdst` overwrote saved registers
       and produced the `0x1801b994` null-object fault. Restricting `miscTBD:12`
       to six words fixes the blocker; localtime is now enabled by default.
+- [ ] Investigate save/default state and input transition issues. Iteration 7
+      found `.clicky-saves/prefs.sav` and `game.sav` are zero-byte files, while
+      Tetris requests 4096 bytes for each and current `AsyncFileIO:3` reports
+      success after delivering 0 bytes. Also, scripted `menu`/`down` events can
+      reach a separate null read at `0x180206fc` (`[0x14]`). These may be
+      upstream state issues that keep the expected menu label state from being
+      built.
 - [ ] Re-run headed after menu-label issuance is fixed; clock already reads a
       real `H:MM AM`, but the menu still needs to match the user oracle labels.
 - [ ] Cleanup: once labels are sane, deprecate `live_find_texgen_text_cursor`
@@ -536,6 +546,69 @@ Iteration 6 implementation details:
   `8:04AM` / `8:05AM` for the clock plus `89ΔΕABCDE` for the decorative sample.
   So the remaining label bug is independent of the clock.
 
+## Iteration 7 — menu-label negative evidence tightened
+
+Work completed this iteration:
+
+1. **Brute-forced the `Settings:0("Language")` value.** Ran headless text
+   diagnostics for `CLICKY_EAPP_LANGUAGE=0..10`:
+   `/tmp/tet_iter7_lang_{0..10}.log`. Values 0-9 all emitted only the clock plus
+   `89ΔΕABCDE`; value 10 changed the decorative/sample row to unsupported
+   glyphs (`89.......`) but still emitted no expected menu labels. So the label
+   absence is not simply "English is a different language index".
+
+2. **Decoded `Strings.dta` rows in the runtime scan.** Enhanced the env-gated
+   `EAPP_STRING_SCAN=1` diagnostic to parse selected UTF-16BE tab-separated rows
+   and scan for work-RAM u32 pointers into those rows/value spans. Result log:
+   `/tmp/tet_iter7_string_ptr_scan.log`.
+
+   Decoded rows:
+   - `TET_STRING_MAIN_MENU` → `Menu` at `0x1000b9b2`
+   - `TET_STRING_PLAY` → `Play` at `0x10003e6c`
+   - `TET_STRING_VOLUME` → `Volume` at `0x10010044`
+   - `TET_STRING_OPTIONS` → `Options` at `0x10004116`
+   - `TET_STRING_RECORDS` → `Records` at `0x10003fb0`
+   - `TET_STRING_HELP` → `Help` at `0x10004078`
+   - `TET_STRING_EXIT` → `Exit` at `0x10004206`
+
+   For all of these rows, `row_ptr_refs=[]` and `value_ptr_refs=[]`. This means
+   the raw table is loaded and decodable, but no obvious parsed pointer table or
+   direct value pointer for the expected labels exists in work RAM at scan time.
+
+3. **Checked time/input as explanations.** A long no-input run
+   (`/tmp/tet_iter7_long_noinput.log`, 80M cycles, text frames >1000) still only
+   emitted the clock + decorative row. Scripted input runs
+   (`/tmp/tet_iter7_input_{1..5}.log`) did change state in some cases (new
+   single-character / repeated-`A` text objects), but still emitted no expected
+   labels. `menu`/`down` event paths can hit a separate null read at
+   `pc=0x180206fc`, read `[0x14]`, which is likely another runtime-state/input
+   issue rather than a text decoder problem.
+
+Additional observation for next iteration:
+
+- `prefs.sav` and `game.sav` currently exist as zero-byte files under
+  `.clicky-saves`, while Tetris requests 4096 bytes for each. Current
+  `AsyncFileIO:3` logs success after loading 0 bytes to `0x1802795c` and
+  `0x1802895c`. This could leave save/default state different from real hardware
+  (or from a clean "file missing" path) and may be related to the missing menu
+  label state or input-transition null deref.
+
+Verification:
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- String scan / long no-input runs: 0 fatal, 0 skipped.
+- Input experiments: some scripted event paths still fatal at `0x180206fc`; left
+  unresolved for next iteration.
+
+Next:
+
+- Reverse `AsyncFileIO` save-read semantics: for missing/short `prefs.sav` and
+  `game.sav`, decide whether ordinal 3 should fail, zero-fill the requested
+  buffer, or synthesize default records before reporting completion.
+- RE `0x180206fc` null deref from scripted menu/down input.
+- Continue string lookup tracing from enum IDs / row indices if save-state fixes
+  still do not materialize labels.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
@@ -550,14 +623,16 @@ and overwriting saved registers; the recovered `miscTBD:12` ABI is six words.
 User's visual oracle also proved the 9-char `89ΔΕABCDE`/`89/ABCDE` row is not
 intended menu-label text. Iteration 4 showed it is a deliberate decorative /
 font-sample string. The actual expected menu labels are still **not issued as
-text draws** in the current guest state/path. Iteration 4 fixed the major
-wrong-texture issue that made menu layers sample the Japanese glyph atlas, and
-iteration 6 fixed the clock; remaining work is to find why label
-objects/strings are not built or drawn.
+text draws** in the current guest state/path. Iteration 7 tightened this:
+`Strings.dta` rows decode to the expected English values, but no work-RAM pointer
+refs into those rows/value spans exist at scan time, language-index brute force
+does not reveal labels, and long no-input runs never emit them.
 
 Bottom line: glyph decode, texture asset selection, and clock time source are
 now fixed. Remaining visible gap is upstream guest state/API for main-menu label
-issuance/string-table path.
+issuance/string-table path. The current best next lead is save/default-state I/O:
+zero-byte `prefs.sav`/`game.sav` are reported as successful 4096-byte requests,
+and scripted menu/down input can expose a separate null deref at `0x180206fc`.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader

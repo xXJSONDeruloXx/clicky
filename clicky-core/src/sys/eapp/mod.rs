@@ -846,19 +846,29 @@ impl Eapp {
             ("utf16le", |s| s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()),
             ("utf16be", |s| s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect()),
         ];
+        let find_hits = |pat: &[u8], limit: usize| -> Vec<u32> {
+            let mut hits = Vec::new();
+            if pat.is_empty() {
+                return hits;
+            }
+            let mut pos = 0usize;
+            while pos + pat.len() <= buf.len() {
+                let Some(rel) = buf[pos..].windows(pat.len()).position(|w| w == pat) else {
+                    break;
+                };
+                let off = pos + rel;
+                hits.push(WORK_RAM_BASE + off as u32);
+                pos = off + 1;
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+            hits
+        };
         for label in labels {
             for (enc, make_pat) in encodings {
                 let pat = make_pat(label);
-                let mut hits = Vec::new();
-                let mut pos = 0usize;
-                while let Some(rel) = buf[pos..].windows(pat.len()).position(|w| w == pat) {
-                    let off = pos + rel;
-                    hits.push(WORK_RAM_BASE + off as u32);
-                    pos = off + 1;
-                    if hits.len() >= 8 {
-                        break;
-                    }
-                }
+                let hits = find_hits(&pat, 8);
                 if !hits.is_empty() {
                     info!(
                         target: "EAPP",
@@ -869,6 +879,86 @@ impl Eapp {
                     );
                 }
             }
+        }
+
+        let utf16be = |s: &str| -> Vec<u8> {
+            s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect()
+        };
+        let decode_utf16be = |bytes: &[u8]| -> String {
+            let words: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&words)
+        };
+        let find_delim = |start: usize, delim: u8| -> Option<usize> {
+            let pat = [0u8, delim];
+            if start >= buf.len() {
+                return None;
+            }
+            buf[start..]
+                .windows(2)
+                .position(|w| w == pat)
+                .map(|rel| start + rel)
+        };
+        let pointer_refs = |start: u32, end: u32, limit: usize| -> Vec<String> {
+            let mut refs = Vec::new();
+            for off in (0..buf.len().saturating_sub(3)).step_by(4) {
+                let val = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                if (start..end).contains(&val) {
+                    refs.push(format!("{:#010x}->{:#010x}", WORK_RAM_BASE + off as u32, val));
+                    if refs.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            refs
+        };
+
+        // Parse selected `Strings.dta` rows in-place. The file is UTF-16BE,
+        // tab-separated, with column 0 = symbolic ID and column 1 = English.
+        // Logging row/value addresses plus pointer references tells us whether
+        // the guest built a runtime row/value table, even if no draw path emits
+        // the labels yet.
+        let ids = [
+            "TET_STRING_MAIN_MENU",
+            "TET_STRING_PLAY",
+            "TET_STRING_VOLUME",
+            "TET_STRING_OPTIONS",
+            "TET_STRING_RECORDS",
+            "TET_STRING_HELP",
+            "TET_STRING_EXIT",
+        ];
+        for id in ids {
+            let id_pat = utf16be(id);
+            let Some(id_addr) = find_hits(&id_pat, 1).first().copied() else {
+                continue;
+            };
+            let id_off = (id_addr - WORK_RAM_BASE) as usize;
+            let Some(tab0) = find_delim(id_off, b'\t') else {
+                continue;
+            };
+            let value_start = tab0 + 2;
+            let value_end = find_delim(value_start, b'\t')
+                .or_else(|| find_delim(value_start, b'\n'))
+                .unwrap_or(value_start);
+            let row_end = find_delim(value_start, b'\n').unwrap_or(value_end);
+            let value = decode_utf16be(&buf[value_start..value_end]);
+            let value_addr = WORK_RAM_BASE + value_start as u32;
+            let row_end_addr = WORK_RAM_BASE + row_end as u32;
+            let row_refs = pointer_refs(id_addr, row_end_addr, 16);
+            let value_refs = pointer_refs(value_addr, value_addr + (value_end - value_start) as u32, 16);
+            info!(
+                target: "EAPP",
+                "string_row id={} id_addr={:#010x} value_addr={:#010x} value={:?} row_end={:#010x} row_ptr_refs=[{}] value_ptr_refs=[{}]",
+                id,
+                id_addr,
+                value_addr,
+                value,
+                row_end_addr,
+                row_refs.join(","),
+                value_refs.join(",")
+            );
         }
     }
 
