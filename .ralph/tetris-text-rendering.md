@@ -2466,3 +2466,212 @@ Will commit: task file + RE notes (no code changes needed this iteration).
    should schedule a per-guest-time callback that writes 0x18 to
    `[0x18025eb0]` every N us, simulating the firmware's periodic audio IRQ.
 
+
+## Iteration 22 — decoded event/mailbox path; upstream host-event injection replaces downstream PC hook
+
+Goal for this iteration: work the next ~3 items from iteration 21:
+(1) disassemble the suspected per-frame routines (`0x55a0`, `0x53c8`,
+`0x55dc`, `0x50b0`, `0x2d8` plus state-transition calls `0x5048`, `0x59f4`),
+(2) verify whether the real event path can replace the `0x1b630` PC-hook
+mailbox injection, and (3) run headed/default regression + update artifacts.
+
+### Item 1 — per-frame routines decoded: these are NOT menu-label renderers
+
+Disassembled the routines called from EAPP main `0x180222a4` and the state=3/4/5
+transition path:
+
+#### Main-entry event/flag path (`0x180222a4`)
+
+Relevant main-frame sequence:
+
+```armasm
+0x222e8: bl 0x920                     ; miscTBD:9, writes current time/flags to stack
+0x22308: bl 0x53c8                    ; only if miscTBD:9 result has 0x40000000
+0x2239c: bl 0x55dc                    ; consume app event list into splash/event flags
+0x223cc: ldr r0, [r9, #20]            ; r9=0x180256bc, r0=[0x180256d0] flags
+0x223d4: beq 0x223e8                  ; if flags==0, skip mailbox copy
+0x223d8: ldr r1, [r4, #0x30]          ; r1=app_event_head
+0x223dc: bl 0x50b0                    ; copies flags/event-head via 0x5aa4
+0x22410: bl 0x50c0                    ; state dispatch (already decoded)
+0x224c8: bl 0x2d8                     ; import/trampoline table (currently zero-vector)
+```
+
+#### `0x53c8` / `0x59d8`
+
+`0x53c8` is a trivial wrapper: `bl 0x59d8; return 1`. `0x59d8` stores
+`r0 << 16` to `0x18025cac` and `0x18025eb4`. It is only reached when the
+`miscTBD:9` result has bit `0x40000000`. It is not a renderer.
+
+#### `0x55dc` — actual app-event-list consumer
+
+`0x55dc(r0=app_event_head, r1=0x180256d0, r2=app_time, r3=frame_event_mask)`
+walks the linked event list at `[app_object+0x30]`. Each node has:
+
+- byte +0 = event id
+- byte +1 = 2 for press, 1 for release
+- word +8 = next node
+
+For press nodes (`byte1 == 2`), it ORs the mapped bit into `[0x180256d0]`:
+
+| event id | logical source in current builder | bit in `[0x180256d0]` |
+|---:|---|---:|
+| 1 | menu | `0x10` (also stamps start time at `[0x180256bc+0x18]`) |
+| 2 | action/select | `0x01` |
+| 3 | left | `0x02` |
+| 4 | right | `0x04` |
+| 5 | up/down | `0x08` (also stamps start time at `[0x180256bc+0x1c]`) |
+
+For release nodes (`byte1 == 1`), it clears the same bit.
+
+This proves the old "audio slot bit" name was misleading: the byte consumed
+by `0x1b630` is an event/mailbox flag value whose upstream source is
+`[0x180256d0]`, built from app input/host events.
+
+#### `0x50b0` / `0x5aa4` — exact upstream mailbox writer
+
+`0x50b0` is a wrapper around `0x5aa4`. `0x5aa4` is the key writer:
+
+```armasm
+0x5aa4: ldr r2, =0x18025eac
+0x5aa8: str r0, [r2, #4]!     ; [0x18025eb0] = flags
+0x5aac: str r1, [r2, #20]     ; [0x18025ec4] = app_event_head
+0x5ab0: bx lr
+```
+
+So the legitimate path for the iter-20 `[0x18025eb0]` value is:
+
+`InputEvents:0/build event list` → app object `[+0x30]` → `0x55dc` →
+`[0x180256d0]` flags → `0x50b0/0x5aa4` → `[0x18025eb0]` → `0x5a64` →
+`slot+0x8c` → `0x1b630` bit test → byte-setter `0x5034` / state advance.
+
+#### `0x2d8`
+
+`0x2d8` is an import/trampoline-vector entry (`ldr pc, [pc,#...]`) whose
+file-time vector table entries at `0x5a4..` are zero. It is not a menu renderer.
+
+#### State=3/4/5 transition calls
+
+- `0x5048`: transition cleanup. Calls `0x1c03c`, `0x2066c`, loops over five
+  pointers from table `0x180256b4` calling `0x5934`, calls `0x40dc`, releases
+  `[0x18025694]`, clears it, returns prior cleanup result. Not a renderer.
+- `0x59f4`: `mov r0,#1; bx lr` (stub/true)
+- `0x55a0`: `mov r0,#1; bx lr` (stub/true)
+
+**Revised conclusion:** the iteration-21 hypothesis that one of these suspected
+per-frame routines renders menu labels was wrong. These routines are event,
+mailbox, and transition-cleanup plumbing. The frame-38 "menu glyphs" image
+(`/tmp/tetris_iter21_pc_hook_menu_evo.png`) should still be inspected by the
+user, but the code-path RE no longer supports calling it a full menu-label
+render. It is more likely a transition / partial-frame artifact unless a later
+trace shows expected label pushes.
+
+### Item 2 — real event path tested (no downstream `0x1b630` PC hook)
+
+Ran:
+
+```bash
+CLICKY_EAPP_ASYNC3_COMPLETE=1 \
+CLICKY_EAPP_INPUT_SCRIPT='menu:25-30' \
+CLICKY_STARTUP_PROGRESS_FRAMES=600 \
+CLICKY_STARTUP_PROGRESS_INTERVAL=10 \
+CLICKY_GL_TEXGEN_VERBOSE=1 \
+./scripts/tetris.sh --no-build --timeout 35 --headless
+```
+
+Log: `/tmp/tet_iter22_async3_real_menu_event.log`
+
+Results:
+
+- frame 30: `frame_state=6`, `splash_flags=0x10`, event list node
+  `b0=1 b1=2`, `clock_slot_byte_a8=16`, `statemach_byte=1`.
+- This proves the real event path works: `menu` event id 1 → bit `0x10` in
+  `[0x180256d0]` → `0x50b0/0x5aa4` copy → slot byte 0x10 → legit byte-setter.
+- No `CLICKY_EAPP_AUDIO_SLOT_BIT` downstream PC hook was used.
+- BUT the rendered text remained the legal text only:
+  `Tetris(R)&(C)1985-2006...RogerDean` (46 repeated frames + 2 doubled frames).
+  No `MENU`/`PLAY`/`VOLUME`/`OPTIONS`/`RECORDS`/`HELP`/`EXIT` pushes appeared.
+
+So a legitimate menu-button/event transition advances state, but it still
+freezes / repeats the legal-text framebuffer when `ASYNC3_COMPLETE=1`. The
+missing labels are not solved by simply producing the event/mailbox bits.
+
+### Item 3 — implemented cleaner env-gated host-event scheduler / diagnostic
+
+Added `CLICKY_EAPP_HOST_EVENT_FLAGS=...` and optional
+`CLICKY_EAPP_HOST_EVENT_DELAY=N` in `Eapp::step()` at main-entry PC
+`0x180222a4`.
+
+Behavior:
+
+- At the start of each main-frame call, OR `CLICKY_EAPP_HOST_EVENT_FLAGS` into
+  `[0x180256d0]` once `frame_counter >= delay`.
+- The guest then naturally reaches `0x223cc` and, if flags are non-zero, calls
+  `0x50b0 -> 0x5aa4` to copy the value into `[0x18025eb0]`.
+- This is cleaner than the iter-20 `CLICKY_EAPP_AUDIO_SLOT_BIT` PC hook because
+  it uses the actual upstream event/mailbox handoff instead of patching the
+  downstream source immediately before `0x1b630` reads it.
+- The old downstream `CLICKY_EAPP_AUDIO_SLOT_BIT` hook is retained only for
+  comparison.
+
+Validation after rebuilding (without the old PC-hook):
+
+```bash
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x18 \
+CLICKY_EAPP_HOST_EVENT_DELAY=0 \
+CLICKY_STARTUP_PROGRESS_FRAMES=120 \
+CLICKY_STARTUP_PROGRESS_INTERVAL=5 \
+./scripts/tetris.sh --timeout 18 --headless
+```
+
+Log: `/tmp/tet_iter22_host_event_flags_rebuilt.log`
+
+Observed:
+
+- frame 1+: `splash_flags=0x18`
+- frame 3+: `clock_slot_byte_a8=24`
+- frame 4+: both slots `clock_slot_byte_a8=24`, `clock_slot_byte_ac=24`
+- frame 14: `frame_state=5`
+- frame 15+: `frame_state=6`
+- 0 fatal, 0 skipped
+
+Screenshot: `/tmp/tetris_iter22_host_event_flags.png`.
+
+This proves the cleaner host-event ingress reproduces the state advance without
+patching `0x18025eb0` at `0x1b630`.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- Default headed smoke (no env): `/tmp/tet_iter22_default_headed.log`
+  - 0 fatal
+  - 0 skipped
+  - maxframe 181
+- New host-event run: 0 fatal / 0 skipped, state advances via real mailbox path.
+
+### User visual artifacts to inspect
+
+- `/tmp/tetris_iter21_pc_hook_menu_evo.png` — iter-21 frame-38 glyph-like image.
+  User should confirm whether this is actually menu text or just an artifact.
+- `/tmp/tetris_iter22_host_event_flags.png` — cleaner upstream host-event path
+  output (state advance through `[0x180256d0] -> [0x18025eb0]`).
+
+### Next priorities for iteration 23
+
+1. **Trace expected label string refs after state=6 with ASYNC3_COMPLETE.** The
+   labels parse into pointer tables, but neither legitimate input event nor
+   host-event flags cause `MENU`/`PLAY`/... pushes. Add/enable PC trace on the
+   localized string lookup/render callsites (likely near `0x15308`, `0x15c30`,
+   `0x1ceac`/`0x1cf14`, or menu object constructors) and watch reads of the
+   parsed value pointers (`0x100ee238`, `0x100eec98`, etc.).
+2. **Map event semantics beyond `menu`.** The legitimate event path works, but
+   id 1 during legal screen may be a skip/abort/pause transition that freezes
+   legal text. Test delayed `action`, `up/down`, and combinations AFTER the
+   legal dwell with `ASYNC3_COMPLETE=1`, checking text pushes and frame hashes.
+3. **Find the actual menu-label render/create routine.** The suspected main
+   per-frame routines are not it. Search cross-references/calls to the parsed
+   string pointer tables and to text helper `0x1801616c` after label pointers
+   materialize.
+4. Eventually remove the iter-20 downstream PC hook once the upstream
+   host-event path and/or real input behavior is fully understood.
+

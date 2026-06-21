@@ -1140,22 +1140,47 @@ impl Eapp {
                 lg.record_text_char_push(text_obj, char_code);
             }
         }
-        // RE (iter 20): caller-3 entry points that decide whether the legit
-        // byte-setter `0x18005034` fires. `0x1b8b4` is tail-called from
-        // `0x18004088`; it in turn calls `0x1b630`. The slot bit test at
-        // `0x1b7ac/0x1b7b8` requires `clock_obj+idx*16+0x8c` to have bit
-        // 0x10 (or 0x08) for BOTH slot indices; guest code may clear these
-        // bytes mid-frame BEFORE `0x1b630` reads them. To RE the natural
-        // path, optionally re-inject the bits just before the gate runs.
+        // RE (iter 22): cleaner host-event ingress for the Tetris legal→menu
+        // gate. The per-frame main function `0x180222a4` builds event flags at
+        // `[0x180256d0]` from the app event list, then calls `0x50b0 -> 0x5aa4`
+        // to copy those flags into `[0x18025eb0]`. `0x1b630` later copies that
+        // value into `slot+0x8c` and gates the legit byte-setter on bits 0x10
+        // or 0x08. This env path simulates a host/input event at the upstream
+        // mailbox rather than patching the downstream slot immediately before
+        // `0x1b630` reads it.
+        if pc == 0x1802_22a4u32 {
+            if let Ok(raw) = std::env::var("CLICKY_EAPP_HOST_EVENT_FLAGS") {
+                let parse_u32 = |s: &str| -> Option<u32> {
+                    let trimmed = s.trim();
+                    if let Some(hex) = trimmed
+                        .strip_prefix("0x")
+                        .or_else(|| trimmed.strip_prefix("0X"))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        trimmed.parse::<u32>().ok()
+                    }
+                };
+                let delay = std::env::var("CLICKY_EAPP_HOST_EVENT_DELAY")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if self.frame_counter >= delay {
+                    if let Some(flags) = parse_u32(&raw) {
+                        let addr = 0x1802_56d0;
+                        let old = self.read_guest_u32(addr).unwrap_or(0);
+                        let _ = self.write_guest_u32(addr, old | flags);
+                    }
+                }
+            }
+        }
+
+        // Older RE (iter 20): downstream PC-hook injection retained for direct
+        // comparison. Prefer `CLICKY_EAPP_HOST_EVENT_FLAGS=0x18` now because it
+        // uses the guest's real `0x50b0 -> 0x5aa4` event-copy path.
         if std::env::var_os("CLICKY_EAPP_AUDIO_SLOT_BIT").is_some()
             && pc == 0x1801_b630u32
         {
-            // RE (iter 20): `0x1b630` calls `0x5a64` which copies the global at
-            // `0x18025eac` (4 bytes 0/4/8/24 offsets) to `slot+0x88/0x90/0x94/0xa0`.
-            // The slot+0x8c byte (from the +4 field at `0x18025eb0`) gates the
-            // caller-3 byte-setter via `tst r5, #16` / `tst r5, #8` at 0x1b7ac.
-            // The guest resets `0x18025eb0` periodically between progress logs,
-            // so re-inject each time we enter `0x1b630` (right before `bl 0x5a64`).
             let bit: u32 = std::env::var("CLICKY_EAPP_AUDIO_SLOT_BIT_VAL")
                 .ok()
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
