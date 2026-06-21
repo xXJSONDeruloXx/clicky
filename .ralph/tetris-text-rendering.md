@@ -113,15 +113,13 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - [x] Decide: mechanism is PROVEN correct. The remaining issue is NOT
       char-source or consumption alignment — it's an upstream garbage time
       value. Pivoted to the time-value workstream below.
-- [x] **Find what writes the time value at guest `0x1005f780`.** Iteration 5:
-      field is object `0x1005f710 + 0x70`; constructor zeroes it at
-      `0x1801c290`; update path writes it at `0x1801be6c`/`0x1801b56c` as
-      `tm_min + 60 * tm_hour` after calling `miscTBD:12` (`0x18000e98` veneer).
-      Added env-gated `CLICKY_EAPP_LOCALTIME=1` implementation for `miscTBD:12`
-      that writes C `struct tm` leading fields and proves the field becomes
-      sane (e.g. `0x90` = 144 minutes = 2:24). Not enabled by default yet
-      because it exposes a separate null-object transition at `0x1801b994`
-      before the menu.
+- [x] **Find and fix what writes the time value at guest `0x1005f780`.**
+      Iterations 5-6: field is object `0x1005f710 + 0x70`; constructor zeroes
+      it at `0x1801c290`; update path writes it at `0x1801be6c`/`0x1801b56c`
+      as `tm_min + 60 * tm_hour` after calling `miscTBD:12` (`0x18000e98`
+      veneer). Implemented `miscTBD:12` localtime with the recovered **six-word**
+      layout (`sec,min,hour,mday,mon0,year`). Default headed run now logs
+      `time_val_i32=483` and scalar text `8:03AM` instead of `':.0AM`.
 - [x] **Fix wrong menu-layer texture selection.** Iteration 4: all A8 uploads
       are tagged with ambiguous tex_name `0x8`; blindly choosing the latest
       upload forced menu/spinner/background strips to `f16x16menu3_a8` (Japanese
@@ -136,19 +134,16 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       strings are emitted through `0x1801616c` and no other label draw path is
       currently visible. `EAPP_STRING_SCAN=1` confirms expected labels exist
       only in raw `Strings.dta` buffer, not in parsed/draw cache.
-- [ ] **Fix newly exposed localtime downstream blocker.** With
-      `CLICKY_EAPP_LOCALTIME=1`, Tetris no longer has garbage clock input, but
-      it reaches a path that returns from the `0x1801bc90` UI update/audio
-      sequence to `0x1801b990` with `r4=0`, causing null read `[0x2c]`. Need RE
-      the caller/vtable/audio/runtime expectation before enabling localtime by
-      default.
-- [ ] Re-run headed after the time value and menu-label issuance are fixed;
-      scalar clock should read a real `H:MM AM` and the menu should match the
-      user oracle screenshot.
-- [ ] Cleanup: once the time value + labels are sane, deprecate
-      `live_find_texgen_text_cursor` cursor scan and remove temporary RE hooks
-      (`TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`, `scan_for_strings`,
-      `CLICKY_EAPP_LOCALTIME`).
+- [x] **Fix newly exposed localtime downstream blocker.** Root cause was my
+      initial 9-word `struct tm` proof write: Tetris passed a stack slot with
+      room for six words; writing `wday/yday/isdst` overwrote saved registers
+      and produced the `0x1801b994` null-object fault. Restricting `miscTBD:12`
+      to six words fixes the blocker; localtime is now enabled by default.
+- [ ] Re-run headed after menu-label issuance is fixed; clock already reads a
+      real `H:MM AM`, but the menu still needs to match the user oracle labels.
+- [ ] Cleanup: once labels are sane, deprecate `live_find_texgen_text_cursor`
+      cursor scan and remove temporary RE hooks (`TEXT_FORMAT_TIME_ENTRY_PC`,
+      `take_text_char_diag`, `scan_for_strings`).
 
 ## Verification
 - Headed verbose log: `/tmp/tetris_run_20260621_002942.log`
@@ -475,30 +470,94 @@ Next:
   `CLICKY_EAPP_LOCALTIME` gate and the clock should become real text.
 - Continue separate menu-label issuance investigation.
 
+## Iteration 6 reflection + clock fix enabled by default
+
+Reflection checkpoint:
+
+1. **What has been accomplished so far?**
+   - Renderer/text mechanism: fixed. The scalar register-computed text path now
+     consumes the real `0x1801616c(r0=text_obj,r1=char)` pushes; UTF-16 path is
+     still decoded correctly; push==consume; 0 skipped draws.
+   - Texture selection: fixed. Ambiguous A8 tex_name reuse no longer forces menu
+     layers onto the wrong Japanese glyph atlas.
+   - Clock source: now fixed. `miscTBD:12` was identified as the calendar /
+     localtime ABI feeding Tetris' `tm_min + 60*tm_hour` clock field.
+
+2. **What's working well?**
+   - Log-driven RE with write watchpoints is very effective, especially after
+     overlap matching was added for `w16`/`w32`.
+   - The PC-hook text diagnostics are strong: they prove whether a visible string
+     is renderer-caused or guest-authored.
+   - Headed runs plus `frame_diag` / `text_char_diag` give fast regression checks
+     without relying on agent vision.
+
+3. **What's not working / blocking?**
+   - Main-menu labels are still not issued as draws. After this iteration the
+     clock is real (`8:03AM` in the headed proof), but the expected oracle labels
+     (`MENU`, `PLAY`, `VOLUME`, `OPTIONS`, `RECORDS`, `HELP`, `EXIT`) remain only
+     in the raw `Strings.dta` buffer and no text-helper pushes emit them.
+   - Temporary RE hooks/logging are accumulating and should be cleaned once the
+     remaining label path is fixed.
+
+4. **Should the approach be adjusted?**
+   - Yes: stop treating visible gibberish as a renderer problem. Renderer, atlas,
+     and clock are now solved. The remaining work should target guest runtime
+     state / localization-string issuance: unimplemented imports, string-table
+     parse/copy paths, or menu-state objects that decide whether to draw labels.
+
+5. **Next priorities.**
+   - Find the string lookup/render path for expected labels. Start from
+     `Strings.dta` hit addresses / string IDs and locate callsites that copy or
+     render those UTF-16BE entries into menu text objects.
+   - Keep Tetris default golden: headed 0 fatal / 0 skipped; current clock-fixed
+     artifact: `/tmp/tetris_iter6_clock_fixed_latest.png`.
+
+Iteration 6 implementation details:
+
+- Fixed `miscTBD:12` from the iteration-5 proof. The first proof wrote a full
+  9-word `struct tm` (`sec,min,hour,mday,mon0,year,wday,yday,isdst`), but
+  Tetris passes `sp+0x24` inside a 0x3c-byte stack frame. Writing words 6-8
+  overwrote saved registers at `sp+0x3c..`, causing the apparent downstream
+  null-object fault at `0x1801b994` (`r4` restored from overwritten `wday`).
+  The recovered ABI is six words: `sec,min,hour,mday,mon0,year_since_1900`.
+
+- Enabled `miscTBD:12` by default after the six-word fix. Verification:
+  - headless proof `/tmp/tet_iter6_localtime6_headless.log`: `local_time`
+    `min=2 hour=8`, watch wrote `0x000001e2` at `0x1005f780`, and
+    `text_char_diag` emitted `8:02AM`.
+  - headed proof `/tmp/tet_iter6_default_localtime_headed.log`: 0 fatal,
+    0 skipped, `time_val_i32=483`, scalar text `8:03AM`.
+  - exported frame: `/tmp/tetris_iter6_clock_fixed_latest.png`.
+  - tests: `cargo test -p clicky-core --lib eapp` → 16 passed.
+
+- Re-ran string scan after the clock fix:
+  `/tmp/tet_iter6_string_scan_after_clock.log`. Expected labels are still only
+  in the raw `Strings.dta` buffer; unique pushed text sequences are now just
+  `8:04AM` / `8:05AM` for the clock plus `89ΔΕABCDE` for the decorative sample.
+  So the remaining label bug is independent of the clock.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
 char seq; push==consume; ASCII-order table; glyphs OCR-verified; UVs match;
 0 fatals/0 skips; splash golden intact).
 
-The scalar clock path still renders `':.'0AM` by default, but iterations 3+5
-**proved this is not a renderer bug**. Iteration 5 identified the exact upstream
-ABI: `miscTBD:12` must write a local-time / C `struct tm`-style record, and
-Tetris stores `tm_min + 60 * tm_hour` at `0x1005f780`. An env-gated proof
-(`CLICKY_EAPP_LOCALTIME=1`) makes that field sane, but currently exposes a
-separate null-object UI/audio transition before the menu, so it remains gated to
-avoid regressing the default Tetris golden run.
+The scalar clock path is now fixed: default headed run logs a sane minutes-since-
+midnight value (`0x1e3`) and emits `8:03AM` instead of `':.0AM`. The apparent
+iteration-5 downstream blocker was caused by writing too many localtime fields
+and overwriting saved registers; the recovered `miscTBD:12` ABI is six words.
 
 User's visual oracle also proved the 9-char `89ΔΕABCDE`/`89/ABCDE` row is not
 intended menu-label text. Iteration 4 showed it is a deliberate decorative /
 font-sample string. The actual expected menu labels are still **not issued as
 text draws** in the current guest state/path. Iteration 4 fixed the major
-wrong-texture issue that made menu layers sample the Japanese glyph atlas, but
-remaining work is to find why label objects/strings are not built or drawn.
+wrong-texture issue that made menu layers sample the Japanese glyph atlas, and
+iteration 6 fixed the clock; remaining work is to find why label
+objects/strings are not built or drawn.
 
-Bottom line: glyph decode and texture asset selection are now much stronger;
-remaining visible gaps are upstream guest state/API issues: (1) RTC/time value,
-(2) main-menu label issuance/string-table path.
+Bottom line: glyph decode, texture asset selection, and clock time source are
+now fixed. Remaining visible gap is upstream guest state/API for main-menu label
+issuance/string-table path.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader

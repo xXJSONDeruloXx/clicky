@@ -4172,16 +4172,11 @@ impl Eapp {
     /// Calendar/local-time ABI used by Tetris' menu clock. The game calls
     /// `miscTBD:12(out_tm, ...)`, then reads `out_tm[1] + 60 * out_tm[2]` as
     /// minutes since midnight before passing that scalar to its `H:MM AM/PM`
-    /// formatter. That layout matches the leading fields of C `struct tm`:
-    /// sec, min, hour, mday, mon, year, wday, yday, isdst.
+    /// formatter. Recovered layout: six u32 fields (`sec, min, hour, mday,
+    /// mon0, year_since_1900`). Tetris passes a stack slot with room for these
+    /// six words; writing a full 9-word C `struct tm` would overwrite the
+    /// caller's saved registers.
     fn handle_misc12_local_time(&mut self, args: [u32; 4]) -> u32 {
-        // Env-gated until the newly-reachable downstream transition bug is
-        // fixed. With this enabled, Tetris writes a sane `hour * 60 + minute`
-        // to its clock object, but currently trips a separate null-object path
-        // before reaching the menu. Default stays conservative/no-regression.
-        if std::env::var_os("CLICKY_EAPP_LOCALTIME").is_none() {
-            return 0;
-        }
         let out = args[0];
         if out == 0 {
             return 0;
@@ -4194,9 +4189,6 @@ impl Eapp {
             now.day() as u32,
             now.month0() as u32,
             (now.year() - 1900) as u32,
-            now.weekday().num_days_from_sunday(),
-            now.ordinal0(),
-            0,
         ];
         for (idx, val) in fields.iter().copied().enumerate() {
             let _ = self.write_guest_u32(out.wrapping_add((idx as u32) * 4), val);
@@ -4204,16 +4196,14 @@ impl Eapp {
         if self.startup_progress.enabled {
             info!(
                 target: "EAPP_PROGRESS",
-                "local_time module=miscTBD ordinal=12 out={:#010x} sec={} min={} hour={} mday={} mon0={} year={} wday={} yday={}",
+                "local_time module=miscTBD ordinal=12 out={:#010x} sec={} min={} hour={} mday={} mon0={} year={}",
                 out,
                 fields[0],
                 fields[1],
                 fields[2],
                 fields[3],
                 fields[4],
-                fields[5],
-                fields[6],
-                fields[7]
+                fields[5]
             );
         }
         1
