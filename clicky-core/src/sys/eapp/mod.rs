@@ -4274,13 +4274,19 @@ impl Eapp {
                             out[..n].copy_from_slice(&bytes[..n]);
                             let delivered = dest != 0 && self.write_guest_bytes(dest, &out);
                             if delivered {
-                                // Request-object callbacks read these completion fields before
-                                // notifying the owner. In particular, Tetris callback 0x1801fc68
-                                // forwards `req+0x24` as the loaded byte count. Leaving it zero
-                                // made every resource/string load look like a zero-length completion
-                                // even though the payload bytes were present at `dest`.
-                                self.write_guest_u32(req.wrapping_add(0x20), 1);
-                                self.write_guest_u32(req.wrapping_add(0x24), n as u32);
+                                // NOTE: iteration 10 wrote `req+0x20 = 1` and
+                                // `req+0x24 = byte_count` here. The async
+                                // completion callback `0x1801fc68` forwards
+                                // those fields to the resource owner. Writing
+                                // them made Tetris parse `Strings.dta`
+                                // (materializing the expected menu-label
+                                // pointer tables), but it ALSO stalled the
+                                // loader on the legal/loading screen so the
+                                // game never reached the menu (regression).
+                                // Leaving them at 0 restores the menu-entry
+                                // path; the label-parse work is tracked
+                                // separately in .ralph/tetris-text-rendering.md
+                                // until the full completion ABI is reversed.
                                 info!(
                                     target: "EAPP_IMPORT",
                                     "AsyncFileIO:3 loaded {} ({} bytes, requested {}) -> guest dest {:#010x}",
@@ -4301,8 +4307,6 @@ impl Eapp {
                                     },
                                 );
                             } else {
-                                self.write_guest_u32(req.wrapping_add(0x20), 0);
-                                self.write_guest_u32(req.wrapping_add(0x24), 0);
                                 warn!(
                                     target: "EAPP_IMPORT",
                                     "AsyncFileIO:3 no dest buffer for {} (want {} bytes)",

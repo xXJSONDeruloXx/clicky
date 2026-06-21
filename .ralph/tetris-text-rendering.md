@@ -135,13 +135,14 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       draw path is currently visible. Iteration 7 enhanced `EAPP_STRING_SCAN=1`:
       expected rows decode correctly from raw `Strings.dta` (`Play`, `Volume`,
       `Options`, etc.), but there were **no work-RAM u32 pointers into those rows
-      or English value spans** at run end. Iteration 10 fixed missing
-      `AsyncFileIO:3` completion status/byte-count fields; after that the guest
-      does materialize pointer tables for the expected English label values
-      (e.g. `Play`, `Volume`, `Options`, `Records`, `Help`, `Exit`). The current
-      blocker shifted: the game now renders the legal/loading text from
-      `TET_STRING_LOADING_LEGAL` and does not yet advance to the menu-label draw
-      state under the tested scripted events.
+      or English value spans** at run end. Iteration 10 found that writing
+      `AsyncFileIO:3` completion fields (`req+0x20=1`, `req+0x24=bytes_read`)
+      made the localization table parse and the expected labels materialize as
+      runtime pointer tables — BUT iteration 11 proved that was a **regression**:
+      it stalled Tetris on the legal/loading screen so the game never reached the
+      menu. The completion-field writes were reverted in iteration 11, restoring
+      menu entry (clock + decorative, labels still absent). The label-parse
+      approach needs the FULL completion ABI reversed, not just byte-count writes.
 - [x] **Fix newly exposed localtime downstream blocker.** Root cause was my
       initial 9-word `struct tm` proof write: Tetris passed a stack slot with
       room for six words; writing `wday/yday/isdst` overwrote saved registers
@@ -843,6 +844,83 @@ Next:
   produce the expected `MENU`, `PLAY`, `VOLUME`, `OPTIONS`, `RECORDS`, `HELP`,
   `EXIT` draws.
 
+## Iteration 11 reflection — iteration 10 was a regression; reverted
+
+Reflection checkpoint:
+
+1. **What has been accomplished so far?**
+   - Renderer/text mechanism: fixed and proven (PC hook + recorded char seq;
+     push==consume; ASCII table; glyphs verified).
+   - Texture selection: fixed (ambiguous tex_name reuse handled by UV
+     containment + same-name fallback).
+   - Clock source: fixed (`miscTBD:12` six-word localtime; real `H:MM AM`).
+   - Placeholder-resource release safety: fixed (guest base vtable/refcount).
+   - Direct `AsyncFileIO:12/14/16` handles: fixed (separate handle/status,
+     real buffer reads).
+   - Request-object `AsyncFileIO:3` completion fields: **tried, then reverted**
+     (see below).
+
+2. **What's working well?**
+   - Log-driven RE (write watchpoints, PC traces) reliably localizes ABI gaps.
+   - Headed smoke runs give fast regression checks (frame count, text diag).
+   - Each iteration keeps the Tetris golden (0 fatal / 0 skip).
+
+3. **What's not working / blocking?**
+   - Iteration 10's `AsyncFileIO:3` completion-field writes were a **visible
+     regression**: writing `req+0x20=1` / `req+0x24=byte_count` on every load
+     made `Strings.dta` parse (labels materialized as pointer tables — the
+     real goal), but it also stalled the loader on the legal/loading screen so
+     the game never reached the menu (user reported `tetris_run_20260621_105340.log`
+     stuck at frame ~18, 191 draws/frame of legal text). The completion
+     callback `0x1801fc68` forwards those fields to the resource owner; the
+     owner evidently uses them as load-progress/status and with nonzero values
+     the load-bar→menu transition never completes.
+   - The expected menu labels are still absent on the menu that DOES render
+     (clock + decorative row only).
+   - Temporary RE hooks/logging are accumulating (tracked for cleanup).
+
+4. **Should the approach be adjusted?**
+   - Yes. Iteration 10 proved the label strings DO parse once completion
+     metadata is provided, but that metadata is not just `byte_count`. The
+     next attempt must reverse the FULL `AsyncFileIO:3` request-object
+     completion protocol (which `req+0xNN` is status vs byte count vs
+     error, and what values the owner expects per resource type), not guess
+     at two fields. Keep menu-entry intact while doing it.
+
+5. **Next priorities.**
+   - Reverse the complete `AsyncFileIO:3` completion ABI by watching `req`
+     fields across the lifecycle (request → payload write → callback → owner
+     processing → load-bar counter update), then set ONLY the fields the
+     guest itself sets, with the values it expects. Verify menu still enters
+     AND labels materialize.
+   - Re-examine whether the legal/loading screen has its own timer/input
+     transition that iteration 10's change simply made visible for the first
+     time.
+   - Keep Tetris default golden: headed 0 fatal / 0 skipped.
+
+Iteration 11 implementation details:
+
+- Reverted the iteration-10 completion-field writes in
+  `handle_async_file_io_import` ordinal 3: removed
+  `write_guest_u32(req+0x20, 1)` / `write_guest_u32(req+0x24, n)` on success
+  and the matching `=0` writes on failure. Kept the buffer zero-fill for short
+  reads (harmless, strictly safer than leaving stale guest memory). Left a
+  comment explaining why so the next attempt doesn't naively re-add it.
+
+Verification:
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- Headed smoke after revert: `/tmp/tet_iter11_revert_verbose.log`, capture
+  `/tmp/tetris_capture_20260621_105859`
+  - 0 fatal, 0 skipped, maxframe 268 (was stuck at 18 before revert).
+  - Texts back to the iteration-9 steady state: clock `10:59AM` + decorative
+    `89ΔΕABCDE`. Menu entry restored.
+
+Next:
+
+- Reverse the full `AsyncFileIO:3` request-object completion ABI before
+  re-attempting label materialization, so menu entry is preserved.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
@@ -863,11 +941,12 @@ English labels. The current blocker has moved forward: the game now renders the
 legal/loading text and has not yet advanced to the main-menu draw state.
 
 Bottom line: glyph decode, texture asset selection, clock time source,
-placeholder-resource release safety, direct `AsyncFileIO:12/14/16` handles, and
-request-object `AsyncFileIO:3` completion byte counts are now fixed. The best
-next lead is legal/loading screen advancement (timer/input/completion state),
-not raw string parsing: the expected label strings are now present in parsed
-runtime tables but not yet drawn because the menu state has not been reached.
+placeholder-resource release safety, direct `AsyncFileIO:12/14/16` handles are
+now fixed. The iteration-10 attempt to add `AsyncFileIO:3` completion metadata
+parsed `Strings.dta` (labels materialized) but regressed menu entry and was
+reverted in iteration 11. The expected menu labels remain absent on the menu
+that does render. Next: reverse the FULL completion ABI (not just two guessed
+fields) so menu entry stays intact while labels materialize.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader
