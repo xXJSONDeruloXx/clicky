@@ -566,6 +566,10 @@ impl Eapp {
     /// Tetris). Each hit is tagged with the guest PC that performed the write
     /// so the writer of any watched field can be identified.
     pub fn drain_watch_log(&mut self) {
+        // Note: the CLI's `--timeout` may SIGTERM the process before end-of-run
+        // drain fires. To ensure watch captures survive regardless of how the
+        // run ends, `maybe_log_startup_progress` also calls drain at every
+        // emitted startup_progress frame.
         if self.bus.watch_log.is_empty() {
             return;
         }
@@ -4632,6 +4636,14 @@ impl Eapp {
             import_summary,
             trace_summary
         );
+
+        // Flush the write-watchpoint log (if any). The CLI's `--timeout` may
+        // SIGTERM the process before end-of-run drain fires, so emitting at
+        // every startup_progress frame ensures watch captures survive.
+        // Entries are unsampled and tagged with the writer PC; callers can
+        // correlate them to the splash_phase / splash_times / dispatch-state
+        // fields above by frame.
+        self.drain_watch_log();
     }
 
     fn render_state_hash(&self) -> u64 {

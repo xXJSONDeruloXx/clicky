@@ -1400,9 +1400,131 @@ Static RE candidates to chase next iter:
   and `0x1801_224d0` (function near splash update logic). Find the writer/
   reader of `0x180256bc+0x18/0x1c/0x20`.
 - Trace ALL stores to `0x18025600..0x18025700` (the whole splash BSS range)
-  (CLI: `CLICKY_EAPP_WATCH=0x18025 00,0x100`) to enumerate every writer PC.
+  (CLI: `CLICKY_EAPP_WATCH=0x18025600,0x100`) to enumerate every writer PC.
 - Tests on `frame_state` writers (iter 9 identified `0x180051e8` sets 1,
   `0x1800532c` sets 5, `0x18005344` sets 6): trace what gates the writer of
   state 2 (the legalñmenu case).
 - Re-enable `byte_count` writes (iter-12 ABI) and fix the new splash gate
   once it is identified; default stays reverted/golden.
+
+## Iteration 16 — REPAIR WATCH TOOL + decode splash update function + frame_state gate
+
+Reflection checkpoint (Ralph iteration 16/40). See above for the reflection
+summary; this iteration's work was RE and tooling only. Default path unchanged
+(golden).
+
+### Tooling fix: watch tool was being dropped on `--timeout` SIGTERM
+
+Major RE breakthrough this iteration came from instrumenting the watch hook
+itself with `eprintln!` to prove hits WERE being recorded — the watch tool was
+working ALL ALONG but `drain_watch_log()` was emitting ZERO output on RE runs.
+
+Root cause: `tetris.sh --timeout N` sends SIGTERM to the eapp binary at N
+seconds, killing the process BEFORE the headless end-of-run `drain_watch_log()`
+at `eapp.rs:184` (and `dump_string_trace_totals()` which also drains) ever
+fire. So iterations 14-15's "watch returns zero hits" conclusion was a RED
+HERRING — the writes were captured by the bus hook but never flushed to stderr
+before termination.
+
+Fix: `maybe_log_startup_progress` now calls `self.drain_watch_log()` at every
+emitted startup_progress frame (interval controllable via
+`CLICKY_STARTUP_PROGRESS_INTERVAL`). Watch hits now survive regardless of how
+the run terminates. The end-of-run drain paths are kept for the no-timeout case
+(clean `--cycles N` exit).
+
+### Splash update function fully decoded: `0x180222a4`
+
+Disassembled around the literal-pool site at file offset 0x224d0 (vma
+0x180224d0). It's a literal pool belonging to the function ending at
+0x180224cc (`pop {...,pc}`). The function START is at vma `0x180222a4` (`push
+{r2,r3,r4,r5,r6,r7,r8,r9,sl,lr}`). The raw byte sequence `0x180222a4` (LE)
+appears at exactly ONE place in the binary: file offset 0x00024 (vma
+0x18000024), which is the EAPP header's main-entry-pointer slot (confirmed by
+the bootstrap log: `aux=0x180222a4`).
+
+So **`0x180222a4(app_object, frame_context)` is the EAPP main per-frame entry
+function**, invoked once per frame by the runner.
+
+The function body loads `splash_base = 0x180256bc` into r9 via
+`ldr r9, [pc, #524]` at 0x180222bc, then:
+- `0x180222b8: ldrb r0, [r5]` where `r5 = frame_context` (=0x100035a0) — i.e.
+  it loads `frame_state` (first byte at frame_context).
+- `0x180222c4: cmp r0, #0`.
+- `0x180222c8: ldreq r0, [r4, #4]` — r0 = `[app_object+4]` (= 0x100015a4 =
+  the miscTBD:9 destination, i.e. host_us).
+- `0x180222d0/d4/d8: streq r0, [r9, #24/28/32]` — WRITE splash_times_a/b/c
+  with host_us, ONLY when `frame_state == 0`.
+- `0x180222dc: streq r8, [r5, #32]` and `0x180222e4: streq r8, [r4, #52]` —
+  zero other context fields.
+- `0x180222e8: bl 0x920` — service call (miscTBD:9 trampoline).
+- `0x18022388: str r0, [r9, #16]` — write `[splash_base+0x10] = counter`
+  (0..15 wrap; iterates 8 times each call → ~40 writes total over 5 frames
+  before settling).
+- `0x180223ac: str r0, [r9, #20]` — reset the `[splash_base+0x14]` field
+  using `bic` then `orr` (clears bit `0x60`).
+
+### Conclusion: the real legal→menu stall
+
+The full splash writer cycle works correctly. `splash_times` are updated
+ONCE per boot because they only write when `frame_state == 0`. Once state
+advances 0→1 (by writer `0x180051e8`), the streq path inside `0x180222a4`
+is skipped and splash_times freeze at the host_us value from the (single)
+frame where state was 0.
+
+**Key correction to the iteration-15 hypothesis**: `splash_phase` at byte
+`0x180256bc` (= splash_base+0x00) is **NEVER WRITTEN by guest code**.
+Iter-15's "splash_phase=0 is freezing" was a misread of a static-init value
+that stays static. The actual state the legal screen depends on is
+`frame_state` at `0x100035a0`, NOT splash_phase.
+
+### frame_state writes captured
+
+Watching `0x100035a0, 0x10` (covers `[r4+0..r4+12]`) shows the default boot
+produces ONLY ONE write to the entire frame_context byte range:
+  - `addr=0x100035a0 (=frame_ctx+0x00) val=0x01  writer_pc=0x180051e8  hits=1`
+
+The other writers iter-9 found (`0x1800532c` sets state=5, `0x18005344` sets
+state=6) only fire via scripted INPUT events. **No writer of state=2 (the
+legal→menu transition state) exists on the default (no-input) boot path.**
+This is the concrete description of the stall: the legal screen renders every
+frame (repeating the legal text draws) but never advances to the menu because
+nothing writes `frame_state=2`.
+
+Disassembly around `0x180051d8..0x18005344` shows the function flow:
+- `0x180051d8: bl 0x5508` (pre-state work)
+- `0x180051dc: str r7, [r4, #12]`  — write `[frame_ctx+0x0c]`
+- `0x180051e0: strb r6, [r4, #1]`  — write `[frame_ctx+0x01]`
+- `0x180051e4: ldr r0, [r4, #8]`   — load frame_state_ptr
+- `0x180051e8: strb r6, [r0]`      — write r6 (=1) to *frame_state_ptr  ← state set to 1
+- `0x180051ec: b 0x535c`           — jump to function tail
+- `0x1800531c: strbeq r6, [r4]`    — conditional write if `0x4088(r0) == 2` ← would set state=1 again (not state=2!)
+- `0x1800532c: strbeq r0, [r1]`    — conditional write `[r1] = r0` (=5 if input routed)
+- `0x18005344: strb lr, [r1]`      — write `[r1] = lr` (=6 if different input routed)
+
+Note: `0x1800531c` writes `[r4]` (= `[frame_ctx+0x00]` which IS frame_state)
+but only when `0x4088(r0) == 2` returns true — and that conditional DID NOT
+fire on the default path. So `0x4088` does NOT return 2 in default usage.
+`0x4088` is the state-machine sub-routine that decides whether to advance.
+**If we could make `0x4088` return the value that triggers state=2
+advancement, the legal→menu gate would open.**
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 17 passed (16 + lib set).
+- Default golden headed: 0 fatal, 0 skip, maxframe 189 (`tet_iter16_final_default.log`).
+- RE runs with periodic drain (every 20 progress frames):
+  - `/tmp/tet_iter16_splashdrain_v2.log` (full splash writer map)
+  - `/tmp/tet_iter16_framestatelog.log` (frame_state writes)
+
+### Next (iteration 17 priorities)
+- Disassemble `0x18004088` (the state-machine sub-routine called at 0x18005314)
+  to find what conditions return state=2 and what readers gate it.
+- Watch `[0x100035a8..0x100035b4]` (covers `[r4+8]` = `frame_state_ptr`)
+  to confirm the pointer at `[frame_ctx+0x08]` actually aliases 0x100035a0.
+- Try a wider scripted input sweep: events 0..7 at multiple timings
+  (early during `frame_state=0`, mid-frame, late during `frame_state=1`) to
+  find if a specific event triggers the legal→menu advance.
+- Re-enable `CLICKY_EAPP_ASYNC3_COMPLETE=1` (byte_count path) once the legal
+  state machine is understood; default stays reverted/golden.
+- Cleanup: remove temp RE hooks `TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`,
+  `scan_for_strings`, `EAPP_STRING_TRACE` once labels materialize on the menu.
