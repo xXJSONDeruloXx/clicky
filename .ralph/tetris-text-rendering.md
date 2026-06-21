@@ -1171,3 +1171,134 @@ fields) so menu entry stays intact while labels materialize.
   hardcoded-string patch. The `0x1801616c` PC is Tetris-specific (its EA
   engine's own text code); sibling engines use different text paths that
   would need per-game RE if their text accuracy becomes a goal.
+
+## Iteration 14 — RE: dispatcher + I/O initiator + in-flight byte lifecycle
+
+Goal: act on iteration-13's next step — disassemble the texture processor
+`0x18019770` and find the legal→menu transition gate by watching entry
+lifecycle fields.
+
+### Static RE: full load-manager cascade decoded
+
+1. **`0x18019770` texture processor** (analog of Strings.dta processor
+   `0x18015308`, mirror image with +0xc field offset):
+
+   | logical field       | Strings.dta `0x18015308` | Texture `0x18019770` |
+   |---|---|---|
+   | index-to-register   | `[desc+0x11c]`           | `[desc+0x128]`      |
+   | done byte           | `[desc+0x120]=1`         | `[desc+0x12c]=1`    |
+   | byte_count landing  | `[desc+0x124]=byte_count` | `[desc+0x130]=bc`   |
+   | 2nd-stage cb        | `[desc+0x128]`            | `[desc+0x134]`      |
+
+   Both processors call `bl 0x1d644(manager, index)` to register the slot.
+
+2. **`0x1d8d0` = manager init** (fires once at startup). Allocates a
+   10-slot array of 0x184-byte entries, builds an initial FREE LIST
+   (`entry[i]+0x180 ⟶ entry[i+1]`), sets `[mgr+0xf24]=0` (active count)
+   and `[mgr+0xf28]=entry[0]` (free-list head).
+
+3. **`0x1d644` = LINK function** (not the dispatcher): if `[entry+0x180] != 0`
+   (already in some list), return immediately; else set `[entry+0x124]=1`, set
+   `[entry+0x180] = old_head`, set `[mgr+0xf28] = entry` (push to front).
+   This is what `0x18015308` and `0x18019770` call after each load completion:
+   it "returns" the slot to the free list for reuse. The 8000+ idx=0 hits in
+   iteration 13 are NO-OPS because `[entry+0x180] != 0`.
+
+4. **`0x1d76c` = DISPATCHER** (one-step pop). Pops head entry from
+   `[mgr+0xf28]`, advances head to `[head+0x180]`, sets `[head+0x180]=0`, then
+   sets `[head+4]=1`, `[head+5]=1`, `[head+6]=1`, `[head+0x120]=0`,
+   `[head+0x124]=0`, memsets `entry+8..entry+0x11c`, installs continuation
+   `{r8=fn, r9=arg}` at `[head+0x164]/[head+0x168]`, then:
+   - `[entry+0x110]==0 || ([entry+0x110]==1 && [entry+0x114]==0)` ⟶ `bl 0x1fe28`
+     with `(r0=entry+0x16c, r1=entry[0x118], r2=0x1801d370[,owner cb],
+     r3=entry[0x10c])`.
+   - else ⟶ `bl 0x1fcc8` with `(r0=entry+0x16c, ..., r2=0x1801d1b4[,cb])`.
+   If the call returns non-zero (load started), `bne 0x1d854` ⟶ return r6
+   (unchanged initial value `-1`) WITHOUT re-linking ⟶ entry permanently
+   removed from the pending list. If the call returns zero (busy/fail),
+   `[entry+0x180]=old_head; [mgr+0xf28]=entry` ⟶ re-link at head (busy-wait).
+
+5. **`0x1fe28` = I/O initiator A** (the path hit by Strings.dta-style loads).
+   `r0 = entry+0x16c` (= "the request struct"). Sequence:
+   - `r0 = [r0+4]` = `[entry+0x170]` (BUSY / in-flight byte).
+   - If `[entry+0x170] != 0`, return 0 immediately ⟶ dispatcher re-links
+     (busy-wait).
+   - Else: `bl 0x21b38(60)` ⟶ alloc owner struct; `bl 0x20154` ⟶ init owner;
+     set `[entry+0x178]=entry[0x118]`, `[entry+0x17c]=0x1801d370` (owner cb);
+     `bl 0x200c8(owner, 6, 0, ...)` = AsyncFileIO:6 (open file);
+     `bl 0x200ac(owner, entry+0x16c)` = link owner ⟷ request struct;
+     `bl 0x644 (r0=entry[8], r1=entry+9(name ptr), r2=owner)` = AsyncFileIO:3
+     (our handler). On result r6 != 0 (success), `mov r0,#4; strb r0, [r4,#4]`
+     ⟶ `[entry+0x170]=4`, jump to `0x1fed8`; `0x1fed8: r0=r6; pop` ⟶ return
+     r6 to dispatcher (success path). On r6==0, cleanup, return 0.
+
+6. **`0x1fcc8` = I/O initiator B** (texture-side path). Same structure, calls
+   `0x638` (a different AsyncFileIO import) and uses cb `0x1801d1b4`. On
+   success, `mov r0,#1; strb r0, [r4,#4]` ⟶ `[entry+0x170]=1` (vs A's 4).
+
+7. **Call chain summary**: loader-poll → `0x1d76c`(dispatcher) → `0x1fe28`/
+   `0x1fcc8`(I/O initiator) → `0x644`/`0x638`(AsyncFileIO import) ⟶ our
+   `handle_async_file_io_import(ordinal=3)` → bytes copied, completion queued
+   → later: `0x1801fc68`⟶`0x1801fc94`⟶`0x1d370`⟶processor.
+
+### Dynamic RE: empirical progress on the stall
+
+Traces added (env-gated, off by default in default path): `0x1d76c` (dispatcher
+with head/in-flight/done-byte dump), `0x1d500` (begin-load: entry[4]/[7]/
+[0x174]/[0x164]/[0x168]), `0x1fe28`/`0x1fcc8` (I/O initiator: dump `[e+170]`,
+`[r+4]`, `[r+0xc]`, `[r+0x10]`), `0x1fec8` (failure-path code address),
+`0x1fed8` (success-path code address).
+
+Run: `CLICKY_EAPP_ASYNC3_COMPLETE=1 EAPP_STRING_TRACE=1 EAPP_STRING_TRACE_LIMIT=400
+CLICKY_EAPP_WATCH=0x10013790,0x4 ./scripts/tetris.sh --no-build --timeout 10 --headless`
+(`/tmp/tet_iter14_post3.log`).
+
+Empirical results:
+
+- **`0x1fec8` (failure path) was HIT ZERO TIMES.** No `0x1fe28`/`0x1fcc8` call
+  ever took the failure/cleanup branch.
+- **`0x1fed8` (success path) was HIT 20+ times in frames 1-2**, with
+  `r0=0x04` (the OLD r0 left over from `movne r0,#4`, proving r6 != 0 ⟶ our
+  AsyncFileIO:3 returned non-zero ⟶ `[entry+0x170]=4` was stored). The
+  AsyncFileIO:3 outcome log confirms 40 staged loads completed successfully.
+- **BUT on every `0x1fe28` ENTRY, `[r+4] == 0x00` (= `[entry+0x170]=0`).**
+  Since `0x1febc` DID store `[entry+0x170]=4` (proven by 0x1fed8 success-path
+  hits), this means the value is being CLEARED between dispatches by the
+  completion chain.
+- **Watch tool on `[entry+0x170]=0x10013790` (length 4) returned ZERO hits**
+  despite the `strb` guest store firing repeatedly. → our watch tool's hook does
+  not catch single-byte ARM `strb` stores from guest execution (only larger
+  host-side writes). Need to widen the guest-store hook if we want to trace
+  this field directly.
+
+### Reassessment
+
+- Both "dead-spin" and "slot-collision" hypotheses (iteration 12-13) are
+  disproved. The new stall model is simpler: the dispatch cycle is
+  pop-entry⟶set-in-flight-byte⟶AsyncFileIO:3⟶completion-clears-in-flight-byte⟶re-link-at-head,
+  and the legal screen's "is pending work?" check sees `[mgr+0xf28] != 0`
+  forever because every load keeps returning to the free list.
+- The legal→menu gate is therefore NOT "[entry+0x170] stuck at 4"; it's that
+  the cycle runs forever because completion keeps resetting the slot instead
+  of leaving it done. Need to find the field that DECIDES "slot is finally
+  done" and never re-dispatched — and confirm whether OUR completion chain is
+  failing to set it (e.g. `[entry+0x11c]` is set by the completion processor,
+  and the dispatcher reads `[entry+0x174]` (via `0x1d500: ldr r0, [r4, #0x174];
+  ...; str r0, [r4, #0x11c]`)). If the per-resource processor writes
+  `[entry+0x174]=-1` (sentinel) on completion, the next dispatcher would
+  `ldr [entry+0x174]=-1`... actually that doesn't quite fit either.
+
+### Verification
+- `cargo test -p clicky-core --lib eapp` ⟶ 16 passed.
+- default (no env) headed smoke: 0 fatal, 0 skip, maxframe 219 (golden).
+- RE runs: `/tmp/tet_iter14_dispatch_watch.log`, `/tmp/tet_iter14_full.log`,
+  `/tmp/tet_iter14_post3.log`.
+
+### Next
+- Find the field/setter that the dispatcher would read to decide a slot is
+  DONE (so it stops putting `[entry+0x170]=4`/`1`-relinked entries back on the
+  free list). Candidate: `[entry+0x174]` (read by `0x1d500`, used to refill
+  `[entry+0x11c]`). Find writers.
+- Fix the watch tool so it catches single-byte ARM `strb` guest stores (so we
+  can directly watch `[entry+0x170]` writes).
+- Keep `CLICKY_EAPP_ASYNC3_COMPLETE=1` for RE; default remains reverted/golden.

@@ -82,6 +82,13 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_fc94, // completion status handoff after 0x1fc68
     0x1801_d644, // load-manager slot registration: r0=mgr, r1=index
     0x1801_d664, // dead-spin guard if entry[7]!=0 (duplicate reg)
+    0x1801_d76c, // dispatcher: pop head of pending list, link/unlink entry
+    0x1801_d8d0, // manager init (alloc 10-slot free-list)
+    0x1801_d500, // begin-load: assign slot index, set entry[7]=1 lock, call processor
+    0x1801_fe28, // I/O initiator A (read path, 0x1801d370 shared owner cb)
+    0x1801_fcc8, // I/O initiator B (read path, 0x1801d1b4 cb)
+    0x1801_fec8, // AFTER AsyncFileIO:3 store [r+4]: capture the in-flight byte
+    0x1801_fed8, // 0x1fe28 success-branch return; capture r6 (AsyncFileIO:3 result)
 ];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
@@ -4960,6 +4967,84 @@ impl Eapp {
                 // dead-spin: logged only if entry[7]!=0 on registration.
                 // If this PC fires, the guest loops here forever.
                 details.push(format!("SPIN r0={:#010x} r1={:#010x}", regs[0], regs[1]));
+            }
+            0x1801_d8d0 => {
+                // manager init: returns a freshly-allocated 10-slot array.
+                // Fires once at startup. Log nothing extra; outer info! has it.
+            }
+            0x1801_d76c => {
+                // dispatcher pops head of pending list = [mgr+0xf28]; the
+                // popped entry is at [mgr+0xf28]. If [mgr+0xf28]==0 the
+                // list is empty (returns -1, no work).  Log head entry, its
+                // [entry+0x170] in-flight flag, and [entry+0x124] (done).
+                let mgr = regs[0];
+                let head = self.read_guest_u32(mgr.wrapping_add(0xf28)).unwrap_or(0);
+                let (inf, e124, e128) = if head != 0 {
+                    (
+                        self.read_guest_u8(head.wrapping_add(0x170)).unwrap_or(0),
+                        self.read_guest_u8(head.wrapping_add(0x124)).unwrap_or(0),
+                        self.read_guest_u32(head.wrapping_add(0x128)).unwrap_or(0),
+                    )
+                } else {
+                    (0, 0, 0)
+                };
+                details.push(format!(
+                    "mgr={:#010x} head={:#010x} e[170]={:#04x} e[124]={:#04x} e[128]={:#010x}",
+                    mgr, head, inf, e124, e128
+                ));
+            }
+            0x1801_d500 => {
+                // begin-load: r0=ctx (=mgr slot[idx]). Sets entry[7]=1 lock,
+                // entry[0x11c]=[entry+0x174] (slot index), then tail-calls
+                // per-resource processor if entry[4]==0; else branch path.
+                let e = regs[0];
+                details.push(format!(
+                    "ctx={:#010x} e[4]={:#04x} e[7]={:#04x} e[174]={:#010x} e[164]={:#010x} e[168]={:#010x}",
+                    e,
+                    self.read_guest_u8(e.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(7)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x174)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x164)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x168)).unwrap_or(0)
+                ));
+            }
+            0x1801_fe28 | 0x1801_fcc8 => {
+                // I/O initiator: r0 = entry+0x16c (the request struct).
+                // Reads [entry+0x170] (==[r0+4]) as the in-flight byte;
+                // nonzero -> immediately returns 0 (busy-wait re-link).
+                let r = regs[0];
+                let entry = r.wrapping_sub(0x16c);
+                details.push(format!(
+                    "req={:#010x} entry={:#010x} [e+170]={:#04x} [r+4]={:#04x} [r+0xc]={:#010x} [r+0x10]={:#010x}",
+                    r,
+                    entry,
+                    self.read_guest_u8(entry.wrapping_add(0x170)).unwrap_or(0),
+                    self.read_guest_u8(r.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u32(r.wrapping_add(0x0c)).unwrap_or(0),
+                    self.read_guest_u32(r.wrapping_add(0x10)).unwrap_or(0)
+                ));
+            }
+            0x1801_fec8 => {
+                // Right after `strbne r0, [r4, #4]` (set [entry+0x170]=4 on
+                // success). r4 should be entry+0x16c; r6 holds our AsyncFileIO:3
+                // return value. If [e+170] != 4 here, our return is being
+                // treated as 0 / the strb doesn't fire.
+                let r = regs[0];
+                let entry = r.wrapping_sub(0x16c);
+                details.push(format!(
+                    "POST-3 r6={:#010x} [e+170]={:#04x} [r+4]={:#04x}",
+                    self.read_guest_u8(r.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(0x170)).unwrap_or(0),
+                    self.read_guest_u8(r.wrapping_add(4)).unwrap_or(0)
+                ));
+            }
+            0x1801_fed8 => {
+                // 0x1fe28 return (success branch). r6 = AsyncFileIO:3 result
+                // we returned. If r6==0, our wrapper returned 0 (fail).
+                details.push(format!(
+                    "RET r0={:#010x} r6(unused, was nonzero)={:#010x}",
+                    regs[0], regs[1]
+                ));
             }
             _ => {}
         }
