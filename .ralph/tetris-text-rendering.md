@@ -104,19 +104,19 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       consumes recorded char per draw.
 - [x] Headed Tetris regression: 0 fatals, 0 skips, draws 9-14 distinct glyphs
       on correct font atlas.
-- [ ] **Ask user to confirm visual result of the menu text.**
-- [x] Cross-game check: `0x1801616c` char-push helper is **Tetris-binary-
-      specific** (0 callers in all 5 sibling binaries — Pacman, MsPacman,
-      Holdem, Cubis2, Minigolf — each has different code at that offset).
-      The PC hook never fires for siblings → zero regression risk; the
-      `state+0x00 == 0x18023e24` vtable guard in `live_decode_generated_uvs`
-      further prevents any sibling from reaching the recorded-char path.
-      Sibling zero-UV skips (PAC-MAN `0x19`/`0x02`, etc.) are a SEPARATE
-      workstream (real missing-UV-array sprite draws / file-backed texture
-      routing), not scalar-formatter text. PAC-MAN headless smoke (25M cyc):
-      0 fatals, skip patterns identical to prior matrix baseline.
-- [ ] Cleanup: consider deprecating `live_find_texgen_text_cursor` cursor scan
-      if the recorded path fully supersedes it (keep as fallback for now).
+- [ ] **Ask user to confirm visual result of the menu text** — specifically
+      whether draws 9-14 (y≈228) show sensible glyphs and draws 21-29
+      (y≈52) read sensibly, using the artifacts above.
+- [x] ~~Cross-game check~~ (iteration 1: Tetris-scoped helper, no regression).
+- [ ] Decide: if user confirms text is right → remove cursor-scan fallback
+      & mark complete. If user says wrong → the mechanism is proven correct,
+      so the gap is char-source (r1 is right) or string composition; iterate
+      on whether pushes map 1:1 to visible draws or include non-visible
+      control pushes.
+- [ ] (Optional) Find a menu-state oracle or capture a real-device menu
+      frame to validate the exact strings; the lcd5 oracle is gameplay-only.
+- [ ] Cleanup: deprecate `live_find_texgen_text_cursor` cursor scan once the
+      recorded path is confirmed sufficient.
 
 ## Verification
 - Headed verbose log: `/tmp/tetris_run_20260621_002942.log`
@@ -132,7 +132,67 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - Cycle calibration: 60M cycles → frame 960 (~62.5k cyc/frame); menu at ~11M.
 - Golden regression baseline (pre-fix): ~4808 rasterized, ~9 skipped, 0 fatals.
 
-## Cross-game check result (this iteration)
+## Iteration 2 — mechanism verification (vision-independent) + oracle decode
+
+Doubled down on verifying the fix is *actually correct*, not just
+"produces distinct glyphs," using only logs + run-data:
+
+1. **`table_a` is a plain ASCII-order font atlas.** Confirmed by
+   correlating every consumed char's recorded `glyph_index` against its
+   ASCII code: `glyph_index == ch - 0x20` holds exactly for all 6 scalar
+   chars (`'`→7, `.`→14, `0`→16, `:`→26, `A`→33, `M`→45) and all 9 UTF-16
+   chars. So there is **no table bug**; the slot→glyph mapping is standard.
+   Decoded `f10x12text1_a8.pix` directly: it is an 8-bit indexed **BMP** (magic
+   `BM`, biBitCount=8, 1078-byte header) 980×24. Rendered the 6 consumed
+   scalar glyphs in draw order to `/tmp/font_scalar_consumed.png`.
+
+2. **Push order == draw order == left-to-right, zero drift.** The
+   `texgen_generated_uvs` log fires once per draw; matching its UV column
+   against each draw_detail's UV column gives a perfect 1:1 correlation for
+   all 6 scalar draws on frame 171 (draw9=push[0]=`'` at x=14; … draw14=
+   push[5]=`M` at x=64). Pushes repeat identically every frame across 18+
+   frames (lines 1-18 of the log = 3 clean repetitions). If push/consume
+   indices were drifting, the sequence would shift — it does not. The
+   texgen-decode mechanism is textbook-correct.
+
+3. **Actual rendered strings (computed this iteration):**
+   - Scalar path (y≈228, draws 9-14): `' : . 0 A M` → `':.'0AM`
+   - UTF-16 path (y≈52, draws 21-29): `8 9 Δ Ε A B C D E` → `89ΔΕABCDE`
+     (was `9ΔΕABCDE` via cursor-scan; the recorded path recovered the
+     dropped `8`, so it is strictly *more* correct than before.)
+   These are not English words, so they cannot be self-verified as the
+   *intended* menu strings without vision. The mechanism that produces
+   them is provably correct, but string-level ground-truth needs the
+   user's eyes.
+
+4. **Oracle decode (`tetris.raw.lcd5`):** Decoded as 16-byte header
+   (w=320,h=216,row_bytes=640,tag=`565L`) + 320×216×2 RGB565 = 138256 bytes
+   (exact). Rendered `/tmp/oracle_tetris_lcd5.png` + contrast-stretched
+   `/tmp/oracle_stretched.png` + 4× content band `/tmp/oracle_band_4x.png`.
+   Pixel analysis: 77% black; bright content only in x=64..255, y=42..210
+   with a playfield-shaped (167-px-wide) upper region and narrower
+   (60-px) lower regions. **This is a Tetris gameplay frame (well + pieces
+   + stats box), NOT the menu** — so it cannot directly validate the
+   menu text rows (9-14/21-29). It does confirm the rest of the renderer
+   produces coherent gameplay.
+
+### Honest confidence assessment
+- **Mechanism: high confidence (vision-independent proof above).** Chars
+  are read from r1 at the documented `0x1801616c` push site; table is
+  ASCII-order; push==draw==left-to-right; deterministic; UVs match.
+- **Pre→post improvement: certain.** Wrong atlas→correct atlas; 6× stale
+  `(`→6 distinct correct chars; 9 skips→0; splash fingerprint unchanged.
+- **String-level correctness of `':.'0AM` / `89ΔΕABCDE`: unverified.**
+  These need the user's visual confirmation against the real device.
+
+### Artifacts open for the user
+- `/tmp/tetris_text_fix_latest.png` — my rendered menu (post-fix)
+- `/tmp/tetris_text_prefix_baseline.png` — my rendered menu (pre-fix)
+- `/tmp/font_scalar_consumed.png` — the 6 glyphs the scalar path renders,
+  in draw order (so the user can read what `':.'0AM` looks like as glyphs)
+- `/tmp/font_f10x12_full.png` — full 980×24 font atlas (all 98+ glyphs)
+- `/tmp/oracle_stretched.png` / `/tmp/oracle_band_4x.png` — real device
+  gameplay frame (not menu; for renderer coherence reference)
 
 Scanned all 5 sibling binaries for `bl 0x1801616c` callers and for the
 Tetris text-helper signature at file offset `0x1616c`:
