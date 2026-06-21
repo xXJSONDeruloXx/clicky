@@ -921,6 +921,129 @@ Next:
 - Reverse the full `AsyncFileIO:3` request-object completion ABI before
   re-attempting label materialization, so menu entry is preserved.
 
+## Iteration 12 — fully reversed the AsyncFileIO:3 completion ABI
+
+Goal: reverse the **full** request-object completion protocol (per the
+iteration-11 reflection) so menu entry stays intact while labels materialize.
+This iteration was pure RE; no default-path change (still the iter-11 revert /
+golden).
+
+### The callback chain (fully reversed)
+
+`AsyncFileIO:3` (our handler) delivers bytes to `dest` and queues the guest
+callback `cb_pc(req, cb_ctx)` via `pending_guest_calls`. `cb_pc = [req+0x34]`
+is `0x1801fc68` for every load observed. Disassembly:
+
+```
+0x1801fc68: push {r4,r5,r6,lr}           ; r0=req, r1=ctx
+0x1801fc6c: add  r6, r0, #32             ; r6 = req+0x20
+0x1801fc70: ldm  r6, {r5,r6}             ; r5=[req+0x20]=status, r6=[req+0x24]=byte_count
+0x1801fc74: ldr  r4, [r0,#8]             ; r4 = [req+0x08] = OWNER
+0x1801fc7c: blne 0x21b20
+0x1801fc80: mov  r2,r6 ; mov r1,r5 ; mov r0,r4   ; (owner, status, byte_count)
+0x1801fc8c: pop {r4,r5,r6,lr}; nop        ; fall-through (tail-call) into 0x1801fc94
+0x1801fc94: push {r4,lr}                  ; r0=owner, r1=status, r2=byte_count
+0x1801fc98: mvn  r3,#0                   ; r3 = -1
+0x1801fc9c: mov  lr,#0
+0x1801fca0: str  r3,[r0,#8]              ; [owner+0x08] = -1   (DONE sentinel)
+0x1801fca4: strb lr,[r0,#4]              ; [owner+0x04] = 0    (clear state byte)
+0x1801fca8: ldr  ip,[r0,#12]             ; ip  = [owner+0x0c]  (owner cb)
+0x1801fcac: ldr  r3,[r0,#16]             ; r3  = [owner+0x10]  (ctx)
+0x1801fcb0: str  lr,[r0,#12] ; str lr,[r0,#16]   ; clear owner cb/ctx
+0x1801fcc0: bxne ip                      ; tail-call owner_cb(owner, status, byte_count, ctx)
+```
+
+**Key finding 1: status ([req+0x20]) is IGNORED.** `0x1801fc94` only marks the
+owner done and tail-calls the owner's callback `[[owner+0x0c]]`, forwarding
+`r1=status, r2=byte_count`. So iteration-10's `req+0x20=1` was irrelevant; only
+`req+0x24` (byte_count) mattered.
+
+**Key finding 2: one shared owner + ctx for ALL loads.** Every AsyncFileIO:3
+load uses owner `0x1001378c`, `[[owner+0x0c]] = 0x1801d370`, `[[owner+0x10]] =
+ctx = 0x10013620`. All resources funnel through one load manager.
+
+`0x1801d370(owner, status, byte_count, ctx=0x10013620)`:
+```
+0x1d3e4: ldr  r0,[r6,#8]          ; r0 = [owner+8] (= -1 done sentinel)
+0x1d3e8: add  r1, r5, #0x11c      ; r1 = ctx+0x11c
+0x1d3ec: stm  r1, {r0,r7}         ; [ctx+0x11c]=[owner+8]=-1,  [ctx+0x120]=byte_count
+0x1d3f4: strb r0(=1),[r5,#0x124]  ; [ctx+0x124] = 1
+0x1d3f8: ldr  ip,[r5,#0x164]     ; ip = [ctx+0x164] = per-resource PROCESSOR
+0x1d404: ldr  r0,[r5]             ; r0 = [ctx]         (an object ptr stored at ctx)
+0x1d408: ldr  r1,[r5,#0x120]     ; r1 = byte_count
+0x1d40c: ldr  r3,[r5,#0x168]     ; r3 = [ctx+0x168] = DESC
+0x1d414: ... bx ip               ; PROCESSOR(r0=[ctx], r1=byte_count, r2=ctx+8, r3=desc)
+```
+So byte_count lands in `[ctx+0x120]` and is passed as `r1` to the per-resource
+processor `[ctx+0x164]`. The processor and desc differ per resource type:
+
+| resource | [ctx+0x164] processor | [ctx+0x168] desc |
+|---|---|---|
+| Strings.dta | 0x18015308 | 0x1802995c (BSS) |
+| all *.pix   | 0x18019770 | per-texture (e.g. 0x1802a554) |
+
+`0x18015308` (Strings.dta processor):
+```
+0x15310: ldr  r7,[r3,#0x11c]      ; r7 = [desc+0x11c]  (a resource index/key)
+0x15318: mov  r6, r1             ; r6 = byte_count
+0x15344: bl   0x1d644            ; 0x1d644(manager, [desc+0x11c])  -- NO byte_count!
+0x1534c: str  0,[r4,#0x11c]      ; [desc+0x11c] = 0
+0x15354: strb 1,[r4,#0x120]      ; [desc+0x120] = 1  (done byte)
+0x15358: str  r6,[r4,#0x124]     ; [desc+0x124] = byte_count   <-- lands here
+0x15370: bxne [r4,#0x128]        ; tail-call [desc+0x128] 2nd-stage cb if set
+```
+`0x1d644(manager, index)` links `entry[index]` into the manager's pending list
+(an array of ten 0x184-byte/388-byte slots) at `[manager+0xf28]`, marking
+`entry[0x124]=1`, `entry[0x180]=link`. There is a **dead spinloop at 0x1d664**
+if `entry[7]!=0` (a lock/assert).
+
+### Why byte_count=N "regressed" but byte_count=0 "worked"
+
+`0x1d644` does NOT take byte_count; it takes `[desc+0x11c]`. So the only
+observable effect of byte_count is that `desc+0x124` / `ctx+0x120` become N
+instead of 0. Some later READER of those fields decides behavior:
+
+- byte_count=0 (iter-11 revert, default): reader sees 0 -> treat as "not loaded /
+  skip parse" -> localization table NOT parsed -> game takes a FALLBACK path
+  that renders the recognizable-but-label-less "menu-ish" state (clock +
+  decorative `89ΔΕABCDE`). User recognizes this as "the menu".
+- byte_count=N (iter-10): reader sees N>0 -> "loaded" -> properly parses
+  Strings.dta (labels materialize as pointer tables, confirmed iter-10) ->
+  follows the PROPER boot flow which renders the legal/loading screen first
+  -> then stalls before the legal->menu transition.
+
+So iteration-10 was actually on the CORRECT track (proper boot flow); it just
+exposed the NEXT blocker: the legal/loading screen does not advance to the
+menu. That transition is gated on something else (a dwell timer, an
+"all-resources-loaded" counter that never reaches total, or another completion
+field). The reverted default keeps the recognizable menu-ish state for now.
+
+### RE tooling added (env-gated, off by default)
+
+- `CLICKY_EAPP_ASYNC3_COMPLETE=1` re-enables the iter-10 completion-field
+  writes for RE, so the proper-boot-flow / legal screen is reproducible on
+  demand without changing the default/golden path.
+- `EAPP_ASYNC_OWNER` dumps per-load: owner, `[o+4/8/c/10]`, and `ctx+0x120/124/
+  164/168` (byte_count, done flag, processor, desc). Confirmed the shared
+  owner/ctx and the per-type processor/desc table above.
+
+### Verification
+- `cargo test -p clicky-core --lib eapp` -> 16 passed.
+- default (no env) headed smoke: 0 fatal, 0 skip, maxframe 222 (menu entry
+  intact; byte-equivalent to iter-11 revert).
+- RE runs: `/tmp/tet_iter12_owners.log`, `/tmp/tet_iter12_ctx.log`.
+
+### Next
+- The exact stall cause (who reads `desc+0x124` / `ctx+0x120` and what gates the
+  legal->menu advance) needs a write/read watchpoint on `0x10013740`
+  (ctx+0x120) and `0x18029a80` (desc+0x124) with `CLICKY_EAPP_ASYNC3_COMPLETE=1`.
+- Candidates to check: a dwell timer using `miscTBD:9` monotonic ticks; an
+  "all slots linked" counter in the manager (`[manager+0xf24]` is zeroed in init,
+  likely an active-count); or the `0x1d664` spin being hit because a slot's
+  `entry[7]` is nonzero when a duplicate registration happens.
+- Keep status writes OFF (proven irrelevant); focus only on byte_count + the
+  legal-screen advance gate when re-enabling.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded

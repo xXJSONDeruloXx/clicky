@@ -4274,19 +4274,81 @@ impl Eapp {
                             out[..n].copy_from_slice(&bytes[..n]);
                             let delivered = dest != 0 && self.write_guest_bytes(dest, &out);
                             if delivered {
-                                // NOTE: iteration 10 wrote `req+0x20 = 1` and
-                                // `req+0x24 = byte_count` here. The async
-                                // completion callback `0x1801fc68` forwards
-                                // those fields to the resource owner. Writing
-                                // them made Tetris parse `Strings.dta`
-                                // (materializing the expected menu-label
-                                // pointer tables), but it ALSO stalled the
-                                // loader on the legal/loading screen so the
-                                // game never reached the menu (regression).
-                                // Leaving them at 0 restores the menu-entry
-                                // path; the label-parse work is tracked
-                                // separately in .ralph/tetris-text-rendering.md
-                                // until the full completion ABI is reversed.
+                                // The async completion callback `0x1801fc68`
+                                // is a thin trampoline: it reads
+                                //   r5 = [req+0x20]  (status)
+                                //   r6 = [req+0x24]  (byte_count)
+                                //   r4 = [req+0x08]  (OWNER object)
+                                // and tail-calls `0x1801fc94`, which marks the
+                                // owner done ([owner+8]=-1, [owner+4]=0) and
+                                // then tail-calls the OWNER's own callback
+                                //   [owner+0x0c](owner, status, byte_count, [owner+0x10])
+                                // It is the owner callback that consumes
+                                // status/byte_count.
+                                //
+                                // Writing (status=1, byte_count=N) here made
+                                // Tetris parse `Strings.dta` (labels
+                                // materialized) but stalled the loader on the
+                                // legal/loading screen (iteration 10
+                                // regression, reverted in iteration 11). The
+                                // full owner-callback ABI is still being
+                                // reversed; default stays at 0 (golden). Set
+                                // CLICKY_EAPP_ASYNC3_COMPLETE=1 to re-enable
+                                // the iteration-10 behavior for RE.
+                                let complete = std::env::var("CLICKY_EAPP_ASYNC3_COMPLETE")
+                                    .map(|v| v == "1" || v == "true")
+                                    .unwrap_or(false);
+                                if complete {
+                                    self.write_guest_u32(req.wrapping_add(0x20), 1);
+                                    self.write_guest_u32(req.wrapping_add(0x24), n as u32);
+                                }
+                                if std::env::var_os("EAPP_ASYNC_OWNER").is_some() {
+                                    let owner =
+                                        self.read_guest_u32(req.wrapping_add(0x08)).unwrap_or(0);
+                                    let (ostate, oresult, ocb, octx) = if owner != 0 {
+                                        (
+                                            self.read_guest_u32(owner.wrapping_add(0x04)).unwrap_or(0),
+                                            self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0),
+                                            self.read_guest_u32(owner.wrapping_add(0x0c)).unwrap_or(0),
+                                            self.read_guest_u32(owner.wrapping_add(0x10)).unwrap_or(0),
+                                        )
+                                    } else {
+                                        (0, 0, 0, 0)
+                                    };
+                                    // `0x1801d370` reads the per-load processor
+                                    // from [ctx+0x164] and the load-bar/owner
+                                    // accounting from [ctx+0x11c/0x120/0x124].
+                                    // Dump them so we can follow the chain.
+                                    let (c120, c124, c164, c168) = if octx != 0 {
+                                        (
+                                            self.read_guest_u32(octx.wrapping_add(0x120)).unwrap_or(0),
+                                            self.read_guest_u32(octx.wrapping_add(0x124)).unwrap_or(0),
+                                            self.read_guest_u32(octx.wrapping_add(0x164)).unwrap_or(0),
+                                            self.read_guest_u32(octx.wrapping_add(0x168)).unwrap_or(0),
+                                        )
+                                    } else {
+                                        (0, 0, 0, 0)
+                                    };
+                                    info!(
+                                        target: "EAPP_ASYNC_OWNER",
+                                        "owner_dump frame={} req={:#010x} owner={:#010x} path={} bytes={} want={} complete={} [o+4]={:#010x} [o+8]={:#010x} [o+c]={:#010x} [o+10]={:#010x} [ctx+120]={:#010x} [ctx+124]={:#010x} [ctx+164]={:#010x} [ctx+168]={:#010x}",
+                                        self.frame_counter,
+                                        req,
+                                        owner,
+                                        host_path.display(),
+                                        n,
+                                        requested_len,
+                                        complete as u8,
+                                        ostate,
+                                        oresult,
+                                        ocb,
+                                        octx,
+                                        c120,
+                                        c124,
+                                        c164,
+                                        c168
+                                    );
+                                }
                                 info!(
                                     target: "EAPP_IMPORT",
                                     "AsyncFileIO:3 loaded {} ({} bytes, requested {}) -> guest dest {:#010x}",
