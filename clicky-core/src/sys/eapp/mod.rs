@@ -323,6 +323,27 @@ struct EappBus {
     image: Ram,
     image_len: u32,
     work_ram: Ram,
+    /// Optional write-watchpoint range (start, end exclusive). When set,
+    /// every byte write whose address falls in [start, end) is recorded to
+    /// `watch_log` tagged with `pending_pc`. Used for RE: attributing
+    /// object-field writes to the guest instruction that performed them.
+    watch: Option<(u32, u32)>,
+    /// PC of the instruction currently executing. Captured by `step()` before
+    /// `cpu.step(...)` so the bus (which only sees `&mut EappBus`) can tag
+    /// watchpoint hits. Stale by one instruction for multi-access instrs, but
+    /// close enough to locate the writer.
+    pending_pc: u32,
+    /// Accumulated write-watchpoint hits (addr, value, pc). Drained and
+    /// dumped on fatal / at end of run. Bounded; a flooded range is a sign
+    /// the watch was set too wide.
+    watch_log: Vec<WatchHit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WatchHit {
+    addr: u32,
+    val: u32,
+    pc: u32,
 }
 
 #[derive(Error, Debug)]
@@ -396,12 +417,15 @@ impl Eapp {
         let zeroes = vec![0u8; WORK_RAM_SIZE];
         work_ram.bulk_write(0, &zeroes);
 
-        Ok(Eapp {
+        let mut eapp = Eapp {
             cpu,
             bus: EappBus {
                 image: image_ram,
                 image_len: mapped_image_len as u32,
                 work_ram,
+                watch: None,
+                pending_pc: 0,
+                watch_log: Vec::new(),
             },
             metadata: image.metadata,
             header: image.header,
@@ -441,7 +465,9 @@ impl Eapp {
             staged_file_generation: 0,
             halted: false,
             live_gl: Self::maybe_init_live_gl(),
-        })
+        };
+        eapp.bus.watch = Self::parse_watch_env();
+        Ok(eapp)
     }
 
     pub fn title(&self) -> &str {
@@ -825,6 +851,10 @@ impl Eapp {
         }
         let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
         self.record_pc(pc);
+        // Surface the current PC to the bus so write-watchpoint hits can be
+        // tagged with the writer's PC. Set before `cpu.step`, which may emit
+        // memory writes for the instruction at `pc`.
+        self.bus.pending_pc = pc;
         if pc == BOOTSTRAP_RETURN_PC || (pc == 0 && self.bootstrap_phase != BootstrapPhase::Done) {
             self.handle_bootstrap_return();
             return Ok(());
@@ -928,6 +958,26 @@ impl Eapp {
                             .map(|w| format!("{:#010x}", w))
                             .collect::<Vec<_>>()
                             .join(",")
+                    );
+                }
+            }
+            // Dump the write-watchpoint log (if any) so the constructor / writer
+            // of the faulting object's fields can be identified by PC. This
+            // is the payoff of the `CLICKY_EAPP_WATCH` RE hook: every write
+            // to the watched range is shown with its guest PC, making it
+            // possible to ask "who set word 1 (refcount) but never word 0
+            // (vtable)?"
+            if !self.bus.watch_log.is_empty() {
+                warn!(
+                    target: "EAPP",
+                    "watch hits ({} total; first 64):",
+                    self.bus.watch_log.len()
+                );
+                for hit in self.bus.watch_log.iter().take(64) {
+                    warn!(
+                        target: "EAPP",
+                        "  write addr={:#010x} val={:#010x} pc={:#010x}",
+                        hit.addr, hit.val, hit.pc
                     );
                 }
             }
@@ -1078,6 +1128,24 @@ impl Eapp {
 
     fn gl_hle_enabled(&self) -> bool {
         self.live_gl.is_some()
+    }
+
+    /// Parse `CLICKY_EAPP_WATCH=0xADDR,0xLEN` into a work-RAM write-
+    /// watchpoint range `(start, end)`. Used by the in-bus watch hook to
+    /// attribute field writes to the guest instruction that performed them.
+    /// Returns `None` when unset, so default behavior is unchanged.
+    fn parse_watch_env() -> Option<(u32, u32)> {
+        let raw = std::env::var("CLICKY_EAPP_WATCH").ok()?;
+        let mut parts = raw.split(',');
+        let addr_str = parts.next()?.trim();
+        let len_str = parts.next().map(|s| s.trim()).unwrap_or("0x20");
+        let parse_num = |s: &str| -> Option<u32> {
+            let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+            u32::from_str_radix(s, 16).ok().or_else(|| s.parse::<u32>().ok())
+        };
+        let addr = parse_num(addr_str)?;
+        let len = parse_num(len_str).unwrap_or(0x20);
+        Some((addr, addr.wrapping_add(len)))
     }
 
     /// Read the experimental GL HLE env flags and construct live state only
@@ -4633,6 +4701,19 @@ impl Memory for EappBus {
     }
 
     fn w32(&mut self, offset: u32, val: u32) -> MemResult<()> {
+        if let Some((start, end)) = self.watch {
+            if (start..end).contains(&offset) {
+                self.watch_log.push(WatchHit {
+                    addr: offset,
+                    val,
+                    pc: self.pending_pc,
+                });
+                // Hard cap to avoid OOM on a flooding range.
+                if self.watch_log.len() > 4096 {
+                    self.watch_log.truncate(4096);
+                }
+            }
+        }
         match offset {
             FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
                 self.image.w32(offset - FILE_VMA_BASE, val)

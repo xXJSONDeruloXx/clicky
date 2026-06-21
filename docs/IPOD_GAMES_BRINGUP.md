@@ -1393,6 +1393,78 @@ expects the OS to participate in the teardown, and our eapp spike has no OS.
 
 The next concrete step is #3 (the write-watch), to decide between #1 and #2.
 
+### Decisive finding from the write-watch (rules out fix #1)
+
+Implemented the `CLICKY_EAPP_WATCH=0xADDR,0xLEN` env-gated write-watchpoint
+(generic RE infrastructure: `EappBus` carries an optional `(start, end)`
+range + `pending_pc` updated each `step()`, and `w32` records every in-range
+write as `(addr, val, pc)`; dumped in the fatal path). Ran the Menu crash with
+`CLICKY_EAPP_WATCH=0x100e4be0,0x660` (covers all 3 list nodes):
+
+```
+watch hits (13 total):
+  write addr=0x100e4be8 val=0x100e4c00 pc=0x18013de0   ; node0.next
+  write addr=0x100e4e08 val=0x100e4e20 pc=0x18013de0   ; node1.next
+  write addr=0x100e5028 val=0x100e5040 pc=0x18013de0   ; node2.next  ← list constructor links all 3
+  write addr=0x100e4be4 val=0x00000001 pc=0x18020650   ; node0.refcount=1
+  write addr=0x100e4e04 val=0x00000001 pc=0x18020650   ; node1.refcount=1
+  write addr=0x100e5024 val=0x00000001 pc=0x18020650   ; node2.refcount=1  ← retain/adopt
+  write addr=0x100e4be4 val=0x00000002 pc=0x18020650   ; refcount 1→2
+  ... (all 3 nodes retained twice)
+  write addr=0x100e4be4 val=0x00000001 pc=0x180206ec   ; release loop 2→1
+  ... (all 3 released)
+  write addr=0x100e4be4 val=0x00000000 pc=0x180206ec   ; release loop 1→0 → dtor → FAULT
+```
+
+**The object's word 0 (vtable) is NEVER written by anything.** Zero hits at
+`0x100e4be0`/`0x100e4e00`/`0x100e5020` (the vtable fields). The only writers
+are:
+- `0x18013de0` — the list constructor, writes the `+0x8` next-link
+- `0x18020650` — a `retain(obj, out_ptr)` routine (`ldr r2,[r0,#4]; add r2,#1;
+  str r2,[r0,#4]; strne r0,[r1]`), writes the `+0x4` refcount
+- `0x180206ec` — the crash loop's own `str r1,[r0,#4]`, decrementing refcount
+
+Decoding around the writers revealed the decisive structural fact: **there are
+TWO release functions**, and only one guards against null vtables:
+
+- `0x1802066c` — single-object `release(obj)`: `ldr r0,[r0]` (load vtable),
+  **`cmp r0,#0; beq skip_dtor`** (explicitly skips the destructor if
+  `vtable==0`), then `ldr r1,[r4,#4]; subs r1,#1; str r1,[r4,#4]; ...`.
+  This path **tolerates** null-vtable objects as a legitimate state.
+- `0x180206b0` — the list-release **loop** (the one we crash in): same
+  refcount-drop + `vtable[5]` dispatch, but **no null-vtable guard**.
+
+### Conclusion: fix shape #1 is wrong; fix shape #2 (model the OS exit) is correct
+
+The game **deliberately never sets these vtables** — they are zeroed by the
+allocator and left at 0. The safe single-release path anticipates and tolerates
+`vtable==0` (skip-dtor). The crash comes from running a *different*, un-guarded
+list-release loop that is only reachable via the Menu-hold **exit-to-shell**
+path — which on real hardware never runs, because RetailOS kills the game
+process the moment it signals exit, before the game gets to walk its own
+self-destruct path.
+
+This means:
+- Fix shape #1 (have some HLE stub populate the vtable) would be **wrong** —
+  the game doesn't expect these objects to have vtables; it expects to be
+  killed. Inventing a vtable would be guessing at a destructor that real
+  hardware never invokes.
+- Fix shape #2 (model the OS process-kill on exit) is the **accurate** fix:
+  it does exactly what real hardware does — the game signals "exit," the OS
+  terminates the process, and the post-exit teardown code never runs. Since
+  the eapp spike has no RetailOS, the eapp runtime itself must serve as the
+  OS-kill.
+
+The remaining open question for fix #2 is **how the game signals "exit to OS"**
+so we can intercept it cleanly rather than pattern-matching Tetris-specific
+teardown. Candidates to investigate next:
+- A specific `miscTBD` ordinal meaning "exit process" (the run shows
+  `miscTBD:12` and `miscTBD:14` firing in the teardown, with `r3=0x18002c5c`
+  and `r1=0x13ffecd8` — candidate exit/signal calls)
+- The Menu-hold `InputEvents:0` return path (the game may pass a quit event up)
+- The `Metadata:62`/`Metadata:134` calls right before the crash (shared
+  `r1=0x101a9a18`, `r2=0xb` — possibly a "flush and exit" metadata op)
+
 ### Diagnostics added this round (both permanent, env-gated, generic)
 
 - `fault object @r0` dump: on every fatal, reads 16 words at `r0` plus any
