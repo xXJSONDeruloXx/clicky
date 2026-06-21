@@ -65,6 +65,22 @@ const TEXT_PUSH_CHAR_PC: u32 = 0x1801_616c;
 /// Cluster-A clock formatter entry (VMA). After `cmp r3,#0; bxeq lr` guard,
 /// so r3 (time-value ptr) is non-zero here. Used by the temporary RE hook.
 const TEXT_FORMAT_TIME_ENTRY_PC: u32 = 0x1800_83b4;
+/// Env-gated guest-PC probes for the Tetris localization/async string-table
+/// path. These are reverse-engineering diagnostics only; default execution is
+/// unchanged unless `EAPP_STRING_TRACE=1` is set.
+const STRING_TRACE_PCS: &[u32] = &[
+    0x1801_d76c, // schedule pooled async/localization work item
+    0x1801_e0fc, // file-table parse step
+    0x1801_e45c, // file-table async completion trampoline
+    0x1801_e484, // file-table completion/update body
+    0x1801_e708, // resource/menu object activation
+    0x1801_f900, // menu resource array construction
+    0x1801_fa90, // menu resource lookup/dispatch entry
+    0x1801_faa8, // menu resource lookup loaded table entry
+    0x1801_fb3c, // menu resource update/ensure path
+    0x1801_fc68, // AsyncFileIO request completion callback
+    0x1801_fc94, // completion status handoff after 0x1fc68
+];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
 const TRAMPOLINE_STRIDE: u32 = 0x20;
@@ -273,6 +289,8 @@ pub struct Eapp {
     staged_files: HashMap<u32, StagedFile>,
     /// Request objects we've already dumped once, to keep logs tractable.
     dumped_requests: HashSet<u32>,
+    /// Per-PC counters for env-gated Tetris localization/string-table tracing.
+    string_trace_hits: HashMap<u32, u32>,
     /// Per-(module, ordinal) call counters, to find render-critical imports.
     import_call_counts: HashMap<(String, u32), u64>,
     /// Per-frame import counters used by the optional startup-progress trace.
@@ -467,6 +485,7 @@ impl Eapp {
             pending_guest_calls: VecDeque::new(),
             staged_files: HashMap::new(),
             dumped_requests: HashSet::new(),
+            string_trace_hits: HashMap::new(),
             import_call_counts: HashMap::new(),
             frame_import_counts: HashMap::new(),
             startup_progress: StartupProgressTrace::from_env(),
@@ -908,6 +927,15 @@ impl Eapp {
                 .position(|w| w == pat)
                 .map(|rel| start + rel)
         };
+        let find_field_end = |start: usize| -> Option<usize> {
+            if start >= buf.len() {
+                return None;
+            }
+            buf[start..]
+                .windows(2)
+                .position(|w| matches!(w, [0, b'\t'] | [0, b'\n'] | [0, 0]))
+                .map(|rel| start + rel)
+        };
         let pointer_refs = |start: u32, end: u32, limit: usize| -> Vec<String> {
             let mut refs = Vec::new();
             for off in (0..buf.len().saturating_sub(3)).step_by(4) {
@@ -942,15 +970,20 @@ impl Eapp {
                 continue;
             };
             let id_off = (id_addr - WORK_RAM_BASE) as usize;
-            let Some(tab0) = find_delim(id_off, b'\t') else {
+            let Some(tab0) = find_field_end(id_off) else {
                 continue;
             };
             let value_start = tab0 + 2;
-            let value_end = find_delim(value_start, b'\t')
-                .or_else(|| find_delim(value_start, b'\n'))
-                .unwrap_or(value_start);
-            let row_end = find_delim(value_start, b'\n').unwrap_or(value_end);
+            let value_end = find_field_end(value_start).unwrap_or(value_start);
+            let row_end = find_delim(value_start, b'\n')
+                .filter(|&end| end <= value_end)
+                .unwrap_or(value_end);
             let value = decode_utf16be(&buf[value_start..value_end]);
+            let value_preview = if value.chars().count() > 96 {
+                format!("{}…", value.chars().take(96).collect::<String>())
+            } else {
+                value.clone()
+            };
             let value_addr = WORK_RAM_BASE + value_start as u32;
             let row_end_addr = WORK_RAM_BASE + row_end as u32;
             let row_refs = pointer_refs(id_addr, row_end_addr, 16);
@@ -961,7 +994,7 @@ impl Eapp {
                 id,
                 id_addr,
                 value_addr,
-                value,
+                value_preview,
                 row_end_addr,
                 row_refs.join(","),
                 value_refs.join(",")
@@ -1084,6 +1117,8 @@ impl Eapp {
                 text_obj, time_ptr, time_val, time_val as u32
             );
         }
+
+        self.maybe_trace_string_path(pc);
 
         self.maybe_patch_guest_state(pc);
         if self.handle_guest_svc(pc) {
@@ -4233,18 +4268,25 @@ impl Eapp {
                     }
                     match fs::read(&host_path) {
                         Ok(bytes) => {
-                            let n = if want != 0 {
-                                bytes.len().min(want as usize)
-                            } else {
-                                bytes.len()
-                            };
-                            let delivered = dest != 0 && self.write_guest_bytes(dest, &bytes[..n]);
+                            let requested_len = if want != 0 { want as usize } else { bytes.len() };
+                            let n = bytes.len().min(requested_len);
+                            let mut out = vec![0u8; requested_len];
+                            out[..n].copy_from_slice(&bytes[..n]);
+                            let delivered = dest != 0 && self.write_guest_bytes(dest, &out);
                             if delivered {
+                                // Request-object callbacks read these completion fields before
+                                // notifying the owner. In particular, Tetris callback 0x1801fc68
+                                // forwards `req+0x24` as the loaded byte count. Leaving it zero
+                                // made every resource/string load look like a zero-length completion
+                                // even though the payload bytes were present at `dest`.
+                                self.write_guest_u32(req.wrapping_add(0x20), 1);
+                                self.write_guest_u32(req.wrapping_add(0x24), n as u32);
                                 info!(
                                     target: "EAPP_IMPORT",
-                                    "AsyncFileIO:3 loaded {} ({} bytes) -> guest dest {:#010x}",
+                                    "AsyncFileIO:3 loaded {} ({} bytes, requested {}) -> guest dest {:#010x}",
                                     host_path.display(),
                                     n,
+                                    requested_len,
                                     dest
                                 );
                                 self.staged_file_generation =
@@ -4259,6 +4301,8 @@ impl Eapp {
                                     },
                                 );
                             } else {
+                                self.write_guest_u32(req.wrapping_add(0x20), 0);
+                                self.write_guest_u32(req.wrapping_add(0x24), 0);
                                 warn!(
                                     target: "EAPP_IMPORT",
                                     "AsyncFileIO:3 no dest buffer for {} (want {} bytes)",
@@ -4776,6 +4820,72 @@ impl Eapp {
         true
     }
 
+    /// Env-gated Tetris localization/string-table PC trace. Logs only the
+    /// first few hits for each PC, enough to identify which suspected routines
+    /// run on the default path and what guest pointers/status fields they see.
+    fn maybe_trace_string_path(&mut self, pc: u32) {
+        if !string_trace_enabled() || !STRING_TRACE_PCS.contains(&pc) {
+            return;
+        }
+        let hit_count = {
+            let hit = self.string_trace_hits.entry(pc).or_insert(0);
+            *hit = hit.wrapping_add(1);
+            *hit
+        };
+        let limit = std::env::var_os("EAPP_STRING_TRACE_LIMIT")
+            .and_then(|v| v.to_string_lossy().parse::<u32>().ok())
+            .unwrap_or(24);
+        if hit_count > limit {
+            return;
+        }
+
+        let mode = self.cpu.mode();
+        let regs = [
+            self.cpu.reg_get(mode, 0),
+            self.cpu.reg_get(mode, 1),
+            self.cpu.reg_get(mode, 2),
+            self.cpu.reg_get(mode, 3),
+        ];
+        let mut details = Vec::new();
+        match pc {
+            0x1801_fc68 => {
+                let req = regs[0];
+                for off in [0x08, 0x14, 0x18, 0x20, 0x24, 0x34, 0x38] {
+                    details.push(format!("req+{:#04x}={:#010x}", off, self.read_guest_u32(req.wrapping_add(off)).unwrap_or(0)));
+                }
+            }
+            0x1801_fc94 | 0x1801_e0fc | 0x1801_e45c | 0x1801_e484 | 0x1801_e708 => {
+                let obj = regs[0];
+                for off in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x20, 0x24, 0x2c, 0x124, 0x128, 0x12c, 0x130] {
+                    details.push(format!("obj+{:#04x}={:#010x}", off, self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)));
+                }
+            }
+            0x1801_f900 | 0x1801_fa90 | 0x1801_faa8 | 0x1801_fb3c => {
+                let global = 0x1802_5668;
+                for off in [0x00, 0x04, 0x08] {
+                    details.push(format!("glob+{:#04x}={:#010x}", off, self.read_guest_u32(global + off).unwrap_or(0)));
+                }
+                let obj = regs[0];
+                for off in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14] {
+                    details.push(format!("r0+{:#04x}={:#010x}", off, self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)));
+                }
+            }
+            _ => {}
+        }
+        info!(
+            target: "EAPP_STRING_TRACE",
+            "pc={:#010x} hit={} frame={} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} {}",
+            pc,
+            hit_count,
+            self.frame_counter,
+            regs[0],
+            regs[1],
+            regs[2],
+            regs[3],
+            details.join(" ")
+        );
+    }
+
     /// Best-effort diagnostic dump of the AsyncFileIO request-object layout.
     /// Used to reverse-engineer where the guest expects file payload/length to
     /// be written. Logged once per request object address.
@@ -4976,6 +5086,12 @@ impl Eapp {
 
 fn texgen_verbose_enabled() -> bool {
     std::env::var_os("CLICKY_GL_TEXGEN_VERBOSE")
+        .map(|v| v.to_string_lossy() == "1")
+        .unwrap_or(false)
+}
+
+fn string_trace_enabled() -> bool {
+    std::env::var_os("EAPP_STRING_TRACE")
         .map(|v| v.to_string_lossy() == "1")
         .unwrap_or(false)
 }
