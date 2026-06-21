@@ -1302,3 +1302,107 @@ Empirical results:
 - Fix the watch tool so it catches single-byte ARM `strb` guest stores (so we
   can directly watch `[entry+0x170]` writes).
 - Keep `CLICKY_EAPP_ASYNC3_COMPLETE=1` for RE; default remains reverted/golden.
+
+## Iteration 15 — disproved dispatcher stall: real gate is frozen `splash_phase`
+
+Goal: act on iteration-14's next steps — find the field that decides a slot is
+DONE and verify whether the dispatcher keeps re-dispatching. Built richer RE
+tooling and ran a long steady-state capture; CONCLUSIVELY proved the stall is
+not in the load manager at all.
+
+### Tooling added (env-gated, off by default)
+
+- `dump_string_trace_totals(&mut self)` — emits each PC's actual hit count
+  (the per-PC log itself is throttled; the underlying counters are not).
+- `EAPP_PROGRESS`'s per-frame `startup_progress` line now appends a `trace=[...]`
+  summary of all RE-PC hit counts, so the dispatch cycle is visible per frame.
+- `dump_string_trace_totals` now also calls `drain_watch_log()`, so watches
+  fire at end-of-run even when no fatal memory fault occurs (Tetris never
+  faults, so previously the watch_log was never emitted).
+- `STRING_TRACE_PCS` dedup'd and extended with the per-resource processors:
+  `0x1801_d370` (shared owner cb), `0x1801_5308` (Strings.dta processor),
+  `0x1801_9770` (texture processor).
+- Match cases for the three new PCs dump their respective desc fields
+  (`byte_count`, `done`, `next_cb`, slot-index word).
+
+### Breakthrough 1: the dispatch cycle COMPLETES at startup; steady-state
+  dispatches NOTHING
+
+Long capture: `CLICKY_EAPP_ASYNC3_COMPLETE=1 EAPP_STRING_TRACE=1
+  EAPP_STRING_TRACE_LIMIT=10 CLICKY_STARTUP_PROGRESS_FRAMES=2000
+  CLICKY_STARTUP_PROGRESS_INTERVAL=20 --timeout 25 --headless`
+  (`/tmp/tet_iter15_long.log`, 110 frames).
+
+Per-PC totals at frame 9:
+```
+0x1801_5308=1     Strings.dta processor
+0x1801_9770=38    texture processor
+0x1801_d370=40    shared owner cb (every load)
+0x1801_d644=40    LINK fn
+0x1801_d76c=41    dispatcher (40 + 1 empty-list final)
+0x1801_d8d0=1     manager init (once)
+0x1801_fc68=40    completion trampoline
+0x1801_fc94=40    completion status handoff
+0x1801_fe28=40    I/O initiator A
+0x1801_fed8=40    success-branch return
+```
+
+At frame 100, the totals are **byte-identical** to frame 9 — every PC count is
+frozen. Iteration 13's `8421 idx=0, 7769 idx=1` count for `0x1d644` was from a
+much longer run / a different aggregate; the cycle clearly reaches steady
+state rapidly and the dispatcher (and processors) are NEVER re-entered.
+
+So **both** "dead-spin" (iter 13) and "per-frame busy-wait re-dispatch"
+(iter 14's leftover hypothesis) are disproved: the load manager drains its
+work queue correctly, all 40 resources complete, no slot is stuck in flight.
+
+### Breakthrough 2: the real legal→menu gate is a frozen splash/timer
+
+`EAPP_PROGRESS startup_progress` for frames 1..100:
+```
+  frame=1   frame_state=0
+  frame=2   frame_state=1   splash_phase=0   splash_times=[12193,12193,12193]
+  frame=10  frame_state=1   splash_phase=0   splash_times=[12193,12193,12193]
+  frame=100 frame_state=1   splash_phase=0   splash_times=[12193,12193,12193]
+```
+
+Three independent timer accumulators at splash_base+0x18/+0x1c/+0x20
+(`0x180256d4/d8/dc` in the FILE_VMA .data tail) are **frozen at one small
+value (~12K) for the entire run**. `splash_phase` (byte at 0x180256bc) never
+transitions from 0 → 1 → 2. Since `frame_state=1` (legal/loading) is gated on
+`splash_phase`, the game never advances past the legal screen.
+
+`miscTBD:9` (monotonic tick source) IS returning advancing `host_us` values
+(10K → 8.7M over the run) to its per-call args[0] pointed-at destination
+(0x100015a4 etc.), so the time SOURCE works. The problem is specifically the
+splash_times writers: either they read from a field that ISN'T advancing, or
+they set splash_times once at startup and never update it again. The byte
+write to `splash_phase` would advance the legal screen à la `splash_phase =
+splash_phase + 1` after some accumulated ticks.
+
+Static RE candidates to chase next iter:
+- Execution path that writes `splash_base+0x18/0x1c/0x20` (the splash_times)
+  and `splash_base+0x00` (phase byte). Iteration 14 found two literal-pool
+  references to `0x180256bc` at file offsets 0x5750 and 0x224d0; the second
+  is a function entry near `0x1801_224a0` (called near splash logic).
+- Look at the timer-read call sites and the routine at ``0x1801_224a0``.
+  The dispatch cycle is DONE — the stall is *_inside_* the legal-screen render
+  / phase machine, not in I/O.
+
+### Verification
+- `cargo test -p clicky-core --lib eapp` └ 16 passed.
+- default (no env) headed smoke: 0 fatal, 0 skip, maxframe 224 (golden).
+- RE runs: `/tmp/tet_iter15_full.log`, `/tmp/tet_iter15_long.log`,
+  `/tmp/tet_iter15_splashdrain.log`.
+
+### Next
+- Disassemble around `0x18000575c` (literal pool target = splash_base)
+  and `0x1801_224d0` (function near splash update logic). Find the writer/
+  reader of `0x180256bc+0x18/0x1c/0x20`.
+- Trace ALL stores to `0x18025600..0x18025700` (the whole splash BSS range)
+  (CLI: `CLICKY_EAPP_WATCH=0x18025 00,0x100`) to enumerate every writer PC.
+- Tests on `frame_state` writers (iter 9 identified `0x180051e8` sets 1,
+  `0x1800532c` sets 5, `0x18005344` sets 6): trace what gates the writer of
+  state 2 (the legalñmenu case).
+- Re-enable `byte_count` writes (iter-12 ABI) and fix the new splash gate
+  once it is identified; default stays reverted/golden.

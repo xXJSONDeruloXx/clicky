@@ -69,7 +69,7 @@ const TEXT_FORMAT_TIME_ENTRY_PC: u32 = 0x1800_83b4;
 /// path. These are reverse-engineering diagnostics only; default execution is
 /// unchanged unless `EAPP_STRING_TRACE=1` is set.
 const STRING_TRACE_PCS: &[u32] = &[
-    0x1801_d76c, // schedule pooled async/localization work item
+    0x1801_d76c, // dispatcher: pop head of pending list, link/unlink entry
     0x1801_e0fc, // file-table parse step
     0x1801_e45c, // file-table async completion trampoline
     0x1801_e484, // file-table completion/update body
@@ -78,17 +78,19 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_fa90, // menu resource lookup/dispatch entry
     0x1801_faa8, // menu resource lookup loaded table entry
     0x1801_fb3c, // menu resource update/ensure path
-    0x1801_fc68, // AsyncFileIO request completion callback
-    0x1801_fc94, // completion status handoff after 0x1fc68
-    0x1801_d644, // load-manager slot registration: r0=mgr, r1=index
+    0x1801_fc68, // AsyncFileIO request completion callback (trampoline)
+    0x1801_fc94, // completion status handoff (marks owner done)
+    0x1801_d370, // shared owner cb: store byte_count → ctx+0x120, dispatch processor
+    0x1801_d644, // load-manager LINK fn: push entry to pending list
     0x1801_d664, // dead-spin guard if entry[7]!=0 (duplicate reg)
-    0x1801_d76c, // dispatcher: pop head of pending list, link/unlink entry
     0x1801_d8d0, // manager init (alloc 10-slot free-list)
     0x1801_d500, // begin-load: assign slot index, set entry[7]=1 lock, call processor
     0x1801_fe28, // I/O initiator A (read path, 0x1801d370 shared owner cb)
     0x1801_fcc8, // I/O initiator B (read path, 0x1801d1b4 cb)
     0x1801_fec8, // AFTER AsyncFileIO:3 store [r+4]: capture the in-flight byte
     0x1801_fed8, // 0x1fe28 success-branch return; capture r6 (AsyncFileIO:3 result)
+    0x1801_5308, // Strings.dta processor (offset base path)
+    0x1801_9770, // texture processor (mirror path, +0xc offset)
 ];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
@@ -1012,6 +1014,30 @@ impl Eapp {
     }
 
     /// Scan guest work RAM for large contiguous non-zero regions and report
+    /// Dump per-PC totals from the optional RE string-path tracer. The
+    /// per-PC trace *log* is throttled by `EAPP_STRING_TRACE_LIMIT` to avoid
+    /// megabyte logs, but the underlying counters accrue all hits. This prints
+    /// those totals so we can see the actual steady-state cycle of the load
+    /// manager / dispatcher without being throttled by the log cap.
+    pub fn dump_string_trace_totals(&mut self) {
+        if string_trace_enabled() && !self.string_trace_hits.is_empty() {
+            let mut entries: Vec<(u32, u32)> =
+                self.string_trace_hits.iter().map(|(k, v)| (*k, *v)).collect();
+            entries.sort_by_key(|&(pc, _)| pc);
+            let mut out = String::from("string_trace_totals:");
+            for (pc, count) in entries {
+                out.push_str(&format!(" {:#010x}={}", pc, count));
+            }
+            info!(target: "EAPP_STRING_TRACE", "{}", out);
+        }
+        // Also dump the write-watchpoint log if any. By default it only gets
+        // emitted on a fatal memory fault, which means RE runs that don't
+        // fault never see the captured writes. Emitting here at end-of-run
+        // lets watches on normally-executing paths (e.g. splash timers in
+        // the FILE_VMA region) be inspected.
+        self.drain_watch_log();
+    }
+
     /// any whose size is plausible for a framebuffer (e.g. 320*240*2 = 153600
     /// bytes for RGB565, or *4 = 307200 for RGBA8888). Also samples the first
     /// nonzero word of each large region so we can recognise texture data.
@@ -4567,9 +4593,19 @@ impl Eapp {
             .read_guest_u32(splash_base.wrapping_add(0x20))
             .unwrap_or(0);
         let import_summary = self.format_frame_import_counts(8);
+        let trace_summary = if string_trace_enabled() && !self.string_trace_hits.is_empty() {
+            let mut entries: Vec<(u32, u32)> =
+                self.string_trace_hits.iter().map(|(k, v)| (*k, *v)).collect();
+            entries.sort_by_key(|&(pc, _)| pc);
+            entries.iter()
+                .map(|(pc, c)| format!("{:#010x}={}", pc, c))
+                .collect::<Vec<_>>().join(",")
+        } else {
+            String::new()
+        };
         info!(
             target: "EAPP_PROGRESS",
-            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}]",
+            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
             frame,
             self.host_start.elapsed().as_micros() as u64,
             fb_hash,
@@ -4593,7 +4629,8 @@ impl Eapp {
             self.guest_callback_invocation_count,
             self.async_pending_requests.len(),
             self.staged_files.len(),
-            import_summary
+            import_summary,
+            trace_summary
         );
     }
 
@@ -5044,6 +5081,52 @@ impl Eapp {
                 details.push(format!(
                     "RET r0={:#010x} r6(unused, was nonzero)={:#010x}",
                     regs[0], regs[1]
+                ));
+            }
+            0x1801_d370 => {
+                // Shared owner cb: (owner, status, byte_count, ctx). ctx=r3.
+                // Writes ctx+0x11c=[owner+8]=-1, ctx+0x120=byte_count,
+                // ctx+0x124=1; tail-calls [ctx+0x164] (processor) with
+                // (r0=[ctx], r1=byte_count, r2=ctx+8, r3=[ctx+0x168]=desc).
+                let owner = regs[0];
+                let status = regs[1];
+                let byte_count = regs[2];
+                let ctx = regs[3];
+                let processor = self.read_guest_u32(ctx.wrapping_add(0x164)).unwrap_or(0);
+                let desc = self.read_guest_u32(ctx.wrapping_add(0x168)).unwrap_or(0);
+                let idx_word = self.read_guest_u32(desc.wrapping_add(0x11c)).unwrap_or(0);
+                let idx_word_tex = self.read_guest_u32(desc.wrapping_add(0x128)).unwrap_or(0);
+                details.push(format!(
+                    "owner={:#010x} status={:#x} bc={} ctx={:#010x} proc={:#010x} desc={:#010x} d[11c]={:#x} d[128]={:#x}",
+                    owner, status, byte_count, ctx, processor, desc, idx_word, idx_word_tex
+                ));
+            }
+            0x1801_5308 => {
+                // Strings.dta processor: (r0=res_obj, r1=byte_count, r2=ctx+8,
+                // r3=desc=0x1802995c). Reads r3+0x11c=index, calls 0x1d644,
+                // writes desc+0x120=1 (done), desc+0x124=byte_count, then
+                // tail-calls desc+0x128 (2nd-stage cb) if set.
+                let desc = regs[3];
+                let index = self.read_guest_u32(desc.wrapping_add(0x11c)).unwrap_or(0);
+                let done = self.read_guest_u8(desc.wrapping_add(0x120)).unwrap_or(0);
+                let stored_bc = self.read_guest_u32(desc.wrapping_add(0x124)).unwrap_or(0);
+                let next_cb = self.read_guest_u32(desc.wrapping_add(0x128)).unwrap_or(0);
+                details.push(format!(
+                    "STRINGSPROC desc={:#010x} byte_count_in={} d[11c]=idx={} d[120]=done={} d[124]=bc={} d[128]=next_cb={:#010x}",
+                    desc, regs[1], index, done, stored_bc, next_cb
+                ));
+            }
+            0x1801_9770 => {
+                // Texture processor: mirror image with +0xc offsets.
+                // d[128]=index, d[12c]=done, d[130]=bc, d[134]=next_cb.
+                let desc = regs[3];
+                let index = self.read_guest_u32(desc.wrapping_add(0x128)).unwrap_or(0);
+                let done = self.read_guest_u8(desc.wrapping_add(0x12c)).unwrap_or(0);
+                let stored_bc = self.read_guest_u32(desc.wrapping_add(0x130)).unwrap_or(0);
+                let next_cb = self.read_guest_u32(desc.wrapping_add(0x134)).unwrap_or(0);
+                details.push(format!(
+                    "TEXPROC desc={:#010x} byte_count_in={} d[128]=idx={} d[12c]=done={} d[130]=bc={} d[134]=next_cb={:#010x}",
+                    desc, regs[1], index, done, stored_bc, next_cb
                 ));
             }
             _ => {}

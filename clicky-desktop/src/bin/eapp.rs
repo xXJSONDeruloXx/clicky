@@ -183,6 +183,7 @@ fn main() -> DynResult<()> {
                 .write_gl_trace_fixture(&path)
                 .map_err(|err| format!("failed to write GL capture {}: {}", path.display(), err))?;
         }
+        system.dump_string_trace_totals();
         if let Err(err) = result {
             return Err(format!("fatal eapp error: {:#010x?}", err).into());
         }
@@ -201,6 +202,7 @@ fn main() -> DynResult<()> {
             Some(cycles) => system.run_cycles(cycles),
             None => system.run(),
         };
+        system.dump_string_trace_totals();
         if let Err(err) = result {
             error!("fatal eapp error: {:#010x?}", err);
         }
