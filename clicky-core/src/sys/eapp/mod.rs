@@ -2028,7 +2028,6 @@ impl Eapp {
             material_epoch,
             explicit_uv_def,
             explicit_uv_enabled,
-            has_resource_upload,
         ) =
             {
                 let lg = match self.live_gl.as_ref() {
@@ -2058,8 +2057,6 @@ impl Eapp {
                     lg.current_material_epoch,
                     explicit_uv_def,
                     explicit_uv_enabled,
-                    lg.resource_uploads_by_handle
-                        .contains_key(&lg.current_handle),
                 )
             };
         let pointer_handle =
@@ -2127,6 +2124,18 @@ impl Eapp {
         } else {
             None
         };
+        // Vertex arrays are independent GL state that persists across texture
+        // (material) binds — already established for `mode=5` triangle strips
+        // (Texas Hold'em) where arrays are defined at one `159` epoch and the
+        // draw runs at the next. The same pattern occurs for `mode=7` quads in
+        // the PAC-MAN / Ms. PAC-MAN family: array 1 (UV) is defined and
+        // explicitly enabled before a `159` bind bumps the material epoch, so
+        // a strict `material_epoch` guard would reject the valid enabled UV
+        // array as "stale". After the strict path fails, retry with the
+        // epoch-agnostic decoder. Tuned titles (Tetris) always redefine
+        // arrays at the current epoch immediately before each draw, so the
+        // strict path already succeeds and the fallback never runs — no
+        // regression versus the Tetris golden fingerprint.
         let explicit = self
             .live_decode_uvs_range(
                 &explicit_uv_def,
@@ -2136,14 +2145,12 @@ impl Eapp {
                 count,
             )
             .or_else(|| {
-                has_resource_upload.then(|| {
-                    self.live_decode_uvs_range_any_epoch(
-                        &explicit_uv_def,
-                        explicit_uv_enabled,
-                        first,
-                        count,
-                    )
-                })?
+                self.live_decode_uvs_range_any_epoch(
+                    &explicit_uv_def,
+                    explicit_uv_enabled,
+                    first,
+                    count,
+                )
             });
         let solid_color = if handle == 0x3 {
             self.live_decode_solid_color(&explicit_uv_def, explicit_uv_enabled, material_epoch)

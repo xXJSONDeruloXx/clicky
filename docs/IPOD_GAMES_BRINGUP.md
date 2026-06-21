@@ -415,7 +415,7 @@ Cross-game north-star priorities from this matrix:
 1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
 2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
 3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is zero-UV triangle strips (UV decode), not tex-name association — see Holdem trace investigation.**
-4. improve UV/upload matching for zero/degenerate UV cases; Mahjong's ordinal-45 resource-upload path is now decoded enough to render its main handles; PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and remaining Tetris pointer-text misses still need work
+4. ~~improve UV/upload matching for zero/degenerate UV cases; Mahjong's ordinal-45 resource-upload path is now decoded enough to render its main handles; PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and remaining Tetris pointer-text misses still need work~~ **Partially resolved:** the `mode=7` quad strict-material-epoch guard is now relaxed to the same epoch-agnostic UV decode that already backed `mode=5` strips and `DrawElements`. PAC-MAN and Ms. PAC-MAN skip counts drop ~30%, Texas Hold'em skips drop to zero. Tetris is byte-identical (no regression). Remaining zero-UV gaps are now narrower: real missing-array cases (PAC-MAN/Ms. PAC-MAN `handle=0x2`/`0x19`, Tetris pointer-text `0x100e38e0`/`0x100e5260`, Mini Golf `handle=0x27` file-backed texture not live-uploaded). See the "Follow-up fix: relax `mode=7` quad strict-material-epoch UV guard" section below for details.
 5. ~~investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work~~ **Partially resolved for the Sims/Sudoku/Solitaire engine family:** `OpenGLES:38` is indexed triangle-strip draw; iQuiz/Vortex remain early fatal object-layout cases.
 
 Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`):
@@ -713,6 +713,67 @@ Follow-up investigation: UV/upload matching for PAC-MAN / Ms. PAC-MAN / Mini Gol
   selector finds nothing because Mini Golf uploads nothing live; a correct fix
   would route such handles to their file-backed texture rather than skipping.
   No code patched this round; evidence recorded for the UV-matching workstream.
+
+Follow-up fix: relax `mode=7` quad strict-material-epoch UV guard (PAC-MAN / Ms.
+PAC-MAN / Texas Hold'em cross-epoch UV arrays)
+
+- evidence root: `/tmp/clicky_zerouv_baseline_20260620/` (12M-cycle headless
+  baselines) + `/tmp/clicky_zerouv_trace/` (debug context around the first
+  skip in each title). Observed that PAC-MAN, Ms. PAC-MAN, and Texas Hold'em
+  all share the same pattern: an enabled `137` UV-array definition, a `159`
+  material bind (which bumps `lg.current_material_epoch`), and then `37
+  mode=7` `DrawArrays` — at which point the strict `material_epoch` guard in
+  `live_decode_uvs_range` rejects the (still-valid, still-enabled) UV array
+  as "stale" and the quad falls into `UV span None` skip.
+  - PAC-MAN `AAAAA`: 12M-cyc headless baseline showed 592 aggregate skips,
+    the dedup'd pair being `draw1/draw38 skipped: ... UV span None
+    (handle=0x19)`; debug trace confirmed `live_array idx=1 comps=2` defined
+    AND `live_enable_array idx=1` immediately before the skip.
+  - Ms. PAC-MAN `14004`: 12M-cyc baseline 21,780 aggregate skips across
+    handles `0x19` and `0x2` (no-UV `handle=0x2` remains a real gap).
+  - Texas Hold'em `33333`: 12M-cyc baseline 2,190 aggregate skips under
+    `handle=0x6` `UV span None`. The earlier `mode=5` triangle-strip fix had
+    relaxed this guard for strips; the `mode=7` quad code path had been left
+    strict.
+- root cause: the strict `material_epoch` guard in `live_decode_uvs_range`
+  was the same stale-UV heuristic that had already been identified and relaxed
+  for `mode=5` strips (Texas Hold'em) and for `DrawElements` (Sims family).
+  GL vertex arrays are persistent client state; rejecting them purely because
+  a `159` bind bumped the epoch since their last `137` redefinition was a
+  false-negative that lost real, enabled, in-bounds UV data. The only
+  existing fallback (`live_decode_uvs_range_any_epoch`) was gated behind
+  `has_resource_upload` (the Mahjong `ord45` descriptor-upload path), so the
+  PAC-MAN/Ms. PAC-MAN/Holdem engine family — which never emits `ord45` — had
+  no path to its own UVs once a `159` had bumped the epoch.
+- fix: `clicky-core/src/sys/eapp/mod.rs::live_handle_draw` (the `mode=7` quad
+  branch) now runs `live_decode_uvs_range_any_epoch` as the unconditional
+  fallback whenever the strict `live_decode_uvs_range` returns `None`, not
+  only when `has_resource_upload` is set. This matches the epoch-agnostic
+  decode already used by `live_handle_triangle_strip_draw` (`mode=5`) and
+  `live_handle_draw_elements` (`mode=38`), and matches real GL ES 1.1
+  semantics. The unused `has_resource_upload` binding has been removed.
+- validation root: `/tmp/clicky_zerouv_before/`, `/tmp/clicky_zerouv_after/`
+  (12M-cycle headless, identical env, identical cycle budget, captures
+  enabled). PNG+pixel diffs at `/tmp/clicky_zerouv_cmp/`.
+
+  | Game | 12M-cyc | 12M-cyc | nonzero pixels before→after | conclusion |
+  |      | skips   | skips   | (final captured frame, |32 RGB |            |
+  |      | before  | after   | threshold > 8 diff)        |            |
+  |---|---:|---:|---|---|
+  | `66666` Tetris     |    0 |    0 |   76770 → 76770, diff=     0 | byte-identical capture (no regression) |
+  | `AAAAA` PAC-MAN   |  592 |  426 |    5778 →  5789, diff=    11 | neutral (skip drop but minimal visual delta) |
+  | `14004` Ms.PAC-MAN| 21780| 14520 |   19427 → 35844, diff= 16233 | +85% nonzero pixels (big rasterization gain) |
+  | `33333` Texas Hold'em | 2190 | 0 | 661 → 1334, diff= 672 | +102% nonzero pixels; all `mode=7` skips eliminated |
+- remaining gaps (now narrower, not addressed in this fix):
+  - PAC-MAN / Ms. PAC-MAN handle `0x2` / `0x19` still fall through to `UV
+    span None` when no UV array is bound at all (real GL state gap, needs
+    RE of which runtime call should populate the UV array at that call site)
+  - Tetris pointer-text draws `0x100e38e0` / `0x100e5260` continue to skip on
+    the first occurrence per run when no array 1 is defined for that material
+    epoch; same root cause as before, not affected by this fix
+  - `cargo test -p clicky-core --lib` 14 passed; `cargo test -p clicky-core
+    --test eapp_gl_decode` 15 passed (Tetris frame-4 golden hash
+    `0x3514_598d_ae7f_1fe2` unchanged — confirms no Tetris regression).
 
 Code-path map for the zero-UV decode gap (future-hardening reference)
 
