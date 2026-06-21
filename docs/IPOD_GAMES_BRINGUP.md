@@ -502,6 +502,33 @@ Additional UV/upload-state evidence from Mahjong (`77777`):
   descriptor/object layout and identify the real pixel pointer / format / UV or
   texture-coordinate source.
 
+Additional lifecycle/no-draw evidence from the no-capture titles:
+
+- evidence source: `/tmp/clicky_headed_matrix_unique_20260620_201555` logs
+- `1500C` The Sims Bowling and `1500E` The Sims Pool:
+  - both run/idled through the 7s headed window with no completed draw frames
+  - both perform real uploads and array definitions
+  - representative lifecycle traces include `... 159(h0x27),149,38 ...` and
+    `... 159(h0x19),149,38 ...` instead of `OpenGLES:37`
+  - likely next renderer gap: identify ordinal `38` and/or `149` draw/state
+    semantics used by this engine family
+- `50513` Sudoku and `50514` Royal Solitaire:
+  - also perform uploads/array definitions without ordinal-37 draws
+  - traces similarly show `159(...),149,38` sequences after uploads
+  - likely shares the Sims/Solitaire-style draw/state path rather than being a
+    file or timer stall
+- `1B200` LOST:
+  - after `GL_LUMINANCE_ALPHA` support, the previous unsupported upload is gone
+  - still no completed draws; steady lifecycle is mostly `13,12,159(h0xe),157`
+  - this now looks like a missing material/surface/draw trigger rather than a
+    texture-format blocker
+- `11002` iQuiz and `12345` Vortex:
+  - still distinct early fatal memory/object-layout cases, not no-draw idles
+  - iQuiz: `FatalMemException pc=0x18001b08 kind=Write off=0x0000000c`
+  - Vortex: `FatalMemException pc=0x18014d58 kind=Write off=0x00000004`
+  - both happen after early GL setup/uploads and need separate object/runtime
+    layout investigation
+
 #### Honest status (stable but green)
 
 Running the desktop (non-headless) runner today shows a flat green window. That
