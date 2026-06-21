@@ -832,6 +832,45 @@ impl Eapp {
             .unwrap_or_else(|| host_path.display().to_string())
     }
 
+    /// Env/debug helper: scan guest work RAM for known menu strings in common
+    /// encodings. This distinguishes "strings never loaded/parsed" from
+    /// "strings exist but no draw path is issuing them" during eapp bring-up.
+    pub fn scan_for_strings(&self) {
+        let size = WORK_RAM_SIZE;
+        let mut buf = vec![0u8; size];
+        self.bus.work_ram.bulk_read(0, &mut buf);
+        let labels = ["MENU", "PLAY", "VOLUME", "OPTIONS", "RECORDS", "HELP", "EXIT"];
+        let encodings: [(&str, fn(&str) -> Vec<u8>); 3] = [
+            ("ascii", |s| s.as_bytes().to_vec()),
+            ("utf16le", |s| s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()),
+            ("utf16be", |s| s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect()),
+        ];
+        for label in labels {
+            for (enc, make_pat) in encodings {
+                let pat = make_pat(label);
+                let mut hits = Vec::new();
+                let mut pos = 0usize;
+                while let Some(rel) = buf[pos..].windows(pat.len()).position(|w| w == pat) {
+                    let off = pos + rel;
+                    hits.push(WORK_RAM_BASE + off as u32);
+                    pos = off + 1;
+                    if hits.len() >= 8 {
+                        break;
+                    }
+                }
+                if !hits.is_empty() {
+                    info!(
+                        target: "EAPP",
+                        "string_scan label={} enc={} hits={:?}",
+                        label,
+                        enc,
+                        hits
+                    );
+                }
+            }
+        }
+    }
+
     /// Scan guest work RAM for large contiguous non-zero regions and report
     /// any whose size is plausible for a framebuffer (e.g. 320*240*2 = 153600
     /// bytes for RGB565, or *4 = 307200 for RGBA8888). Also samples the first
@@ -3820,10 +3859,48 @@ impl Eapp {
         active
     }
 
-    fn handle_settings_import(&mut self, ordinal: u32, _args: [u32; 4]) -> u32 {
+    fn handle_settings_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
         match ordinal {
-            // Commonly-polled language / region / time-format values.
-            0 => 0, // en_US-ish default
+            // Settings:0 is a scalar setting query. Tetris calls it as
+            //   Settings:0(key_cstr, out_value_ptr, size_ptr)
+            // e.g. key="Language", with *size_ptr initialized to 4, then treats
+            // return >= 0 as success and reads *out_value_ptr. Leaving the out
+            // value untouched makes the guest use stack garbage as a language
+            // index, which corrupts localization string selection.
+            0 => {
+                let key = self
+                    .try_read_c_string(args[0], 64)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let value = match key.as_str() {
+                    // Guest language enum (not yet proven to be the same as
+                    // Strings.dta column order). Default to 0, but allow quick
+                    // RE/brute-force from the environment.
+                    "Language" => std::env::var("CLICKY_EAPP_LANGUAGE")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(0),
+                    // Conservative default for other scalar settings until
+                    // their exact value domains are reverse-engineered.
+                    _ => 0u32,
+                };
+                if args[1] != 0 {
+                    self.write_guest_u32(args[1], value);
+                }
+                if args[2] != 0 {
+                    // Preserve/confirm the caller-provided scalar byte size.
+                    self.write_guest_u32(args[2], 4);
+                }
+                info!(
+                    target: "EAPP_IMPORT",
+                    "Settings:0 key={} value={} out={:#010x} size={:#010x}",
+                    key,
+                    value,
+                    args[1],
+                    args[2]
+                );
+                0
+            }
+            // Commonly-polled region / time-format values. Return default 0.
             1 => 0,
             2 => 0,
             _ => 0,

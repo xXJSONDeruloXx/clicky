@@ -175,6 +175,9 @@ fn main() -> DynResult<()> {
         if std::env::var("EAPP_RAMSCAN").is_ok() {
             system.scan_for_framebuffer();
         }
+        if std::env::var("EAPP_STRING_SCAN").is_ok() {
+            system.scan_for_strings();
+        }
         if let Some(path) = capture_path {
             system
                 .write_gl_trace_fixture(&path)

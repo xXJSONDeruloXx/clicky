@@ -115,15 +115,28 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       value. Pivoted to the time-value workstream below.
 - [ ] **Find what writes the time value at guest `0x1005f780`** (svc? struct
       init?) and provide a valid iPod system-clock value so the formatter
-      produces real digits. NEW top-priority item (separate RTC/time-emulation
-      workstream, upstream of the text renderer).
-- [ ] Re-run headed after the time value is sane; the scalar bottom row
-      should then read a real `H:MM AM` instead of `':.'0AM`.
-- [ ] (Optional) Find a menu-state oracle or capture a real-device menu
-      frame to validate the exact strings; the lcd5 oracle is gameplay-only.
-- [ ] Cleanup: once the time value is sane AND user confirms UTF-16 row,
-      deprecate `live_find_texgen_text_cursor` cursor scan and remove the
-      temporary `TEXT_FORMAT_TIME_ENTRY_PC` / `take_text_char_diag` RE hooks.
+      produces real digits. Top-priority clock item (separate RTC/time-emulation
+      workstream, upstream of text decode).
+- [x] **Fix wrong menu-layer texture selection.** Iteration 4: all A8 uploads
+      are tagged with ambiguous tex_name `0x8`; blindly choosing the latest
+      upload forced menu/spinner/background strips to `f16x16menu3_a8` (Japanese
+      glyph sheet). Added UV-containment + same-tex-name fallback so draw1 uses
+      `screenBG_565`, spinner draws use `spinner*_a8`, draw7/17 use `menus_a8`,
+      and draw5/6 use `arrows_a8` instead of `f16x16menu3`/`eaLogo`.
+- [ ] **Find why expected menu labels are not issued as draws.** User supplied
+      oracle shows expected English menu labels (`MENU`, `PLAY`, `VOLUME`,
+      `OPTIONS`, `RECORDS`, `HELP`, `EXIT`). After texture-selection fix the
+      background/strips are correct, but steady frames still only push/draw the
+      decorative/sample text `89/ABCDE` and the bad clock `':.0AM`; no menu-label
+      strings are emitted through `0x1801616c` and no other label draw path is
+      currently visible. `EAPP_STRING_SCAN=1` confirms expected labels exist
+      only in raw `Strings.dta` buffer, not in parsed/draw cache.
+- [ ] Re-run headed after the time value and menu-label issuance are fixed;
+      scalar clock should read a real `H:MM AM` and the menu should match the
+      user oracle screenshot.
+- [ ] Cleanup: once the time value + labels are sane, deprecate
+      `live_find_texgen_text_cursor` cursor scan and remove temporary RE hooks
+      (`TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`, `scan_for_strings`).
 
 ## Verification
 - Headed verbose log: `/tmp/tetris_run_20260621_002942.log`
@@ -309,6 +322,82 @@ sprite/background draws missing UV data, not scalar-formatter text). Resolving
 them belongs to the zero-UV decode workstream noted in the prior
 `eapp-matrix-hardening` loop, not this text-rendering fix.
 
+## Iteration 4 — user oracle + texture-selection fix (major visual improvement, labels still absent)
+
+User supplied a visual oracle:
+- current bad screenshot: `/var/folders/_h/z9vz7mfx48b1fp6z1y0srbdm0000gn/T/pi-clipboard-9099c439-b111-47a0-8676-7fbb5a80bf39.png`
+- expected menu screenshot: `/var/folders/_h/z9vz7mfx48b1fp6z1y0srbdm0000gn/T/pi-clipboard-8bb3a0ac-8861-4726-9c09-3f730628fded.png`
+Expected shows the real English menu labels (`MENU`, `PLAY`, `VOLUME`,
+`OPTIONS`, `RECORDS`, `HELP`, `EXIT`). This disproved the previous "UTF-16 row
+is probably fine" assumption: `89/ABCDE` is not intended menu text.
+
+What iteration 4 found/fixed:
+
+1. **`89/ABCDE` is a deliberate decorative/font-sample string, not a
+   localization label.** Watchpoint on its UTF-16 buffer (`0x101a76c0`) shows PC
+   `0x18018f70` copying it from a guest-built sample table. The routine fills
+   ranges (`A-Z`, accented/Japanese-ish glyphs, digits, Greek Δ/Ε) and copies a
+   9-char sliding window. So this string is guest-authored, but it is not the
+   menu labels from the oracle.
+
+2. **The ugly Japanese/gibberish background was mostly wrong texture selection.**
+   All A8 assets are uploaded with ambiguous tex_name `0x8`:
+   `menus_a8`, `spinner*`, `scanlines`, `arrows`, `f10x12`, `f13x13`,
+   `f16x16menu{1,2,3}`, etc. The old draw selection blindly preferred the latest
+   upload for tex_name `0x8`, so steady menu draws 2-7/17 all sampled
+   `f16x16menu3_a8.pix` (Japanese glyph atlas), even when the UV extents exceeded
+   that texture's 32px height. This exactly matched the user's current screenshot.
+
+3. **Implemented a general upload-selection fix.** For UV-backed draws, a
+   tex-name match only wins if the selected upload can contain the draw's UV
+   extents. If not, selection falls back first among uploads with the same
+   tex_name by exact dimensions / smallest-containing, then to the old generic
+   UV/dim heuristic. This fixes ambiguous texture-name reuse without hardcoding
+   Tetris assets.
+
+   Post-fix steady frame selection (headed/headless):
+   - draw1: `screenBG_565.pix` (was `matrix_565.pix`)
+   - draws2-4: `spinner_a8`, `spinner2_a8`, `spinner3_a8` (was `f16x16menu3`)
+   - draws5-6: `arrows_a8` (was `f16x16menu3`, then briefly `eaLogo` before the
+     same-tex-name fallback refinement)
+   - draws7/17: `menus_a8.pix` (was `f16x16menu3`)
+   - logo/text/battery remain on their expected assets
+
+   Captured post-fix menu frame: `/tmp/tetris_post_texselect_latest.png`.
+   It is visually much closer (correct blue background/strips/logo), but still
+   lacks the English option labels and still has the bad clock/sample text.
+
+4. **Fixed Settings:0 scalar-output ABI.** Tetris calls
+   `Settings:0("Language", out_value_ptr, size_ptr)` and then reads
+   `*out_value_ptr` on success. The previous stub returned success but left the
+   output stack word uninitialized. Now it writes a scalar default (env-overridable
+   via `CLICKY_EAPP_LANGUAGE`, default 0) and confirms size=4. This did not by
+   itself make labels appear, but it removes one real source of guest stack
+   garbage.
+
+5. **String scan result:** `EAPP_STRING_SCAN=1` finds `MENU/PLAY/VOLUME/...`
+   only inside the raw `Strings.dta` buffer loaded at `0x10003620..0x10010532`.
+   No parsed UTF-16LE draw/cache copy was found at steady menu frame. Current
+   frames only call the text helper for:
+   - clock: `':.0AM` (known bad upstream time value)
+   - decorative/sample: `89/ABCDE`
+   Therefore the remaining label problem is **not glyph table/atlas selection**;
+   the guest is not issuing expected menu-label draws in this state/path.
+
+Verification:
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- headed run `/tmp/tet_texselect_fix_headed.log`: 0 skipped, 3834 rasterized,
+  selected assets match the corrected list above.
+
+Next:
+- Find why the main menu label objects are not created/issued (state/input/API
+  issue, not renderer glyph decode). Look at unimplemented/suspicious runtime
+  APIs (`miscTBD:13`, async request completion fields, possible string-table
+  parse callbacks) and compare expected label strings from `Strings.dta` against
+  guest callsites that should request them.
+- Separately fix clock source at `0x1005f780` so `':.0AM` becomes valid time.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
@@ -318,13 +407,19 @@ char seq; push==consume; ASCII-order table; glyphs OCR-verified; UVs match;
 The scalar clock path still renders `':.'0AM`, but iteration 3 **proved this
 is not a renderer bug**: the guest's time value at `0x1005f780` is garbage
 (-1,607,505,680), so the formatter's signed-digit arithmetic underflows to
-`'`/`.`. Fixing this requires emulating the iPod system clock (a separate
-RTC/time-emulation workstream, upstream of the text renderer). The UTF-16
-mid-row `89ΔΕABCDE` is a memory string literal (not garbage-driven) and
-likely correct; user eyes still welcome to confirm.
+`'`/`.`. Fixing this requires emulating the iPod system clock (separate
+RTC/time-emulation workstream, upstream of the text renderer).
 
-Bottom line: the text-rendering task itself is done; only the upstream
-time-value sourcing remains, which belongs to a different workstream.
+User's visual oracle also proved the 9-char `89ΔΕABCDE`/`89/ABCDE` row is not
+intended menu-label text. Iteration 4 showed it is a deliberate decorative /
+font-sample string. The actual expected menu labels are still **not issued as
+text draws** in the current guest state/path. Iteration 4 fixed the major
+wrong-texture issue that made menu layers sample the Japanese glyph atlas, but
+remaining work is to find why label objects/strings are not built or drawn.
+
+Bottom line: glyph decode and texture asset selection are now much stronger;
+remaining visible gaps are upstream guest state/API issues: (1) RTC/time value,
+(2) main-menu label issuance/string-table path.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader

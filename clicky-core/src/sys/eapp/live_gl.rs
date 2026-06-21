@@ -586,6 +586,36 @@ impl LiveGlState {
             .map(|u| u.index)
     }
 
+    /// Select a live texture by texture name only if the chosen upload can
+    /// contain the supplied texel-centered UV extents. Some Tetris A8 resources
+    /// are all tagged with the same small texture name (`0x8`); blindly picking
+    /// the latest matching name pins unrelated menu/spinner draws to the last
+    /// uploaded font sheet. Rejecting non-containing uploads lets the existing
+    /// UV/dimension fallback choose the intended resource.
+    fn select_upload_by_tex_name_containing_slice(
+        &self,
+        tex_name: u32,
+        uvs: &[(f32, f32)],
+    ) -> Option<usize> {
+        let (_min_u, _min_v, max_u, max_v) = uv_extents_slice(uvs);
+        let need_w = max_u.ceil().max(1.0) as usize;
+        let need_h = max_v.ceil().max(1.0) as usize;
+        self.select_upload_by_tex_name(tex_name).filter(|idx| {
+            self.uploads
+                .get(*idx)
+                .map(|u| u.width >= need_w && u.height >= need_h)
+                .unwrap_or(false)
+        })
+    }
+
+    fn select_upload_by_tex_name_containing(
+        &self,
+        tex_name: u32,
+        uvs: &[(f32, f32); 4],
+    ) -> Option<usize> {
+        self.select_upload_by_tex_name_containing_slice(tex_name, uvs)
+    }
+
     /// Select a live texture for the supplied texel-centered UVs. Full-texture
     /// quads match by exact UV span; atlas sub-rects (e.g. Tetris menu A8
     /// strips) match the smallest decoded upload that contains the UV extents.
@@ -602,6 +632,32 @@ impl LiveGlState {
         }
 
         self.select_smallest_containing_upload(max_u, max_v)
+    }
+
+    fn select_upload_for_uv_slice_with_tex_name(
+        &self,
+        tex_name: u32,
+        uvs: &[(f32, f32)],
+    ) -> Option<usize> {
+        let (min_u, min_v, max_u, max_v) = uv_extents_slice(uvs);
+        let span_w = (max_u - min_u).round().max(1.0) as usize;
+        let span_h = (max_v - min_v).round().max(1.0) as usize;
+        if let Some(idx) = self
+            .uploads
+            .iter()
+            .rev()
+            .find(|u| {
+                u.texture.is_some()
+                    && u.tex_name == Some(tex_name)
+                    && u.width == span_w
+                    && u.height == span_h
+            })
+            .map(|u| u.index)
+        {
+            return Some(idx);
+        }
+
+        self.select_smallest_containing_upload_with_tex_name(tex_name, max_u, max_v)
     }
 
     /// Generated text UVs describe one glyph cell inside a font atlas. Prefer
@@ -642,6 +698,26 @@ impl LiveGlState {
             .map(|u| u.index)
     }
 
+    fn select_smallest_containing_upload_with_tex_name(
+        &self,
+        tex_name: u32,
+        max_u: f32,
+        max_v: f32,
+    ) -> Option<usize> {
+        let need_w = max_u.ceil().max(1.0) as usize;
+        let need_h = max_v.ceil().max(1.0) as usize;
+        self.uploads
+            .iter()
+            .filter(|u| {
+                u.texture.is_some()
+                    && u.tex_name == Some(tex_name)
+                    && u.width >= need_w
+                    && u.height >= need_h
+            })
+            .min_by_key(|u| (u.width * u.height, u.index))
+            .map(|u| u.index)
+    }
+
     /// Rasterize one draw into the internal framebuffer using the existing
     /// rasterizer. Returns the produced `LiveDrawRecord`.
     pub fn rasterize_draw(
@@ -666,10 +742,11 @@ impl LiveGlState {
         };
 
         let selected_upload = if has_uv && used_generated_uvs && (0x1000_0000..0x1080_0000).contains(&handle) {
-            self.select_upload_by_tex_name(handle)
+            self.select_upload_by_tex_name_containing(handle, &uvs)
                 .or_else(|| self.select_upload_for_generated_text_uvs(&uvs))
         } else if has_uv {
-            self.select_upload_by_tex_name(handle)
+            self.select_upload_by_tex_name_containing(handle, &uvs)
+                .or_else(|| self.select_upload_for_uv_slice_with_tex_name(handle, &uvs))
                 .or_else(|| self.select_upload_for_uvs(&uvs))
         } else {
             self.select_upload_by_tex_name(handle)
@@ -759,7 +836,8 @@ impl LiveGlState {
         let uvs4 = uvs.map(first_four_uvs).unwrap_or([(0.0, 0.0); 4]);
         let inferred_dim = uvs.map(infer_dims_from_uv_slice);
         let selected_upload = uvs
-            .and_then(|_| self.select_upload_by_tex_name(handle))
+            .and_then(|uvs| self.select_upload_by_tex_name_containing_slice(handle, uvs))
+            .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice_with_tex_name(handle, uvs)))
             .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs)));
         let mut record = LiveDrawRecord {
             draw_index,
@@ -1080,6 +1158,95 @@ mod tests {
         ));
         let menu_strip_uvs = [(0.5, 37.5), (0.5, 3.5), (308.5, 3.5), (308.5, 37.5)];
         assert_eq!(lg.select_upload_for_uvs(&menu_strip_uvs), Some(1));
+    }
+
+    #[test]
+    fn tex_name_match_must_contain_uvs_before_it_wins() {
+        let mut lg = LiveGlState::new(true, false, false);
+        // Intended menu strip upload.
+        lg.uploads.push(LiveGlState::build_upload(
+            0,
+            0x0de1,
+            320,
+            99,
+            0x1906,
+            0x1401,
+            0x1000_0000,
+            &vec![0xff; 320 * 99],
+            Some(0x8),
+        ));
+        // Later A8 font upload with the same ambiguous tex name; this was
+        // incorrectly selected for menu-strip UVs even though height 32 cannot
+        // contain v=60.5.
+        lg.uploads.push(LiveGlState::build_upload(
+            1,
+            0x0de1,
+            1568,
+            32,
+            0x1906,
+            0x1401,
+            0x1000_0010,
+            &vec![0xff; 1568 * 32],
+            Some(0x8),
+        ));
+        let menu_strip_uvs = [(0.5, 60.5), (0.5, 39.5), (310.5, 39.5), (310.5, 60.5)];
+        assert_eq!(lg.select_upload_by_tex_name(0x8), Some(1));
+        assert_eq!(lg.select_upload_by_tex_name_containing(0x8, &menu_strip_uvs), None);
+        assert_eq!(
+            lg.select_upload_by_tex_name_containing(0x8, &menu_strip_uvs)
+                .or_else(|| lg.select_upload_for_uv_slice_with_tex_name(0x8, &menu_strip_uvs))
+                .or_else(|| lg.select_upload_for_uvs(&menu_strip_uvs)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn same_tex_name_uv_fallback_beats_unrelated_exact_dimensions() {
+        let mut lg = LiveGlState::new(true, false, false);
+        // Unrelated exact 50x50 upload with another tex name (EA logo).
+        lg.uploads.push(LiveGlState::build_upload(
+            0,
+            0x0de1,
+            50,
+            50,
+            0x1908,
+            0x8034,
+            0x1000_0000,
+            &vec![0xff; 50 * 50 * 2],
+            Some(0x1b),
+        ));
+        // Same-name A8 upload that contains the 50x50 UVs (e.g. arrows sheet).
+        lg.uploads.push(LiveGlState::build_upload(
+            1,
+            0x0de1,
+            52,
+            100,
+            0x1906,
+            0x1401,
+            0x1000_1000,
+            &vec![0xff; 52 * 100],
+            Some(0x8),
+        ));
+        // Latest same-name upload cannot contain v=50.5.
+        lg.uploads.push(LiveGlState::build_upload(
+            2,
+            0x0de1,
+            1568,
+            32,
+            0x1906,
+            0x1401,
+            0x1000_2000,
+            &vec![0xff; 1568 * 32],
+            Some(0x8),
+        ));
+        let uvs = [(0.5, 49.5), (0.5, -0.5), (50.5, -0.5), (50.5, 49.5)];
+        assert_eq!(lg.select_upload_for_uvs(&uvs), Some(0));
+        assert_eq!(
+            lg.select_upload_by_tex_name_containing(0x8, &uvs)
+                .or_else(|| lg.select_upload_for_uv_slice_with_tex_name(0x8, &uvs))
+                .or_else(|| lg.select_upload_for_uvs(&uvs)),
+            Some(1)
+        );
     }
 
     #[test]
