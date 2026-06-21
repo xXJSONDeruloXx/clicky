@@ -150,9 +150,12 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       Iteration 8 also root-caused the scripted `menu` input fatal at
       `0x180206fc` to the existing placeholder resource-slot patch creating
       zero-vtable fake refcounted objects; placeholders now get the guest's
-      minimal base vtable/refcount so release is safe. The input no longer
-      fatals, but it transitions to `frame_state=6` with drawless GL:157-only
-      frames, so input/default-state ABI work is still open.
+      minimal base vtable/refcount so release is safe. Iteration 9 fixed direct
+      `AsyncFileIO:12/14/16` handle semantics and zero-fills the post-Menu
+      `prefs.sav` read buffer, but this still does not materialize labels. The
+      post-Menu `frame_state=6` transition is now traced to the scripted `menu`
+      event id mapping: event id 1 maps to guest bit `0x10`, calls `0x5034`,
+      then `0x4088` returns state 5 and the frame state advances to 6.
 - [ ] Re-run headed after menu-label issuance is fixed; clock already reads a
       real `H:MM AM`, but the menu still needs to match the user oracle labels.
 - [ ] Cleanup: once labels are sane, deprecate `live_find_texgen_text_cursor`
@@ -683,6 +686,76 @@ Next:
 - Keep tracing localization/string lookup from IDs/row indices; the 4096-zero
   save experiment disproved the simplest short-read theory.
 
+## Iteration 9 — direct AsyncFileIO handle semantics + post-Menu state explained
+
+Work completed this iteration:
+
+1. **Reversed and fixed the direct `AsyncFileIO:12/14/16` wrapper path.** Static
+   RE of the guest wrappers shows:
+   - `0x6068` calls ordinal 12 as `AsyncFileIO:12(mode, path, file_obj, cb)`;
+     it writes the import return to `[file_obj+4]` as an open/status code.
+   - The actual guest-visible handle is `file_obj[0]`, written through `r2`.
+   - `0x603c` polls ordinal 16 when `[file_obj+4]` is `0` or `5`.
+   - `0x609c` calls ordinal 14 as `AsyncFileIO:14(handle, buffer, len)`.
+
+   The previous emulation returned handle `1` from ordinal 12, accidentally
+   making both `[file_obj+0]` and `[file_obj+4]` equal `1`, and ordinal 14 only
+   returned `len` without writing the buffer. The implementation now tracks
+   synthetic open handles, returns status `0` from ordinal 12, returns ready
+   status `1` from ordinal 16, and makes ordinal 14 copy the tracked host file
+   bytes into the guest buffer with zero-fill for short reads.
+
+2. **Retested post-Menu save read with real buffer writes.** Replay log:
+   `/tmp/tet_iter9_direct_async14.log`.
+
+   Observed sequence:
+   - `AsyncFileIO:12 path=prefs.sav` → `handle 1 status=0`
+   - `AsyncFileIO:16 handle=1 known=true`
+   - `AsyncFileIO:14 handle=1 ... buffer=0x101a99a0 len=79 file_bytes=0 delivered=true`
+
+   Result: still 0 fatal / 0 skipped, but still no expected labels; the run
+   still transitions to `frame_state=6` and drawless GL:157 frames. So stale
+   direct-read buffer contents were a real ABI bug, but not the label blocker.
+
+3. **Explained the post-Menu `frame_state=6` transition.** A graceful `--cycles`
+   watch run (`/tmp/tet_iter9_frame_state_watch_cycles.log`) on
+   `frame_context=0x100035a0` showed:
+   - `frame_context[0]=1` at `pc=0x180051e8`
+   - `frame_context[0]=5` at `pc=0x1800532c`
+   - `frame_context[0]=6` at `pc=0x18005344` and `pc=0x18005358`
+   - `frame_context+0x20` event mask `0xe` at `pc=0x18005df8`
+
+   Static RE ties this to the input-event mapping, not save I/O: the scripted
+   `menu` event emits event id 1; the guest event mapper at `0x5630..0x5698`
+   maps id 1 to bit `0x10`; callsites `0x125fc` / `0x15874` call `0x5034` when
+   bit `0x10` is present; then `0x4088` returns state `5`, and the frame state
+   advances to `6`. In other words, the old crash is fixed and the remaining
+   drawless state is the guest's response to our provisional `menu` event id,
+   not evidence that `AsyncFileIO:14` is still broken.
+
+Verification:
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- `cargo fmt --check -p clicky-core` still reports broader pre-existing repo
+  formatting drift, so no cargo-fmt churn was applied.
+- Headed default smoke after the AsyncFileIO fix:
+  `/tmp/tet_iter9_headed_direct_async.log`, capture dir
+  `/tmp/tetris_capture_20260621_092314`
+  - 0 fatal lines, 0 skipped lines, 3650 rasterized lines.
+  - Text still only real clock (`9:23AM`) plus decorative `89ΔΕABCDE`.
+  - No direct `AsyncFileIO:12/14/16` calls on the default no-input path.
+
+Next:
+
+- Stop treating scripted `menu:...` as a likely path to the expected main-menu
+  labels; it drives guest bit `0x10` / state 6. If input testing remains useful,
+  map event ids 2..5 to their semantic actions first.
+- Return to the core label blocker: localization/menu label issuance is absent
+  in the default steady state even with texture, clock, placeholders, and direct
+  save reads fixed.
+- Continue tracing from string IDs / row lookup routines rather than save short
+  reads.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
@@ -702,14 +775,13 @@ text draws** in the current guest state/path. Iteration 7 tightened this:
 refs into those rows/value spans exist at scan time, language-index brute force
 does not reveal labels, and long no-input runs never emit them.
 
-Bottom line: glyph decode, texture asset selection, clock time source, and the
-placeholder-resource input null-deref are now fixed. Remaining visible gap is
-upstream guest state/API for main-menu label issuance/string-table path. The
-4096-zero save experiment did not produce labels, so the best next leads are:
-(1) reverse proper save/open/read/write semantics around `AsyncFileIO:12/14`,
-especially the post-Menu `AsyncFileIO:14(handle=1, buffer=0x101a99a0, len=79)`;
-(2) debug the new post-input `frame_state=6` / drawless `GL:157` state; and
-(3) continue localization lookup tracing from IDs/row indices.
+Bottom line: glyph decode, texture asset selection, clock time source,
+placeholder-resource release safety, and direct `AsyncFileIO:12/14/16` handle
+semantics are now fixed. The post-Menu `frame_state=6` path is explained as the
+provisional `menu` event id mapping to guest bit `0x10`, not as a save-read
+failure. Remaining visible gap is still upstream guest state/API for main-menu
+label issuance/string-table path: expected rows exist in `Strings.dta`, but the
+default steady state never materializes or draws them.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader

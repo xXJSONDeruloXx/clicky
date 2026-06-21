@@ -296,6 +296,11 @@ pub struct Eapp {
     async_callback_queued_count: u64,
     guest_callback_invocation_count: u64,
     async_pending_requests: HashSet<u32>,
+    /// Synthetic handles returned by direct AsyncFileIO open/read wrappers
+    /// (ordinals 12/14/16). Keyed by the small guest-visible handle written
+    /// into the caller's file object.
+    async_open_files: HashMap<u32, PathBuf>,
+    next_async_file_handle: u32,
     /// Optional inclusive frame window in which to log every OpenGLES call
     /// with full args + return address, for reverse-engineering the GL stream.
     gl_trace_frames: Option<(u64, u64)>,
@@ -478,6 +483,8 @@ impl Eapp {
             async_callback_queued_count: 0,
             guest_callback_invocation_count: 0,
             async_pending_requests: HashSet::new(),
+            async_open_files: HashMap::new(),
+            next_async_file_handle: 1,
             gl_trace_frames: None,
             gl_capture: None,
             staged_file_generation: 0,
@@ -4114,17 +4121,55 @@ impl Eapp {
     }
 
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
-        // Observed after Tetris menu input: ordinal 14 is used with a numeric
-        // file handle and a guest buffer/length, not with a path string. Treat
-        // it as a successful synchronous byte-count operation for now so menu
-        // input does not fall into an error path after opening prefs.sav.
+        // Direct file-handle read path. Tetris reaches this after a Menu input:
+        // wrapper 0x609c calls AsyncFileIO:14(handle, buffer, len) after
+        // wrapper 0x6068 opened `prefs.sav` with ordinal 12. Earlier emulation
+        // only returned `len`, which meant the guest buffer stayed stale even
+        // though the call looked successful. Copy the tracked host bytes into
+        // the guest buffer and zero-fill short reads so successful reads do not
+        // expose uninitialized guest memory.
         if ordinal == 14 {
-            if args[0] == u32::MAX {
-                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 called with invalid handle args=[{:#010x},{:#010x},{:#010x},{:#010x}]", args[0], args[1], args[2], args[3]);
+            let handle = args[0];
+            let buffer = args[1];
+            let len = args[2] as usize;
+            if handle == u32::MAX || buffer == 0 {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 called with invalid args=[{:#010x},{:#010x},{:#010x},{:#010x}]", args[0], args[1], args[2], args[3]);
                 return 0;
             }
-            info!(target: "EAPP_IMPORT", "AsyncFileIO:14 handle={} buffer={:#010x} len={}", args[0], args[1], args[2]);
-            return args[2];
+            let Some(host_path) = self.async_open_files.get(&handle).cloned() else {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 unknown handle={} buffer={:#010x} len={}", handle, buffer, len);
+                return 0;
+            };
+            let bytes = fs::read(&host_path).unwrap_or_else(|e| {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 read error for {}: {}", host_path.display(), e);
+                Vec::new()
+            });
+            let n = bytes.len().min(len);
+            let mut out = vec![0u8; len];
+            out[..n].copy_from_slice(&bytes[..n]);
+            let delivered = self.write_guest_bytes(buffer, &out);
+            info!(
+                target: "EAPP_IMPORT",
+                "AsyncFileIO:14 handle={} path={} buffer={:#010x} len={} file_bytes={} delivered={}",
+                handle,
+                host_path.display(),
+                buffer,
+                len,
+                bytes.len(),
+                delivered
+            );
+            return if delivered { n as u32 } else { 0 };
+        }
+
+        // Direct file-handle status poll. Wrapper 0x603c calls this when the
+        // open status in `[file+4]` is 0 or 5. Returning 1 keeps the guest's
+        // status compatible with the earlier accidental behavior (open return
+        // value was handle 1) while still separating status from `[file+0]`.
+        if ordinal == 16 {
+            let handle = args[0];
+            let known = self.async_open_files.contains_key(&handle);
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:16 handle={} known={}", handle, known);
+            return if known { 1 } else { 0 };
         }
 
         let path = self
@@ -4135,16 +4180,23 @@ impl Eapp {
             self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
 
             if ordinal == 12 {
-                // Observed open-like call: r1=path, r2=out-handle pointer.
-                // Return and store a small positive synthetic handle.
-                let handle = 1u32;
-                if args[2] != 0 {
-                    self.write_guest_u32(args[2], handle);
-                }
+                // Direct open-like call used by wrapper 0x6068:
+                //   r0 = mode/flags, r1 = path, r2 = file object / out-handle.
+                // The wrapper stores the import return in `[file+4]` (status)
+                // and passes `[file+0]` to ordinal 14. Therefore the handle
+                // belongs in `*r2`, while the return value is a status code.
                 if let Some(host_path) = self.resolve_or_create_host_path(&path) {
-                    info!(target: "EAPP_IMPORT", "AsyncFileIO:12 opened {} -> handle {}", host_path.display(), handle);
+                    let handle = self.next_async_file_handle;
+                    self.next_async_file_handle = self.next_async_file_handle.wrapping_add(1).max(1);
+                    if args[2] != 0 {
+                        self.write_guest_u32(args[2], handle);
+                    }
+                    self.async_open_files.insert(handle, host_path.clone());
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:12 opened {} -> handle {} status=0", host_path.display(), handle);
+                    return 0;
                 }
-                return handle;
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:12 missing host path {}", path);
+                return 8;
             }
 
             if ordinal == 3 {
