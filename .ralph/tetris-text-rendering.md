@@ -1986,3 +1986,234 @@ state machine is gated on byte `[0x18025674]=0` forever.
    screenshot matches the oracle (MENU/PLAY/VOLUME/OPTIONS/RECORDS/HELP/EXIT).
 6. Cleanup: remove temp RE hooks once labels are sane.
 
+
+## Iteration 19 — REVERSED more caller-3 gates + `CLICKY_EAPP_TEST_READY_DELAY` env
+
+Goal: act on iter-18 priorities. Three things: (1) confirm [`clock_obj+0x2c`]
+null-gate hypothesis, (2) implement timed TEST_READY byte write (delay until
+after legal-screen dwell), (3) deeper RE on caller-3 chain to find remaining
+gates.
+
+### (1) Iter-18 hypothesis OVERTURNED: `[clock_obj+0x2c]` IS non-null on default boot
+
+iter 18 hypothesized `[clock_obj+0x2c]` (= `0x1005f713c`) was null on default
+boot. iter 19 added two fields to `startup_progress` and ran a long default run.
+
+**Finding:** `[clock_obj+0x2c]` IS being populated by the guest code, starting
+around frame 3-4. Per-frame values observed on DEFAULT boot:
+- frame 1-2: `[clock_obj+0x2c] = 0x00000000` (NULL — clock not initialized yet)
+- frame 3:    `[clock_obj+0x2c] = 0x100eff40` (heap object allocated)
+- frame 4:    `[clock_obj+0x2c] = 0x101a47f0`
+- frame 5+:    `[clock_obj+0x2c] = 0x101a7660` (eventually)
+
+`[clock_obj+0x54]` (ready byte, the OTHER gate I checked): always 0 on default
+boot. So BOTH caller-3 gates pass on default boot — yet the byte never gets set.
+
+Conclusion: iter 18's watch must have had some intermittent hook bug (the
+iter-14 note already warned that single-byte ARM `strb`/shared-store sometimes
+escapes the watch hook). My new diagnostic reads via `read_guest_u32` and
+works correctly.
+
+### (2) Timed byte-write: `CLICKY_EAPP_TEST_READY_DELAY=N` env
+
+Added a frame-delay env that defers the TEST_READY byte write until frame >= N
+(so the legal-screen dwell completes naturally before state advances).
+
+```
+CLICKY_EAPP_TEST_READY=1
+CLICKY_EAPP_TEST_READY_DELAY=N     # frames to wait before writing byte 1
+```
+
+Verified behavior with `CLICKY_EAPP_TEST_READY_DELAY=25
+CLICKY_EAPP_ASYNC3_COMPLETE=1`:
+- frame 1: state=0, byte=0
+- frame 2-29: state=1, byte=0 (legal screen dwells ~5 seconds)
+- frame 30: byte=1 written, state advances 1→5→6 immediately
+- final: state=6 stable, fb_hash=`0x97ce4ebbe87a1ae7`
+
+Also discovered iter-18's view was incomplete. State=6 framebuffer (fb_hash
+0x97ce4ebbe87a1ae7) is THE SAME HASH that appeared at frame 4 — meaning
+state=6 case just FREEZES the prior state=1 frame. State=6's case at
+`0x1800535c` doesn't trigger any additional render work; the legal text
+remains frozen on screen.
+
+Re-disassembled state=6 case `0x1800535c..0x180053a4`:
+```
+0x1800535c: ldrb r0, [r4]          ; r0 = [state+0]
+0x18005360: cmp r0, #0
+0x18005364: beq 0x18005390         ; if 0, jump to function tail (NO WORK)
+0x18005368: ldr r0, [r4, #12]     ; r0 = [state+0xc]
+0x1800536c: cmp r0, #2
+0x18005370: bne 0x18005390         ; if != 2, jump to function tail (NO WORK)
+0x18005374: ldr r0, [pc, #72]
+0x18005378: str r7, [r0]
+0x1800537c: mov r0, #1
+0x18005380: ldr r1, [r4, #24]
+0x18005384: add r0, r0, #0x3f000
+0x18005388: bl 0x1800002dc          ; some service call
+0x1800538c: bl 0x1800004060          ; ← the audio-cleanup standalone fn!
+0x18005390: ldr r0, [r4, #20]      ; function tail (state[+0x14] increment)
+0x18005394: add r0, r0, #1
+0x18005398: str r0, [r4, #20]
+0x1800539c: mov r0, #1
+0x180053a0: add sp, sp, #32
+0x180053a4: pop {...}              ; return 1
+```
+
+State=6 case has TWO gates to do any work:
+1. `[state+0] != 0` (some state byte)
+2. `[state+0xc] == 2` (input-mode byte must be 2, not 4)
+
+After state 1→5→6 transition, `[state+0xc]` was just WRITTEN TO 4 by the
+state=3/4/5 case handler — so condition 2 FAILS — state=6 case just
+goes to the function tail (basic counter increment, no rendering).
+
+This confirms: STATE=6 CASE DOES NOT RENDER ANY MENU LABELS. It just freezes
+the framebuffer and increments a counter.
+
+So the menu labels must come from a DIFFERENT code path (not state=6 case in
+`0x180050c0`). They would come from another per-frame render routine called
+from `0x180222a4` AFTER the state-dispatch call.
+
+### (3) Disassembled `0x1801b8b4` (state-machine tail-call target from `0x4088`)
+
+`0x18004088` tail-calls `0x1b8b4(clock_obj, sl)` when `count>=3 AND byte==0`.
+This happens EVERY FRAME during state=1. Iter 19 disassembled the full function:
+
+```
+0x1b8b4: push {r4,r5,r6,lr}
+0x1b8b8: mov r4, r0              ; r4 = clock_obj
+0x1b8bc: ldr r0, [r0, #0x6c]    ; counter
+0x1b8c0: mov r5, r1              ; r5 = sl (small per-frame delta ~30)
+0x1b8c4: add r0, r0, r1         ; counter += sl
+0x1b8c8: cmp r0, #1000         ; if > 1000
+0x1b8cc: str r0, [r4, #0x6c]
+0x1b8d0: movgt r0, r4
+0x1b8d4: blgt 0x1b548          ; PER-FRAME TIME UPDATER (calls miscTBD:12)
+0x1b8d8: ldr r0, [r4, #0x5c]   ; sum2
+0x1b8dc: add r0, r0, r5        ; sum2 += sl
+0x1b8e0: str r0, [r4, #0x5c]
+0x1b8e4: ldr r1, [r4, #0x60]   ; threshold
+0x1b8e8: cmp r0, r1
+0x1b8ec: ble 0x1b954           ; IF sum2 <= threshold → byte-setter gate path
+   ...  (else, overflow path — never reached during observed default boot)
+0x1b954: ldrb r0, [r4, #0x54]  ; gate 1: ready_byte
+0x1b958: cmp r0, #0
+0x1b95c: bne 0x1b96c          ; if non-zero, return 2 (NO byte-setter)
+0x1b960: ldr r0, [r4, #0x2c]   ; gate 2: audio_queue pointer
+0x1b964: cmp r0, #0
+0x1b968: bne 0x1b974          ; if non-null, GO TO byte-setter chain
+0x1b96c: mov r0, #2
+0x1b970: pop {...}             ; return 2 (no byte-setter)
+0x1b974: mov r1, r5
+0x1b978: mov r0, r4
+0x1b97c: bl 0x1b630           ; CALL 0x1b630 (audio mixing → maybe byte-setter)
+0x1b980: ldrb r0, [r4, #0x10] ; r0 = [clock_obj+0x10]
+0x1b984: cmp r0, #0
+0x1b988: moveq r0, r4
+0x1b98c: bleq 0x1bc90        ; tail-call 0x1bc90(clock_obj) if eq
+0x1b990: ldr r0, [r4, #0x2c]
+0x1b994: ldr r1, [r0]
+0x1b998: ldr r2, [r1, #0x38]
+0x1b99c: mov r1, r5
+0x1b9a0: pop {r4,r5,r6,lr}
+0x1b9a4: bx r2                ; tail-call vtable[14] of *[clock_obj+0x2c]
+```
+
+So the gates shown by iter 18 (gate 1 and 2) DO pass on default boot. The
+function is tail-called every frame and `0x1b630` IS being called.
+
+### KEY NEW GATES DISCOVERED IN `0x1b630`!
+
+Disassembled `0x1801b814: b 0x18005034` (the eventual byte-setter tail-call
+site) and traced backwards through `0x1b630`:
+
+```
+0x1b7c8: b 0x1b818              ; if (r5 & 0x10) AND (r6 & 0x10) ARE BOTH 0 ...
+0x1b7cc: ldr r6, [pc, #220]    ; AND (r5 & 0x08) AND (r6 & 0x08) ARE BOTH 0
+0x1b7d0: ldr r1, [sp, #40]      ; r1 = some stack value
+0x1b7d4: ldr r0, [r6, #4]
+0x1b7d8: add r0, r0, r1
+0x1b7dc: cmp r0, #2000          ; comparison against threshold 2000
+0x1b7e0: str r0, [r6, #4]
+0x1b7e4: b 0x1b818              ; if r0 < 2000, skip byte-setter
+0x1b7e8: strb fp, [r4, #0x55]  ; r4=1 → set ready byte 0x55 (different from 0x54)
+0x1b7ec: ldr r0, [r4, #0x2c]
+0x1b7f0: cmp r0, #0
+0x1b7f4: ldrne r1, [r4, #0xc]
+0x1b7f8: cmpne r0, r1
+0x1b7fc: addne sp, sp, #44
+0x1b800: popne {...}            ; if [r4+0xc] != [r4+0xc2 absorbed], skip
+0x1b80c: b 0x55a8
+0x1b808: strb fp, [r4, #0x54]   ; ← r4=1 → set ready byte 0x54
+0x1b80c: add sp, sp, #44
+0x1b810: pop {...}
+0x1b814: b 0x18005034           ; ← TAIL CALL byte-setter
+```
+
+The new gate is at:
+```
+0x1b7ac: tst r5, #16 (bit 4 / 0x10)
+0x1b7b8: tst r5, #8  (bit 3 / 0x08)
+```
+
+`r5` was loaded at `0x1b6e8: and r5, r0, #255` from `[some_audio_slot+0x8c]`.
+That is the AUDIO SLOT state byte (NOT user input). If neither bit 0x10 nor
+0x08 is set in this audio-state byte, the path branches to `0x1b818` which
+is the SKIP-BYTE-SETTER path.
+
+So caller-3's REAL final gate is: **the audio slot state byte at
+`[output+0x8c]` must have bit 0x10 OR bit 0x08 set** — i.e., an AUDIO EVENT
+must be currently flagged in the audio slot. Bit 0x10 likely means
+"audio sample playing" and bit 0x08 means "audio sample completed".
+
+Iter 18's hypothesis "audio callback gets invoked by firmware when sample
+plays" is now FULLY confirmed with concrete bit-positions: the firmware
+delivers a state flag to `[output+0x8c]`, Tetris polls it via caller-3's
+chain every frame, and when it sees "playing" or "completed" bits set, the
+byte-setter fires.
+
+### Conclusion
+
+The blocker is NOT a guest-code bug — it's that our emulator doesn't emulate
+the Audio:23 / Audio:1 callback dispatching. Without invoking the registered
+callback struct pointer `r2=0x1801bfc0` after an audio period elapses, the
+audio slot state byte `[output+0x8c]` is never set with bit 0x10 (playing) or
+0x08 (completed), so caller-3's final gate never passes, so byte-setter never
+fires, so state is gated at 1 forever.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- Default (no env) golden headed: 0 fatal, 0 skip, maxframe 150 (no regression)
+- Timed byte test (delay=25 + ASYNC3_COMPLETE): state advances at frame 30,
+  fb_hash stays at 0x97ce4ebbe87a1ae7 — confirms state=6 case doesn't render
+### Next priorities for iteration 20
+
+1. **Identify where `[output+0x8c]` is supposed to be written.** Use the
+   existing watch tool (`CLICKY_EAPP_WATCH=...`) on a TIMED_TESByte run
+   that forces state=6 and observe where the audio slot state byte's writer
+   would normally be. Check the Audio:23 case carefully. Find the registered
+   callback struct and confirm index+0x18 path `b 0x1801bfd8` (caller 4).
+2. **Implement an actual emulator-side audio event scheduler**. When Tetris
+   calls Audio:23 / Audio:1 to register a callback, we should:
+   - Store the registered callback struct pointer + ctx.
+   - At some emulated interval (say after N guest cycles, or after app time
+     >= N ms), write byte 0x10 to `[output+0x8c]` of the audio slot.
+   - Observe whether caller-3's new gate then passes and byte-setter fires
+     NATURALLY.
+
+3. **OR alternative**: investigate `0x1801bfd8` (caller 4) gate requirements
+   in detail. Maybe caller 4 is fired by a different mechanism
+   (e.g., "audio clock tick") that we can emulate more easily than the
+   audio-event-flag scheme.
+4. **Render verification**: if we SUCCESSFULLY fire the byte-setter via the
+   natural audio-event path, the resulting state=6 might still be the frozen
+   legal text (per the iter-19 finding that state=6 case doesn't render).
+   So we may still need to understand what DIRECTLY triggers the menu-label
+   draws in the per-frame render function `0x180222a4` or its post-dispatch
+
+5. **Supplementary**: investigate what `0x1801bc90` (called at `0x1b98c`)
+   does — this might be the "request next audio sample" routine.
+

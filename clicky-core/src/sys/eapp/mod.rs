@@ -4602,15 +4602,38 @@ impl Eapp {
         // transition (legal screen → menu) requires BOTH conditions.
         let statemach_count = self.read_guest_u32(0x1802_5678).unwrap_or(0xff_ffff);
         let statemach_byte = self.read_guest_u8(0x1802_5674).unwrap_or(0xff);
+        // Clock-obj audio gate (iter 19 RE). byte `[clock_obj+0x2c]` is the audio
+        // queue pointer (NULL on default boot -> blocks caller 3 / 4 byte-setter
+        // chains). byte `[clock_obj+0x54]` is a "ready" flag set by caller 4
+        // after firing the byte-setter (re-gates caller 3). clock_obj = 0x1005f710.
+        let clock_audio_queue = self.read_guest_u32(0x1005f710 + 0x2c).unwrap_or(0);
+        let clock_ready_byte = self.read_guest_u8(0x1005f710 + 0x54).unwrap_or(0xff);
+        // RE: caller-3 chain (`0x1b8b4`) sums [clock_obj+0x5c] += sl each frame,
+        // compares to threshold [clock_obj+0x60]. sum<=threshold → take the byte-setter
+        // gate path; sum>threshold takes the overflow path. iter 19 saw both audio
+        // gates pass but byte still not set, so the threshold gate is the
+        // likely remaining blocker. Also log [clock_obj+0x6c] frame counter.
+        let clock_sum2 = self.read_guest_u32(0x1005f710 + 0x5c).unwrap_or(0);
+        let clock_threshold = self.read_guest_u32(0x1005f710 + 0x60).unwrap_or(0);
+        let clock_count = self.read_guest_u32(0x1005f710 + 0x6c).unwrap_or(0);
         // Env-gated diagnostic: write byte 1 to 0x18025674 once per progress
         // interval to prove the gate theory. No guest writer is observed in
         // the binary for this byte, so the value is normally static 0.
+        //
+        // `CLICKY_EAPP_TEST_READY_DELAY=N` defers the byte write until frame
+        // N (so the legal screen can dwell before the legal→menu advance).
+        // Default delay is 0 (write on the first emission, matching iter 17).
         let test_ready = std::env::var("CLICKY_EAPP_TEST_READY")
             .ok()
             .as_deref()
             .map(|s| s == "1")
             .unwrap_or(false);
-        if test_ready {
+        let test_ready_delay: u64 = std::env::var("CLICKY_EAPP_TEST_READY_DELAY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if test_ready && frame >= test_ready_delay {
+            // Use u32 write (overwrites 4 bytes; adjacent bytes stay 0).
             let _ = self.write_guest_u32(0x1802_5674, 1);
         }
         let import_summary = self.format_frame_import_counts(8);
@@ -4626,7 +4649,7 @@ impl Eapp {
         };
         info!(
             target: "EAPP_PROGRESS",
-            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] statemach_count={} statemach_byte={} async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
+            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] statemach_count={} statemach_byte={} clock_audio_queue={:#010x} clock_ready_byte={} clock_sum2={} clock_threshold={} clock_count={} async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
             frame,
             self.host_start.elapsed().as_micros() as u64,
             fb_hash,
@@ -4647,6 +4670,11 @@ impl Eapp {
             splash_time_c,
             statemach_count,
             statemach_byte,
+            clock_audio_queue,
+            clock_ready_byte,
+            clock_sum2,
+            clock_threshold,
+            clock_count,
             self.async_request_count,
             self.async_callback_queued_count,
             self.guest_callback_invocation_count,
