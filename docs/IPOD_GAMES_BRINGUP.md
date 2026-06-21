@@ -1131,6 +1131,114 @@ Success bar:
 - what exactly does `GL:165` bind? *(context + vertex buffer ptr, but the
   double-ptr indirection via static globals is not fully traced)*
 
+## Audio HLE: ABI investigation (2026-06-20)
+
+Motivation: audio is reachable from **11 of 16 titles** (Tetris/PAC-MAN/Cubis2
+all hit ~9 distinct `Audio:*` ordinals), and `.wav` assets are standard PCM —
+so audio would be the first non-visual output `clicky` produces and is
+verifiable via waveform/spectrum tooling rather than vision.
+
+Investigation approach: added an env-gated `CLICKY_AUDIO_TRACE=1` diagnostic
+(`clicky-core/src/sys/eapp/mod.rs::trace_audio_call`) that dumps, for every
+`Audio:*` import, the register args plus a 64-byte preview of any arg that looks
+like a guest pointer, with a RIFF/WAVE sniff + one-line WAV format parse
+(`describe_wav_at`) when the pointed region begins with `RIFF....WAVE`. The
+tracer is **guest-visible no-op** (returns 0 like the existing stub) and is
+left in-tree as a reusable ABI-discovery tool. Artifact root:
+`/tmp/clicky_audio_trace/`.
+
+### Import call frequency (6M-cycle headless, 16 titles)
+
+| Audio-reachable titles | OpenGLES | Audio | Metadata | InputEvents | Settings | AsyncFileIO | miscTBD |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Tetris `66666`     | 20 | 9 | 2 | 1 | 1 | 154 | 7 |
+| Cubis 2 `99999`    | 15 | 9 | 2 | 1 | 1 | 241 | 4 |
+| Holdem `33333`    | 19 | 5 | 2 | 1 | 1 | 57  | 4 |
+| iQuiz `11002`     | 6  | 7 | 8 | 1 | 1 | 0   | 4 |
+| PAC `AAAAA`        | 14 | 4 | 0 | 1 | 1 | 61  | 6 |
+| Ms.PAC `14004`     | 14 | 3 | 0 | 1 | 1 | 81  | 4 |
+| Mini Golf `88888`  | 17 | 3 | 0 | 1 | 1 | 9   | 4 |
+| LOST `1B200`       | 9  | 3 | 0 | 1 | 1 | 6   | 3 |
+| Zuma/SimsBowl/etc  | —  | ≤1 | 0 | 1 | 1 | —   | — |
+
+**11 of 16 titles call Audio.** The full deduped ordinal set across titles is:
+`Audio:0, 2, 5, 13, 14, 15, 40, 43, 45, 47, 48, 49, 50, 51, 52, 53, 55, 56, 60`
+(~19 distinct ordinals, small and enumerable).
+
+### Confirmed Audio ordinal → role mapping (startup path only)
+
+Decoded from Tetris `66666` traces. The **play** ordinals (which carry the PCM
+bytes) were not captured — see the blocker note below.
+
+| Ordinal | Inferred role | Key args / evidence |
+|---|---|---|
+| `Audio:0`  | allocator / zero-fill object-table slot | `r0=1` (count), `r1=0..9` (slot index), `r2=0x18025ec8` (fixed work-RAM table base). Each call extends the zeroed region by ~16 bytes; called 10× to initialize a 10-slot table (mixer channels). |
+| `Audio:40` | allocate buffer of `r3` bytes | `r0=stack_ptr` (out: handle), `r3=0xdea8`=57000 (byte size). Preview at `r0` is zero (uninitialized out-param). |
+| `Audio:52` | register/bind a source descriptor | two shapes: `r0=0x101a7830` (ptr→`0x18023ea4` (file-VMA fn ptr) + `0x1` flag), `r1=source_id`; OR `r0=0, r1=0x437f0000` (float 255.0), `r2=0x9e`. |
+| `Audio:51` | source play/stop control | `r0=source_id`, `r1=action_flag`. |
+| `Audio:56` | queue buffer on source | `r0=1, r1=0xa` (buffer id 10), `r2=0x10001560` (work-RAM, **zeroed at call time — WAV not yet staged here**), `r3=0x180232af` (ASCII `"Abnormal termina..."` — a debug *name string*, not PCM). |
+| `Audio:55` | config / set stream property | `r0=0x7800`=30720 (buffer-period-size? sample count?), later calls use float args (1.0f). |
+| `Audio:53` | master volume set (byte→fixed) | `r0=0`, `r1=0x80808081` (classic divide-by-255 reciprocal — 0..255 byte → 0..1 fixed-point scaling). |
+| `Audio:48` / `Audio:43` | set per-source gain (float) | `r1=r2=r3=0x3f800000` (1.0f — unity gain default). |
+| `Audio:13/14/15/2` | start-game audio setup | appear only after `action` (Select) input; `r1=r2=0x7800`, `r3=0x18025ec8` (the `Audio:0` object table). |
+
+### Critical data-path finding: WAV bytes never appear directly in Audio args
+
+The tracer sniffed for RIFF/WAVE at every pointer arg across **8 audio-heavy
+titles and found zero direct WAV pointers.** The `.wav` files on disk are real
+full PCM (e.g. `Clear.wav` = 132KB, RIFF/WAVE, 16-bit stereo 22050 Hz), but
+`AsyncFileIO:3` reported delivering only **44 bytes per `.wav`** — i.e. the
+*guest requested just the WAV header* (44 bytes) to parse the format, then
+fetches the PCM data chunk via separate offset-based `AsyncFileIO:3` requests
+(which the host also fulfills). The PCM ends up in guest RAM at a
+`staged_files`-tracked address, but the Audio runtime references it **via a
+buffer-handle indirection** (`Audio:40` alloc → `Audio:56` queue), not via a
+raw pointer in an Audio arg.
+
+So accurate audio playback requires resolving the Audio buffer-handle →
+staged-PCM mapping, which in turn requires seeing the *play* ordinals fire
+with a real buffer handle bound.
+
+### Blocker: no title reaches the audio play path
+
+The play-path `Audio:*` ordinals (the ones that would reveal the
+buffer-handle → PCM binding) only fire on **gameplay events** (Tetris
+`Menu`/`Move`/`Drop`/`Clear` SFX). `CLICKY_EAPP_INPUT_SCRIPT` was used to
+inject `menu` and `action` (Select) presses to trigger them headlessly —
+**both crash Tetris before any play ordinal fires**:
+- `menu:60-65` → `FatalMemException pc=0x180206fc kind=Read off=0x14
+  in_device="eapp, <unmapped>"` (null object deref, offset 0x14)
+- `action:60-65` → same fatal at `pc=0x180206fc off=0x14` (after reaching
+  `Audio:13/14/15/2` start-game setup, then null-deref)
+
+This is the **same null-object-provider family** already documented for
+iQuiz (`pc=0x18001b08 off=0xc`) and Vortex (`pc=0x18014d58 off=0x4`), now
+also blocking Tetris gameplay-start. The guest reads a field at `[object+0x14]`
+where `object` is null — an upstream HLE call (likely a `Metadata` object
+provider, currently stubbed `return 0`) should have populated it.
+
+### Implications for what to work on next
+
+Audio playback cannot be verified end-to-end on Tetris (or any title) until a
+title can reach gameplay. The accuracy-first sequence is therefore:
+1. **Fix the null-object-provider fatal** (`pc=0x180206fc off=0x14` and
+   siblings) so Tetris (and iQuiz, Vortex) can start/play. This is a
+   runtime/ABI fix, not audio work, but it unblocks audio verification,
+   iQuiz + Vortex (2 currently-dead titles), and makes Tetris playable —
+   the single highest-leverage remaining item.
+2. **Capture the play-path Audio ordinals** with input injection once
+   gameplay is reachable — the tracer already in-tree will reveal the
+   buffer-handle → PCM binding generically.
+3. **Build the audio HLE** (context/buffer/source object model + cpal host
+   sink in `clicky-desktop`, WAV parse via `hound`) against the now-complete
+   ordinal table, validated by Tetris SFX.
+
+No audio HLE implementation was written this round — the investigation
+established that doing so blind (without the play ABI) would necessarily be
+Tetris-specific guesswork, contradicting the "generic and accurate" goal. The
+tracer + this ABI table are the reusable deliverables; the null-object-provider
+fix is the unblocker.
+
 ## Working rule for this branch
 
 When in doubt, prefer:

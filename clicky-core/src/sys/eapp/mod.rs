@@ -947,7 +947,10 @@ impl Eapp {
             "Settings" => self.handle_settings_import(import.ordinal, args),
             "Metadata" => 0,
             "miscTBD" => self.handle_misc_import(import.ordinal, args),
-            "Audio" => 0,
+            "Audio" => {
+                self.trace_audio_call(import.ordinal, pc, lr, args);
+                0
+            }
             "AsyncFileIO" => self.handle_async_file_io_import(import.ordinal, args),
             other => {
                 warn!(target: "EAPP_IMPORT", "unhandled module {}", other);
@@ -3579,6 +3582,120 @@ impl Eapp {
             2 => 0,
             _ => 0,
         }
+    }
+
+    /// Env-gated (`CLICKY_AUDIO_TRACE=1`) diagnostic that dumps, for each
+    /// `Audio:*` import call, the register args plus a short byte preview of
+    /// any arg that looks like a guest pointer (work-RAM or file VMA). When
+    /// the pointed region begins with a RIFF/WAVE header, the parsed format
+    /// (channels, sample rate, bits, data offset/length) is logged too.
+    ///
+    /// This is purely an investigation aid for deriving the Audio runtime
+    /// ABI across titles. It does not change guest-visible behavior.
+    fn trace_audio_call(
+        &mut self,
+        ordinal: u32,
+        pc: u32,
+        lr: u32,
+        args: [u32; 4],
+    ) {
+        if std::env::var_os("CLICKY_AUDIO_TRACE").is_none() {
+            return;
+        }
+        let work_end = WORK_RAM_BASE.saturating_add(WORK_RAM_SIZE as u32);
+        let image_end = FILE_VMA_BASE.saturating_add(self.bus.image_len);
+        let is_ptr = |v: u32| {
+            (WORK_RAM_BASE..work_end).contains(&v) || (FILE_VMA_BASE..image_end).contains(&v)
+        };
+        let mut detail = String::new();
+        for (i, arg) in args.iter().copied().enumerate() {
+            if !is_ptr(arg) || arg == 0 {
+                continue;
+            }
+            let preview = match self.read_guest_bytes(arg, 64) {
+                Some(b) => b,
+                None => continue,
+            };
+            let hex: String = preview
+                .iter()
+                .take(16)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !detail.is_empty() {
+                detail.push_str(" ");
+            }
+            // RIFF/WAVE sniff: "RIFF" <len:le32> "WAVE" "fmt " ...
+            let riff = preview.len() >= 12
+                && &preview[0..4] == b"RIFF"
+                && &preview[8..12] == b"WAVE";
+            if riff {
+                let wav = self.describe_wav_at(arg);
+                detail.push_str(&format!(
+                    "r{}={:#010x}->WAV[{}]",
+                    i, arg, wav.unwrap_or_else(|| "unparsed".to_string())
+                ));
+            } else {
+                detail.push_str(&format!("r{}={:#010x}->[{}]", i, arg, hex));
+            }
+        }
+        info!(
+            target: "EAPP_AUDIO",
+            "Audio:{} pc={:#010x} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} {}",
+            ordinal, pc, lr, args[0], args[1], args[2], args[3], detail
+        );
+    }
+
+    /// Best-effort WAV header parse at a guest pointer. Returns a compact
+    /// one-line description: `ch=N rate=N bits=N data=@off=off,len=N`. Used
+    /// by the audio tracer; not yet wired to playback.
+    fn describe_wav_at(&mut self, addr: u32) -> Option<String> {
+        let header = self.read_guest_bytes(addr, 44)?;
+        if header.len() < 12 || &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+            return None;
+        }
+        // Walk chunks from offset 12.
+        let mut pos = 12usize;
+        let mut fmt = None::<(u16, u32, u16)>; // channels, rate, bits
+        let mut data = None::<(usize, u32)>; // offset, len
+        let mut guard = 0usize;
+        while pos + 8 <= header.len() && guard < 8 {
+            guard += 1;
+            let chunk_id = &header[pos..pos + 4];
+            let chunk_len =
+                u32::from_le_bytes([header[pos + 4], header[pos + 5], header[pos + 6], header[pos + 7]]) as usize;
+            match chunk_id {
+                b"fmt " => {
+                    // standard 16-byte PCM fmt chunk
+                    if pos + 8 + 16 <= header.len() {
+                        let audio_format = u16::from_le_bytes([header[pos + 8], header[pos + 9]]);
+                        let channels = u16::from_le_bytes([header[pos + 10], header[pos + 11]]);
+                        let rate = u32::from_le_bytes([
+                            header[pos + 12],
+                            header[pos + 13],
+                            header[pos + 14],
+                            header[pos + 15],
+                        ]);
+                        let bits = u16::from_le_bytes([header[pos + 22], header[pos + 23]]);
+                        if audio_format == 1 {
+                            fmt = Some((channels, rate, bits));
+                        }
+                    }
+                }
+                b"data" => {
+                    data = Some((pos + 8, chunk_len as u32));
+                    break;
+                }
+                _ => {}
+            }
+            pos += 8 + chunk_len + (chunk_len & 1); // pad to even
+        }
+        let (ch, rate, bits) = fmt?;
+        let (off, len) = data?;
+        Some(format!(
+            "fmt=PCM ch={} rate={} bits={} data=@{}=0x{:x},len={}",
+            ch, rate, bits, off, off, len
+        ))
     }
 
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
