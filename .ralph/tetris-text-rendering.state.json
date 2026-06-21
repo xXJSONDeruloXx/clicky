@@ -1,7 +1,7 @@
 {
   "name": "tetris-text-rendering",
   "taskFile": ".ralph/tetris-text-rendering.md",
-  "iteration": 2,
+  "iteration": 3,
   "maxIterations": 40,
   "itemsPerIteration": 3,
   "reflectEvery": 5,

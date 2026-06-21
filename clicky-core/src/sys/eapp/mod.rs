@@ -61,6 +61,9 @@ const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
 /// per-binary address, but the convention is shared-runtime; non-Tetris titles
 /// simply never hit this PC and are unaffected.
 const TEXT_PUSH_CHAR_PC: u32 = 0x1801_616c;
+/// Cluster-A clock formatter entry (VMA). After `cmp r3,#0; bxeq lr` guard,
+/// so r3 (time-value ptr) is non-zero here. Used by the temporary RE hook.
+const TEXT_FORMAT_TIME_ENTRY_PC: u32 = 0x1800_83b4;
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
 const TRAMPOLINE_STRIDE: u32 = 0x20;
@@ -929,6 +932,22 @@ impl Eapp {
             }
         }
 
+        // Temporary RE: observe cluster-A clock-formatter entry (VMA
+        // 0x180083b4, after the `cmp r3,#0; bxeq lr` guard). r0=text_obj,
+        // r3=ptr to time value, *r3 = the time value (signed). Confirms
+        // whether the garbage chars (' .) come from a negative *r3.
+        if texgen_verbose_enabled() && pc == TEXT_FORMAT_TIME_ENTRY_PC {
+            let mode = self.cpu.mode();
+            let text_obj = self.cpu.reg_get(mode, 0);
+            let time_ptr = self.cpu.reg_get(mode, 3);
+            let time_val = self.read_guest_u32(time_ptr).unwrap_or(0) as i32;
+            info!(
+                target: "EAPP_GL",
+                "texgen_time_entry text_obj={:#010x} time_ptr={:#010x} time_val_i32={} time_val_hex={:#010x}",
+                text_obj, time_ptr, time_val, time_val as u32
+            );
+        }
+
         self.maybe_patch_guest_state(pc);
         if self.handle_guest_svc(pc) {
             return Ok(());
@@ -1261,6 +1280,11 @@ impl Eapp {
                     }
                 }
                 lg.last_frame_counter = frame;
+                if texgen_verbose_enabled() {
+                    for line in lg.take_text_char_diag(prev_frame) {
+                        info!(target: "EAPP_GL", "{}", line);
+                    }
+                }
                 lg.reset_for_frame();
             }
         }

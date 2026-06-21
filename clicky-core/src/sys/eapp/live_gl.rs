@@ -315,6 +315,50 @@ impl LiveGlState {
         self.text_char_consumed.insert(text_obj, 0);
     }
 
+    /// Diagnostic: format one line per text_obj showing the recorded push
+    /// sequence (hex + ASCII) and how many were consumed by draws this frame.
+    /// A mismatch (`pushed != consumed`) means the text_obj is reused across
+    /// multiple text runs within the frame and a linear consumption counter
+    /// mis-segments across run boundaries. Drained by `reset_for_frame`.
+    pub fn take_text_char_diag(&mut self, frame: u64) -> Vec<String> {
+        if self.text_char_seqs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.text_char_seqs.len());
+        // Sort by text_obj for stable log ordering across frames.
+        let mut keys: Vec<u32> = self.text_char_seqs.keys().copied().collect();
+        keys.sort_unstable();
+        for text_obj in keys {
+            let seq = self.text_seqs_consume_drain(&text_obj);
+            let pushed = seq.len();
+            let consumed = *self.text_char_consumed.get(&text_obj).unwrap_or(&0);
+            let hex: Vec<String> = seq.iter().map(|c| format!("0x{:02x}", c)).collect();
+            let ascii: String = seq
+                .iter()
+                .map(|&c| {
+                    if (0x20..0x7f).contains(&c) {
+                        c as u8 as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            let flag = if pushed != consumed { " MISMATCH" } else { "" };
+            out.push(format!(
+                "text_char_diag frame={} text_obj={:#010x} pushed={} consumed={} ascii=\"{}\" hex=[{}]{}",
+                frame, text_obj, pushed, consumed, ascii, hex.join(","), flag
+            ));
+        }
+        out
+    }
+
+    // Helper: borrow the seq for a text_obj immutably for formatting. (Cannot
+    // be a simple closure borrow with the HashMap API, so this just clones the
+    // hex/ascii representation without mutating.)
+    fn text_seqs_consume_drain(&self, text_obj: &u32) -> Vec<u32> {
+        self.text_char_seqs.get(text_obj).cloned().unwrap_or_default()
+    }
+
     /// Format the current frame's ordinal trace into a compact one-line
     /// summary and drain it. Draw ordinals (37) are annotated with their
     /// 1-based draw index; surface/material ordinals (157/158/165/159) include

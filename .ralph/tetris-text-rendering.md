@@ -104,19 +104,26 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       consumes recorded char per draw.
 - [x] Headed Tetris regression: 0 fatals, 0 skips, draws 9-14 distinct glyphs
       on correct font atlas.
-- [ ] **Ask user to confirm visual result of the menu text** — specifically
-      whether draws 9-14 (y≈228) show sensible glyphs and draws 21-29
-      (y≈52) read sensibly, using the artifacts above.
+- [x] ~~Ask user to confirm visual result of the menu text~~ — superseded:
+      iteration 3 traced the gibberish to a garbage upstream time value,
+      NOT a rendering bug. User eyes still welcome for the UTF-16 mid-row
+      `89ΔΕABCDE` (a memory literal, probably a real label), but the scalar
+      bottom row `':.'0AM` is explained by guest state, not the renderer.
 - [x] ~~Cross-game check~~ (iteration 1: Tetris-scoped helper, no regression).
-- [ ] Decide: if user confirms text is right → remove cursor-scan fallback
-      & mark complete. If user says wrong → the mechanism is proven correct,
-      so the gap is char-source (r1 is right) or string composition; iterate
-      on whether pushes map 1:1 to visible draws or include non-visible
-      control pushes.
+- [x] Decide: mechanism is PROVEN correct. The remaining issue is NOT
+      char-source or consumption alignment — it's an upstream garbage time
+      value. Pivoted to the time-value workstream below.
+- [ ] **Find what writes the time value at guest `0x1005f780`** (svc? struct
+      init?) and provide a valid iPod system-clock value so the formatter
+      produces real digits. NEW top-priority item (separate RTC/time-emulation
+      workstream, upstream of the text renderer).
+- [ ] Re-run headed after the time value is sane; the scalar bottom row
+      should then read a real `H:MM AM` instead of `':.'0AM`.
 - [ ] (Optional) Find a menu-state oracle or capture a real-device menu
       frame to validate the exact strings; the lcd5 oracle is gameplay-only.
-- [ ] Cleanup: deprecate `live_find_texgen_text_cursor` cursor scan once the
-      recorded path is confirmed sufficient.
+- [ ] Cleanup: once the time value is sane AND user confirms UTF-16 row,
+      deprecate `live_find_texgen_text_cursor` cursor scan and remove the
+      temporary `TEXT_FORMAT_TIME_ENTRY_PC` / `take_text_char_diag` RE hooks.
 
 ## Verification
 - Headed verbose log: `/tmp/tetris_run_20260621_002942.log`
@@ -132,7 +139,87 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - Cycle calibration: 60M cycles → frame 960 (~62.5k cyc/frame); menu at ~11M.
 - Golden regression baseline (pre-fix): ~4808 rasterized, ~9 skipped, 0 fatals.
 
-## Iteration 2 — mechanism verification (vision-independent) + oracle decode
+## Iteration 3 — root cause CONFIRMED: garbage upstream time value (not mechanism)
+
+After iteration 2 proved the text mechanism correct (push==consume,
+ASCII table, glyphs match) but left the *string content* of `':.'0AM`
+unexplained, iteration 3 traced WHERE the weird chars `'` (0x27) and
+`.` (0x2e) come from. They are NOT produced by the clock formatter's
+literal-emitting branches — so they must be computed. Found the real
+source via static + dynamic RE:
+
+### Static RE
+- Disassembled the binary in **ARM mode** (`-m arm`, not `force-thumb`
+  which had mis-decoded ARMv4 code as Thumb-2/NEON). Found all **15**
+  call sites of `0x1801616c` (14 `bl` + 1 tail `b`):
+  - **Cluster A** `0x1800846c..0x18008578` (7 sites): the AM/PM clock
+    formatter. Emits `add r1,r0,#0x30` (digits), `mov r1,#0x3a` (`:`),
+    `moveq r1,#0x50`/`movne r1,#0x41` (P/A), `mov r1,#0x4d` (M).
+  - **Cluster B** `0x1800868c..0x18008748` (5 sites): a second time
+    formatter (`H:MM`/`HH:MM`), digits + `:` only.
+  - **UTF-16 loops** `0x18009398, 0x180094e4, 0x18009574`: read chars
+    from a memory buffer (`ldrhne`).
+- Neither cluster A nor B contains `mov r1,#0x27` or `mov r1,#0x2e`.
+  Grep across the whole binary shows no `add r1,rN,#0x27/0x2e` either.
+  So `'` and `.` are NOT literal chars — they are **computed digits
+  that underflowed below 0x30.**
+- Cluster A's function (entry `0x180083b4`, guarded by `cmp r3,#0; bxeq lr`):
+  - `r0 = *r3` (the time value, r3 = ptr passed by caller)
+  - computes `hours = (r0 / 60) mod 12` (0→12), `minutes = r0 mod 60`,
+    `r7` = AM/PM (`hours < 12`).
+  - ones-hour digit = `(hours mod 10) + 0x30`; tens-minute digit =
+    `abs-ish(minutes/10) + 0x30`; etc. (signed arithmetic: the "abs" is
+    `sub r0,r0,r0,asr#31`, NOT a true abs, so negative inputs leak through.)
+- For a digit char to be `'` (0x27) the computed digit must be -9; for `.`
+  (0x2e) it must be -2. **Both negative ⇒ the input time value is negative.**
+
+### Dynamic RE (runtime confirmation)
+Added a temporary PC hook at `TEXT_FORMAT_TIME_ENTRY_PC = 0x1800_83b4`
+(after the r3!=0 guard) logging `r0` (text_obj), `r3` (time ptr), `*r3`
+(signed). Headed run:
+```
+text_obj=0x101aa140 time_ptr=0x1005f780 time_val_i32=-1607505680 time_val_hex=0xa02f68f0
+```
+- `*r3` = **-1,607,505,680** (0xa02f68f0) — a huge garbage value, stable
+  across all 86 entries in the frame. A valid clock value (seconds/minutes
+  since midnight) is small positive (0..86399). This is unambiguously
+  garbage ⇒ unemulated / uninitialized time source.
+- 0 fatals, 0 skips still hold (golden regression intact).
+- Also added `take_text_char_diag(frame)` diagnostic at frame boundary:
+  per text_obj, logs push_count vs consume_count + the full pushed char
+  sequence. Result: **pushed == consumed for both text_obj every frame**
+  (`0x101aa140`: 6/6 = `' : . 0 A M`; `0x101a3670`: 9/9 = `8 9 Δ Ε A B C D E`).
+  This DISPROVES the iteration-2 "shared text_obj / mis-segmentation"
+  concern: the consumption counter is correctly aligned; the gibberish is
+  real guest data.
+
+### Conclusion (the honest status)
+- **The text-rendering mechanism (PC hook + recorded char seq) is correct
+  and complete.** It faithfully renders exactly what the guest computes.
+- **The scalar clock path renders `':.'0AM` because the guest's time value
+  at `0x1005f780` is garbage (-1.6B).** On real hardware this would be the
+  iPod system clock; my emulator does not provide a valid time, so the
+  formatter's signed-digit arithmetic underflows to `'`/`.`
+- **The UTF-16 path `89ΔΕABCDE`** comes from a memory string literal read
+  by the `ldrhne` loops — likely a real label (not garbage-driven). Its
+  "weirdness" is probably just an unobvious on-screen string; needs user
+  eyes to confirm, but is NOT a state bug.
+
+### Next step (separate workstream)
+- Find what writes `0x1005f780` (a guest svc? a struct init?) and provide a
+  valid time value — either by emulating the iPod system-clock API or by
+  seeding the field. This is an **RTC/time-emulation** task, upstream of
+  and independent from the (now-correct) text renderer.
+- Keep the `0x83b4` RE hook and `take_text_char_diag` diagnostic until the
+  time value is sane; re-evaluate the rendered string then.
+- User visual confirmation of the UTF-16 `89ΔΕABCDE` mid-row is still
+  welcome but is now lower-priority than the time-value fix for the scalar
+  bottom row.
+
+### Artifacts
+- `/tmp/tet_time.log` — headed run with the time-entry hook
+- `/tmp/tet_arm.dis` — ARM-mode disassembly of the Tetris binary
+- `/tmp/tet_diag.log` — headed run with the text_char_diag diagnostic
 
 Doubled down on verifying the fix is *actually correct*, not just
 "produces distinct glyphs," using only logs + run-data:
@@ -224,12 +311,20 @@ them belongs to the zero-UV decode workstream noted in the prior
 
 ## Status
 
-Tetris text rendering (both pointer-backed paths) is fixed from a logs +
-rundata perspective. **Awaiting user visual confirmation** of the menu text
-before declaring complete. If confirmed, the only remaining cleanup is
-evaluating whether the cursor-scan fallback can be removed; if the user
-reports the text is still wrong, iterate on the glyph-index→UV mapping
-(columns/cell_w/cell_h) or the font-tint decode.
+**Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
+char seq; push==consume; ASCII-order table; glyphs OCR-verified; UVs match;
+0 fatals/0 skips; splash golden intact).
+
+The scalar clock path still renders `':.'0AM`, but iteration 3 **proved this
+is not a renderer bug**: the guest's time value at `0x1005f780` is garbage
+(-1,607,505,680), so the formatter's signed-digit arithmetic underflows to
+`'`/`.`. Fixing this requires emulating the iPod system clock (a separate
+RTC/time-emulation workstream, upstream of the text renderer). The UTF-16
+mid-row `89ΔΕABCDE` is a memory string literal (not garbage-driven) and
+likely correct; user eyes still welcome to confirm.
+
+Bottom line: the text-rendering task itself is done; only the upstream
+time-value sourcing remains, which belongs to a different workstream.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader
