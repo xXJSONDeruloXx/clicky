@@ -372,6 +372,68 @@ individually:
 4. shared unmapped write at `0x1080000c` (Bejeweled / Zuma)
 5. Tetris exact formatter/texgen state modeling for pointer-backed text
 
+#### Full headed matrix snapshot (2026-06-20)
+
+A full headed pass over all 16 bundles was run after the input/event-list and
+Tetris text-rendering fixes. This matrix is intended as a durable baseline for
+future sessions.
+
+Run setup:
+
+- artifact root: `/tmp/clicky_headed_matrix_unique_20260620_201555`
+- contact sheet: `/tmp/clicky_headed_matrix_unique_20260620_201555/contact_sheet.png`
+- command shape: `./scripts/tetris.sh --no-build --timeout 7 --bundle /Users/kurt/Downloads/16-ipod-games/Games_RO/<id>`
+- live GL env: `CLICKY_EXPERIMENTAL_GL_HLE=1`, `CLICKY_GL_GATE_B=1`,
+  `CLICKY_GL_LIVE_CONTINUOUS=1`, `CLICKY_GL_PRESENT_VFLIP=1`
+- capture cadence: `CLICKY_STARTUP_CAPTURE_PERIOD=20`, max 500 guest frames /
+  80 dumps per title
+- log level: `EAPP_GL=info,EAPP=info,EAPP_PROGRESS=info,EAPP_IMPORT=warn,EAPP_INPUT=info`
+- performance estimates below are `startup_progress frame / host_us`; they
+  include very heavy logging and are useful only as relative health indicators.
+
+| ID | Game | Artifact log | Latest visual | Result | Approx. perf | Current blocker / useful finding |
+|---|---|---|---|---|---:|---|
+| `11002` | iQuiz | `/tmp/clicky_headed_matrix_unique_20260620_201555/11002/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | unmapped write `pc=0x18001b08 off=0x0000000c` after early GL setup/upload |
+| `12345` | Vortex | `/tmp/clicky_headed_matrix_unique_20260620_201555/12345/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | unmapped write `pc=0x18014d58 off=0x00000004` after several inline GL uploads |
+| `14004` | Ms. PAC-MAN | `/tmp/clicky_headed_matrix_unique_20260620_201555/14004/logs/tetris_run_20260620_201556.log` | `14004_latest.png` in artifact root | good loading screen | ~58 fps | mostly renders; remaining skips are `no live upload matched UV span None` for handle `0x2`/related zero-UV cases |
+| `1500C` | The Sims Bowling | `/tmp/clicky_headed_matrix_unique_20260620_201555/1500C/logs/tetris_run_20260620_201603.log` | no capture | runs/idles | ~138 fps | no completed GL frames yet; likely lifecycle/timer/settings/resource-callback gap |
+| `1500E` | The Sims Pool | `/tmp/clicky_headed_matrix_unique_20260620_201555/1500E/logs/tetris_run_20260620_201610.log` | no capture | runs/idles | ~140 fps | no completed GL frames yet; likely same family as Bowling |
+| `1B200` | LOST | `/tmp/clicky_headed_matrix_unique_20260620_201555/1B200/logs/tetris_run_20260620_201617.log` | no capture | runs but no visible frame | ~360 fps | unsupported upload `src_fmt=0x190a pix_type=0x1401` |
+| `33333` | Texas Hold'em | `/tmp/clicky_headed_matrix_unique_20260620_201555/33333/logs/tetris_run_20260620_201624.log` | `33333_latest.png` | partial loading text | ~17 fps | repeated `OpenGLES:37 mode=5 count=11` |
+| `44444` | Zuma | `/tmp/clicky_headed_matrix_unique_20260620_201555/44444/logs/tetris_run_20260620_201631.log` | `44444_latest.png` | tiny partial text/sprite bits, then fatal | ~6 fps before fatal | shared PopCap unmapped write `pc=0x18001720 off=0x1080000c` |
+| `50513` | Sudoku | `/tmp/clicky_headed_matrix_unique_20260620_201555/50513/logs/tetris_run_20260620_201634.log` | no capture | runs/idles | ~208 fps | no completed GL frames yet; lifecycle/runtime gap |
+| `50514` | Royal Solitaire | `/tmp/clicky_headed_matrix_unique_20260620_201555/50514/logs/tetris_run_20260620_201641.log` | no capture | early/stalled | ~2 fps early | likely waiting in early async/runtime state |
+| `55555` | Bejeweled | `/tmp/clicky_headed_matrix_unique_20260620_201555/55555/logs/tetris_run_20260620_201648.log` | `55555_latest.png` | partial white loading text, then fatal | ~4 fps before fatal | shared PopCap unmapped write `pc=0x18001730 off=0x1080000c` |
+| `66666` | Tetris | `/tmp/clicky_headed_matrix_unique_20260620_201555/66666/logs/tetris_run_20260620_201652.log` | `66666_latest.png` | strong startup/menu render | ~29 fps | text is visible but content is still wrong; generated-text UV misses remain for pointer handles `0x100e38e0` / `0x100e5260` |
+| `77777` | Mahjong | `/tmp/clicky_headed_matrix_unique_20260620_201555/77777/logs/tetris_run_20260620_201659.log` | `77777_latest.png` | black despite presented frames | ~70 fps | GL frames present, but no rasterized draws; UV/upload matching blocker around handle `0x19` |
+| `88888` | Mini Golf | `/tmp/clicky_headed_matrix_unique_20260620_201555/88888/logs/tetris_run_20260620_201707.log` | `88888_latest.png` | loading-bar outline | ~63 fps | mostly stable; small UV/upload miss for handle `0x27` |
+| `99999` | Cubis 2 | `/tmp/clicky_headed_matrix_unique_20260620_201555/99999/logs/tetris_run_20260620_201714.log` | `99999_latest.png` | recognizable title screen, upside down | ~18 fps | many draws rasterized; unsupported upload `src_fmt=0x190a pix_type=0x1401`; orientation/presentation issue also visible |
+| `AAAAA` | PAC-MAN | `/tmp/clicky_headed_matrix_unique_20260620_201555/AAAAA/logs/tetris_run_20260620_201721.log` | `AAAAA_latest.png` | visible maze side art + text | ~44 fps | mostly renders; remaining no-upload/UV misses around handle `0x19` |
+
+Cross-game north-star priorities from this matrix:
+
+1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
+2. model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws
+3. implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token
+4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, and the remaining Tetris pointer-text misses
+5. investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work
+
+Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`):
+
+- code path added as renderer format `TextureFormat::LuminanceAlpha88`, decoded as GL ES `LA` byte pairs (`rgb = luminance`, `a = alpha`)
+- targeted headed artifact root: `/tmp/clicky_la_validate_20260620_202557`
+- `cargo test -p clicky-core --test eapp_gl_decode` passed after adding format/payload-size coverage
+- Cubis 2 (`99999`) validation:
+  - log: `/tmp/clicky_la_validate_20260620_202557/99999/logs/tetris_run_20260620_202557.log`
+  - latest screenshot: `/tmp/clicky_la_validate_20260620_202557/99999_latest.png`
+  - prior matrix: 18 skipped draws and repeated unsupported `0x190a/0x1401`
+  - after fix: unsupported-format count is 0; skip count drops to 2; many uploads now log as `Some(LuminanceAlpha88)`, e.g. `images/menubg.raw`, `jewel/sheet-*.raw`, `classic/sheet-*.raw`, `metallic/sheet-*.raw`
+  - remaining visual issue: title screen is still upside down / presentation-orientation related, and two UV/upload misses remain
+- LOST (`1B200`) validation:
+  - log: `/tmp/clicky_la_validate_20260620_202557/1B200/logs/tetris_run_20260620_202604.log`
+  - unsupported-format count is 0; early inline uploads now log as `Some(LuminanceAlpha88)`
+  - still no completed GL frames/captures in the 7s headed run, so the blocker has moved from texture decode to lifecycle/draw-path coverage
+
 #### Honest status (stable but green)
 
 Running the desktop (non-headless) runner today shows a flat green window. That

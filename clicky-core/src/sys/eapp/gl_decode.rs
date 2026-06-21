@@ -13,6 +13,7 @@ pub fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> u
     let bytes_per_pixel = match format {
         TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
         TextureFormat::Rgba8888 => 4,
+        TextureFormat::LuminanceAlpha88 => 2,
         TextureFormat::A8 => 1,
     };
     width * height * bytes_per_pixel
@@ -20,7 +21,8 @@ pub fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> u
 
 /// Map captured GL ES 1.1 upload enumerants to the standalone renderer's
 /// `TextureFormat`. Constants:
-///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906
+///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906,
+///   GL_LUMINANCE_ALPHA=0x190a
 ///   GL_UNSIGNED_SHORT_5_6_5=0x8363, GL_UNSIGNED_SHORT_5_5_5_1=0x8034,
 ///   GL_UNSIGNED_SHORT_4_4_4_4=0x8033, GL_UNSIGNED_BYTE=0x1401
 ///
@@ -31,6 +33,7 @@ pub fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFo
         (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
         (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
         (0x1908, 0x1401) => Some(TextureFormat::Rgba8888),
+        (0x190a, 0x1401) => Some(TextureFormat::LuminanceAlpha88),
         (0x1906, 0x1401) => Some(TextureFormat::A8),
         _ => None,
     }

@@ -968,6 +968,7 @@ fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize
     let bytes_per_pixel = match format {
         TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => 2,
         TextureFormat::Rgba8888 => 4,
+        TextureFormat::LuminanceAlpha88 => 2,
         TextureFormat::A8 => 1,
     };
     width * height * bytes_per_pixel
@@ -975,7 +976,8 @@ fn pix_payload_size(format: TextureFormat, width: usize, height: usize) -> usize
 
 /// Map the captured GL upload constants to the standalone renderer's
 /// `TextureFormat`. Constants are standard GL ES 1.1 enumerants:
-///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906
+///   GL_RGB=0x1907, GL_RGBA=0x1908, GL_ALPHA=0x1906,
+///   GL_LUMINANCE_ALPHA=0x190a
 ///   GL_UNSIGNED_SHORT_5_6_5=0x8363, GL_UNSIGNED_SHORT_5_5_5_1=0x8034,
 ///   GL_UNSIGNED_SHORT_4_4_4_4=0x8033, GL_UNSIGNED_BYTE=0x1401
 fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFormat> {
@@ -984,6 +986,7 @@ fn format_from_gl(internal_format: u32, pixel_type: u32) -> Option<TextureFormat
         (0x1908, 0x8034) => Some(TextureFormat::Rgba5551),
         (0x1908, 0x8033) => Some(TextureFormat::Rgba4444),
         (0x1908, 0x1401) => Some(TextureFormat::Rgba8888),
+        (0x190a, 0x1401) => Some(TextureFormat::LuminanceAlpha88),
         (0x1906, 0x1401) => Some(TextureFormat::A8),
         _ => None,
     }
@@ -1209,6 +1212,10 @@ fn pix_payload_size_matches_format_dimensions() {
         pix_payload_size(TextureFormat::Rgba8888, 40, 20),
         40 * 20 * 4
     );
+    assert_eq!(
+        pix_payload_size(TextureFormat::LuminanceAlpha88, 12, 34),
+        12 * 34 * 2
+    );
     assert_eq!(pix_payload_size(TextureFormat::A8, 784, 20), 784 * 20);
 }
 
@@ -1226,6 +1233,10 @@ fn format_from_gl_maps_captured_upload_constants() {
     assert_eq!(
         format_from_gl(0x1908, 0x1401),
         Some(TextureFormat::Rgba8888)
+    );
+    assert_eq!(
+        format_from_gl(0x190a, 0x1401),
+        Some(TextureFormat::LuminanceAlpha88)
     );
     assert_eq!(format_from_gl(0x1906, 0x1401), Some(TextureFormat::A8));
     assert_eq!(format_from_gl(0xdead, 0xbeef), None);

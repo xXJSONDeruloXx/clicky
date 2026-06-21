@@ -18,6 +18,7 @@ pub enum TextureFormat {
     Rgba5551,
     Rgba4444,
     Rgba8888,
+    LuminanceAlpha88,
     A8,
 }
 
@@ -57,6 +58,7 @@ pub fn decode_texture_pixels(
             width * height * 2
         }
         TextureFormat::Rgba8888 => width * height * 4,
+        TextureFormat::LuminanceAlpha88 => width * height * 2,
         TextureFormat::A8 => width * height,
     };
     assert_eq!(raw.len(), expected);
@@ -111,6 +113,10 @@ pub fn decode_texture_pixels(
         TextureFormat::Rgba8888 => raw
             .chunks_exact(4)
             .map(|chunk| Rgba8::rgba(chunk[0], chunk[1], chunk[2], chunk[3]))
+            .collect(),
+        TextureFormat::LuminanceAlpha88 => raw
+            .chunks_exact(2)
+            .map(|chunk| Rgba8::rgba(chunk[0], chunk[0], chunk[0], chunk[1]))
             .collect(),
         TextureFormat::A8 => raw
             .iter()
