@@ -145,10 +145,14 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - [ ] Investigate save/default state and input transition issues. Iteration 7
       found `.clicky-saves/prefs.sav` and `game.sav` are zero-byte files, while
       Tetris requests 4096 bytes for each and current `AsyncFileIO:3` reports
-      success after delivering 0 bytes. Also, scripted `menu`/`down` events can
-      reach a separate null read at `0x180206fc` (`[0x14]`). These may be
-      upstream state issues that keep the expected menu label state from being
-      built.
+      success after delivering 0 bytes. Iteration 8 tested 4096-byte zero-filled
+      save files: this did **not** materialize labels or parsed string pointers.
+      Iteration 8 also root-caused the scripted `menu` input fatal at
+      `0x180206fc` to the existing placeholder resource-slot patch creating
+      zero-vtable fake refcounted objects; placeholders now get the guest's
+      minimal base vtable/refcount so release is safe. The input no longer
+      fatals, but it transitions to `frame_state=6` with drawless GL:157-only
+      frames, so input/default-state ABI work is still open.
 - [ ] Re-run headed after menu-label issuance is fixed; clock already reads a
       real `H:MM AM`, but the menu still needs to match the user oracle labels.
 - [ ] Cleanup: once labels are sane, deprecate `live_find_texgen_text_cursor`
@@ -609,6 +613,76 @@ Next:
 - Continue string lookup tracing from enum IDs / row indices if save-state fixes
   still do not materialize labels.
 
+## Iteration 8 — save experiment + input null-deref root-caused
+
+Work completed this iteration:
+
+1. **Tested the zero-byte save hypothesis.** Temporarily backed up the current
+   zero-byte `.clicky-saves/prefs.sav` and `game.sav`, replaced both with
+   4096-byte zero-filled files (matching Tetris' request size), and ran a
+   headless `EAPP_STRING_SCAN=1` / text diagnostic:
+   `/tmp/tet_iter8_zero4096_scan.log`.
+
+   Result: no change. The only pushed strings were the real clock (`9:03AM` in
+   that run) and the decorative `89ΔΕABCDE`; selected `Strings.dta` rows still
+   decoded correctly but had `row_ptr_refs=[]` / `value_ptr_refs=[]`. This means
+   “short save left destination buffer dirty” is not the sole explanation for
+   missing menu-label issuance.
+
+2. **Root-caused the `0x180206fc` scripted-input crash.** Reproduced with
+   `CLICKY_EAPP_INPUT_SCRIPT='menu:190-205'` while using 4096-byte zero saves:
+   `/tmp/tet_iter8_input_menu_zero4096.log`.
+
+   The fault was not directly save data. It was the guest's refcount-release
+   loop over an array of resource objects:
+   - `0x180206b0..0x18020718` decrements `[obj+4]`, and if it reaches zero calls
+     the destructor at `[[obj]+0x14]`.
+   - The faulting object `0x100e4be0` had words
+     `[0x00000000, 0x00000000, 0x100e4c00, ...]`: null vtable, refcount just
+     decremented to zero, payload pointer at `+8`.
+   - That exact shape matches the existing `maybe_patch_guest_state()`
+     placeholder entries (entry + payload) for Tetris resource slots 20..37.
+     The patch made non-null resources so startup could continue, but the fake
+     entries were not valid refcounted objects once input/state transitions
+     released copied slots.
+
+3. **Made the existing placeholder patch release-safe.** The placeholders now
+   initialize the minimal base-object header the guest itself uses:
+   - `[entry+0x00] = 0x18023efc` (base vtable; destructor slot `+0x14` is
+     `0x18020734`, which frees non-null objects)
+   - `[entry+0x04] = 1` (initial refcount)
+   - `[entry+0x08] = payload`
+
+   This is still a bounded compatibility shim for the known placeholder patch,
+   not a string/label injection.
+
+Verification:
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- Scripted input replay after the fix:
+  `/tmp/tet_iter8_input_menu_placeholder_fix.log`
+  - 0 fatal lines, 0 skipped lines.
+  - Previously fatal `menu:190-205` now survives past the release path.
+  - New/remaining behavior: after the menu event, the guest enters
+    `frame_state=6` and emits long runs of `GL:157` presents with zero draws.
+    So the null-deref is fixed, but the input/pause/menu state is still not
+    properly modeled.
+- Headed smoke after the fix:
+  `/tmp/tet_iter8_headed_placeholder_fix.log`, capture dir
+  `/tmp/tetris_capture_20260621_090931`
+  - timeout exit 124 as expected, 0 fatal lines, 0 skipped lines.
+  - Text still only `9:09AM` plus `89ΔΕABCDE`; expected labels remain absent.
+
+Next:
+
+- Continue from the new post-input state (`frame_state=6`, GL:157-only) instead
+  of the old `0x180206fc` crash.
+- Reverse `AsyncFileIO:12/14` and save open/read/write semantics around the
+  input path; after pressing Menu, Tetris opens `prefs.sav` and calls
+  `AsyncFileIO:14(handle=1, buffer=0x101a99a0, len=79)`.
+- Keep tracing localization/string lookup from IDs/row indices; the 4096-zero
+  save experiment disproved the simplest short-read theory.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
@@ -628,11 +702,14 @@ text draws** in the current guest state/path. Iteration 7 tightened this:
 refs into those rows/value spans exist at scan time, language-index brute force
 does not reveal labels, and long no-input runs never emit them.
 
-Bottom line: glyph decode, texture asset selection, and clock time source are
-now fixed. Remaining visible gap is upstream guest state/API for main-menu label
-issuance/string-table path. The current best next lead is save/default-state I/O:
-zero-byte `prefs.sav`/`game.sav` are reported as successful 4096-byte requests,
-and scripted menu/down input can expose a separate null deref at `0x180206fc`.
+Bottom line: glyph decode, texture asset selection, clock time source, and the
+placeholder-resource input null-deref are now fixed. Remaining visible gap is
+upstream guest state/API for main-menu label issuance/string-table path. The
+4096-zero save experiment did not produce labels, so the best next leads are:
+(1) reverse proper save/open/read/write semantics around `AsyncFileIO:12/14`,
+especially the post-Menu `AsyncFileIO:14(handle=1, buffer=0x101a99a0, len=79)`;
+(2) debug the new post-input `frame_state=6` / drawless `GL:157` state; and
+(3) continue localization lookup tracing from IDs/row indices.
 
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader

@@ -4818,6 +4818,13 @@ impl Eapp {
             if !self.write_guest_u32(slot_addr, entry) {
                 break;
             }
+            // The placeholders stand in for resource entries the guest later
+            // treats as ref-counted runtime objects. Initialize the minimal
+            // base-object header so normal retain/release paths can safely
+            // decrement and destroy them instead of calling through a NULL
+            // vtable when input/state transitions release copied slots.
+            let _ = self.write_guest_u32(entry, 0x1802_3efc);
+            let _ = self.write_guest_u32(entry.wrapping_add(4), 1);
             let _ = self.write_guest_u32(entry.wrapping_add(8), payload);
             patched += 1;
         }
