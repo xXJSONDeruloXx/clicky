@@ -413,7 +413,7 @@ Run setup:
 Cross-game north-star priorities from this matrix:
 
 1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
-2. model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws
+2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
 3. implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token
 4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, and the remaining Tetris pointer-text misses
 5. investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work
@@ -433,6 +433,34 @@ Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`)
   - log: `/tmp/clicky_la_validate_20260620_202557/1B200/logs/tetris_run_20260620_202604.log`
   - unsupported-format count is 0; early inline uploads now log as `Some(LuminanceAlpha88)`
   - still no completed GL frames/captures in the 7s headed run, so the blocker has moved from texture decode to lifecycle/draw-path coverage
+
+Follow-up validation for the PopCap `0x1080000c` / RAM-aperture blocker:
+
+- root cause: the previous synthetic eapp work-RAM window was only 8 MiB
+  (`0x1000_0000..0x1080_0000`). Bejeweled and Zuma faulted inside memcpy-like
+  asset-copy routines exactly at/just past that boundary, not in device IO.
+- first experiment: 32 MiB moved Zuma's fault from `0x1080000c` to
+  `0x1200000c`, the new boundary, while Bejeweled survived the 7s window. This
+  strongly indicated a too-small guest RAM aperture rather than a special
+  register.
+- fix: increase the synthetic eapp work RAM to 64 MiB, matching high-memory
+  5G-class iPods targeted by many clickwheel games.
+- targeted headed artifact root: `/tmp/clicky_ram64_validate_20260620_203011`
+- Bejeweled (`55555`) validation:
+  - log: `/tmp/clicky_ram64_validate_20260620_203011/55555/logs/tetris_run_20260620_203011.log`
+  - latest screenshot: `/tmp/clicky_ram64_validate_20260620_203011/55555_latest.png`
+  - prior matrix: fatal at `pc=0x18001730 off=0x1080000c`
+  - after fix: no `FatalMemException` in the 7s headed window; remaining skips are UV/upload matching for handles `0x16` and `0x10`
+- Zuma (`44444`) validation:
+  - log: `/tmp/clicky_ram64_validate_20260620_203011/44444/logs/tetris_run_20260620_203018.log`
+  - latest screenshot: `/tmp/clicky_ram64_validate_20260620_203011/44444_latest.png`
+  - prior matrix: fatal at `pc=0x18001720 off=0x1080000c`
+  - 32 MiB experiment: fatal moved to `off=0x1200000c`
+  - after 64 MiB fix: no `FatalMemException` in the 7s headed window; remaining visible output is still minimal due renderer/UV gaps
+- Tetris (`66666`) regression:
+  - log: `/tmp/clicky_ram64_validate_20260620_203011/66666/logs/tetris_run_20260620_203025.log`
+  - latest screenshot: `/tmp/clicky_ram64_validate_20260620_203011/66666_latest.png`
+  - startup/menu state remains stable with the same known pointer-text UV/content gaps
 
 #### Honest status (stable but green)
 

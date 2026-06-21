@@ -42,7 +42,11 @@ const RECENT_PC_LIMIT: usize = 64;
 const BOOTSTRAP_RETURN_PC: u32 = 0x1eff_fffc;
 const GUEST_CALLBACK_RETURN_PC: u32 = 0x1eff_fff8;
 const WORK_RAM_BASE: u32 = 0x1000_0000;
-const WORK_RAM_SIZE: usize = 8 * 1024 * 1024;
+// Use a 64 MiB synthetic app RAM window, matching the high-memory 5G-class
+// iPods that many clickwheel games targeted. Smaller scratch windows truncate
+// guest heaps/arenas: PopCap titles were observed copying assets past both
+// 0x1080_0000 (8 MiB) and 0x1200_0000 (32 MiB).
+const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
 const TRAMPOLINE_STRIDE: u32 = 0x20;
