@@ -848,6 +848,29 @@ impl Eapp {
         if let Some((access, e)) = mem.exception.take() {
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
             warn!(target: "EAPP", "recent pc trace: {}", self.format_recent_pcs());
+            let mode = self.cpu.mode();
+            warn!(
+                target: "EAPP",
+                "fault regs pc={:#010x} fault_addr={:#010x} kind={:?} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                pc,
+                access.offset,
+                access.kind,
+                self.cpu.reg_get(mode, 0),
+                self.cpu.reg_get(mode, 1),
+                self.cpu.reg_get(mode, 2),
+                self.cpu.reg_get(mode, 3),
+                self.cpu.reg_get(mode, 4),
+                self.cpu.reg_get(mode, 5),
+                self.cpu.reg_get(mode, 6),
+                self.cpu.reg_get(mode, 7),
+                self.cpu.reg_get(mode, 8),
+                self.cpu.reg_get(mode, 9),
+                self.cpu.reg_get(mode, 10),
+                self.cpu.reg_get(mode, 11),
+                self.cpu.reg_get(mode, 12),
+                self.cpu.reg_get(mode, reg::SP),
+                self.cpu.reg_get(mode, reg::LR),
+            );
             e.resolve(
                 "EAPP",
                 MemExceptionCtx {

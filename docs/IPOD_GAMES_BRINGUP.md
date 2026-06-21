@@ -393,8 +393,8 @@ Run setup:
 
 | ID | Game | Artifact log | Latest visual | Result | Approx. perf | Current blocker / useful finding |
 |---|---|---|---|---|---:|---|
-| `11002` | iQuiz | `/tmp/clicky_headed_matrix_unique_20260620_201555/11002/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | unmapped write `pc=0x18001b08 off=0x0000000c` after early GL setup/upload |
-| `12345` | Vortex | `/tmp/clicky_headed_matrix_unique_20260620_201555/12345/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | unmapped write `pc=0x18014d58 off=0x00000004` after several inline GL uploads |
+| `11002` | iQuiz | `/tmp/clicky_headed_matrix_unique_20260620_201555/11002/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | null-destination `memcpy` at `pc=0x18001b08` after early GL setup/upload; root-caused, fix needs `Metadata` object-provider RE (see investigation) |
+| `12345` | Vortex | `/tmp/clicky_headed_matrix_unique_20260620_201555/12345/logs/tetris_run_20260620_201555.log` | no capture | quick fatal | n/a | null-destination struct-fill at `pc=0x18014d58` after inline GL uploads; `[object+4]` buffer ptr is null, likely GL surface bind gap (see investigation) |
 | `14004` | Ms. PAC-MAN | `/tmp/clicky_headed_matrix_unique_20260620_201555/14004/logs/tetris_run_20260620_201556.log` | `14004_latest.png` in artifact root | good loading screen | ~58 fps | mostly renders; remaining skips are `no live upload matched UV span None` for handle `0x2`/related zero-UV cases |
 | `1500C` | The Sims Bowling | `/tmp/clicky_headed_matrix_unique_20260620_201555/1500C/logs/tetris_run_20260620_201603.log` | no capture | runs/idles | ~138 fps | no completed GL frames yet; likely lifecycle/timer/settings/resource-callback gap |
 | `1500E` | The Sims Pool | `/tmp/clicky_headed_matrix_unique_20260620_201555/1500E/logs/tetris_run_20260620_201610.log` | no capture | runs/idles | ~140 fps | no completed GL frames yet; likely same family as Bowling |
@@ -551,11 +551,12 @@ Additional lifecycle/no-draw evidence from the no-capture titles:
   - this now looks like a missing material/surface/draw trigger rather than a
     texture-format blocker
 - `11002` iQuiz and `12345` Vortex:
-  - still distinct early fatal memory/object-layout cases, not no-draw idles
+  - distinct early fatal memory/object-layout cases, not no-draw idles
   - iQuiz: `FatalMemException pc=0x18001b08 kind=Write off=0x0000000c`
   - Vortex: `FatalMemException pc=0x18014d58 kind=Write off=0x00000004`
-  - both happen after early GL setup/uploads and need separate object/runtime
-    layout investigation
+  - both happen after early GL setup/uploads; root-caused to a **null
+    destination buffer** (see detailed investigation below), fix needs targeted
+    per-game RE of which HLE call should populate the buffer pointer
 
 Follow-up validation for `OpenGLES:38` indexed draws:
 
@@ -583,8 +584,69 @@ Follow-up validation for `OpenGLES:38` indexed draws:
   - `66666`: 20 startup capture files, 0 fatal errors
 - remaining renderer gaps: much Sims coverage is still zero/tiny or skips due
   to UV/upload/state matching (for example handle `0x27` UV spans that do not
-  match a decoded upload); ordinal `149` remains draw-adjacent state and is
-  recorded as a no-op until its exact semantics are proven.
+  match a decoded upload); ordinal `149` is classified below as a safe no-op
+  per-draw state bind.
+
+Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
+
+- instrumentation: added a register-state dump at the eapp memory-fault path
+  (`fault regs ...`) so every fatal now reports `pc`, `fault_addr`, `kind`, and
+  all of `r0`-`r12`, `sp`, `lr`. This is a general diagnostic improvement, not
+  title-specific.
+- `12345` Vortex fatal at `pc=0x18014d58` (`kind=Write fault_addr=0x4`):
+  - faulting function is at file offset `0x14d38`; disassembly shows a
+    structure-fill routine:
+    `0x14d44: ldr r0,[r0,#4]` (read buffer pointer from object+4) followed by
+    `0x14d54: stmia r0!,{r7,r9}` and `0x14d58: stmia r0!,{r4,r5,r6,lr}`
+  - `0x14d5c: mov fp,#65536` stores the literal `0x10000` into a field, which
+    explains the recurring `0x00010000` register value seen across both games.
+  - register dump at fault: `r0=0x8` (= null + 8 bytes of `stmia` writeback),
+    `lr=0x00010000` (invalid return address), so the destination buffer read
+    from `[object+4]` was null.
+  - the last import before the fault was `miscTBD:0` (allocator, returns valid
+    work RAM); the null therefore comes from an object field that an upstream
+    HLE call should have populated. Leading candidate: `OpenGLES:165`
+    ("surface handle", currently a no-op) may be expected to write a
+    framebuffer/buffer pointer into the surface object, but this is unproven.
+- `11002` iQuiz fatal at `pc=0x18001b08` (`kind=Write fault_addr=0xc`):
+  - faulting code at file offset `0x1af4`-`0x1b1c` is a 32-byte-at-a-time
+    `memcpy` loop: `subs r2,r2,#32`; `ldmcs r1!,{r3,r4,ip,lr}` /
+    `stmiacs r0!,{r3,r4,ip,lr}` repeated twice per iteration (`r0`=dest,
+    `r1`=src, `r2`=len).
+  - register dump at fault: `r0=0x10` (destination advanced from null by one
+    `stmia` pair), `lr=0x0` (null return address), `r1=0x13ffe9a4` (valid
+    stack source). So the **memcpy destination is null**.
+  - iQuiz calls many `Metadata:*` ordinals (all currently stubbed to return 0);
+    one of these is the likely missing allocator/object-provider for the
+    destination buffer, but the exact ordinal is unproven.
+- shared conclusion: both titles dereference a null destination buffer/object
+  pointer that the HLE runtime should have allocated or linked. Do **not**
+  paper over this with a fake low-address mapping; the accuracy-first fix is to
+  identify the specific HLE call (Vortex: likely GL surface bind; iQuiz: likely
+  a `Metadata` object provider) and have it return/populate a real buffer.
+- investigation artifacts:
+  - Vortex logs: `/tmp/clicky_vortex_invest_20260620_211533/vortex{,_debug}.log`
+  - iQuiz logs: `/tmp/clicky_iquiz_invest_20260620_211533/iquiz_debug.log`
+
+Follow-up classification: ordinal `149` draw-adjacent state
+
+- evidence root: `/tmp/clicky_ord149_invest_20260620_211533/sims.log` (Sims
+  Bowling `1500C`, 2941 `OpenGLES:149` calls in a short headless run).
+- observed ABI: every `OpenGLES:149` call has **constant arguments**
+  `r0=0 r1=1 r2=0 r3=0x1807cbc8`, invoked once per draw between the material
+  bind (`159`) and `DrawElements` (`38`), from two guest callsites
+  (`lr=0x18005404`, `lr=0x180425d8`).
+- `r3=0x1807cbc8` lies beyond the file-backed image (Sims image is
+  `0x74010` bytes, mapped `0x18000000..0x18074010`), so it references a
+  BSS/runtime-populated state object, not a static table. The guest passes it
+  as an opaque token to the GL HLE and never dereferences it itself (Sims runs
+  with 0 fatals), so the current no-op is provably safe for existing draw
+  coverage.
+- conclusion: `149` is a per-draw bind of a fixed runtime state/context
+  object. Because the arguments are invariant and `DrawElements` already
+  rasterizes correct geometry without it, the no-op is correct and low-priority;
+  decoding the state block at `0x1807cbc8` is only needed if Sims-family
+  draw coverage stalls on a state-dependent gap.
 
 #### Honest status (stable but green)
 
