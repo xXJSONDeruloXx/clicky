@@ -105,9 +105,16 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - [x] Headed Tetris regression: 0 fatals, 0 skips, draws 9-14 distinct glyphs
       on correct font atlas.
 - [ ] **Ask user to confirm visual result of the menu text.**
-- [ ] Cross-game check: does the recorded-char path help PAC-MAN / Ms.
-      PAC-MAN / Texas Hold'em zero-UV skips? (They may not share the
-      `0x1801616c` callsite; verify before claiming.)
+- [x] Cross-game check: `0x1801616c` char-push helper is **Tetris-binary-
+      specific** (0 callers in all 5 sibling binaries — Pacman, MsPacman,
+      Holdem, Cubis2, Minigolf — each has different code at that offset).
+      The PC hook never fires for siblings → zero regression risk; the
+      `state+0x00 == 0x18023e24` vtable guard in `live_decode_generated_uvs`
+      further prevents any sibling from reaching the recorded-char path.
+      Sibling zero-UV skips (PAC-MAN `0x19`/`0x02`, etc.) are a SEPARATE
+      workstream (real missing-UV-array sprite draws / file-backed texture
+      routing), not scalar-formatter text. PAC-MAN headless smoke (25M cyc):
+      0 fatals, skip patterns identical to prior matrix baseline.
 - [ ] Cleanup: consider deprecating `live_find_texgen_text_cursor` cursor scan
       if the recorded path fully supersedes it (keep as fallback for now).
 
@@ -125,13 +132,52 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - Cycle calibration: 60M cycles → frame 960 (~62.5k cyc/frame); menu at ~11M.
 - Golden regression baseline (pre-fix): ~4808 rasterized, ~9 skipped, 0 fatals.
 
+## Cross-game check result (this iteration)
+
+Scanned all 5 sibling binaries for `bl 0x1801616c` callers and for the
+Tetris text-helper signature at file offset `0x1616c`:
+
+| Game | size | bl→0x1801616c callers | bytes@0x1616c matches Tetris? |
+|---|---:|---:|---|
+| Tetris 66666 | 0x256ec | 14 | yes (push{r4,r5,r6,lr};mov r4,r0;ldr r0,[r0,#0x14];mov r5,r1) |
+| Pacman AAAAA | 0xac8b4 | 0 | no (different fn) |
+| MsPacman 14004 | 0xc7678 | 0 | no |
+| Holdem 33333 | 0x5acd4 | 0 | no |
+| Cubis2 99999 | 0xa9df8 | 0 | no |
+| Minigolf 88888 | 0x37a1c | 0 | no |
+
+**Conclusion:** `0x1801616c` is a Tetris-binary-specific text-runtime helper
+(the EA Tetris engine's own statically-linked text code), NOT a shared-runtime
+ABI. The PC hook is therefore correctly Tetris-scoped. Siblings never execute
+it, so the recorded-char path never engages for them — confirmed by the
+`state+0x00 == 0x18023e24` vtable guard in `live_decode_generated_uvs` and the
+`live_is_texgen_text_object` font/state layout checks that gate
+`take_text_char_for_draw`. PAC-MAN headless smoke (25M cyc, post-fix): 0
+fatals, skip patterns identical to the prior matrix baseline (handle `0x19` =
+file-backed no-live-upload, handle `0x2` = zero-UV). No regression.
+
+The sibling zero-UV skips remain a separate workstream: those draws have a
+valid position array but no UV array and no texgen text object (they are real
+sprite/background draws missing UV data, not scalar-formatter text). Resolving
+them belongs to the zero-UV decode workstream noted in the prior
+`eapp-matrix-hardening` loop, not this text-rendering fix.
+
+## Status
+
+Tetris text rendering (both pointer-backed paths) is fixed from a logs +
+rundata perspective. **Awaiting user visual confirmation** of the menu text
+before declaring complete. If confirmed, the only remaining cleanup is
+evaluating whether the cursor-scan fallback can be removed; if the user
+reports the text is still wrong, iterate on the glyph-index→UV mapping
+(columns/cell_w/cell_h) or the font-tint decode.
+
 ## Notes
 - The `eapp-matrix-hardening` ralph loop (completed) established the broader
   UV/upload-matching context; this loop narrows in on the text-accuracy gap.
 - Always run headed for visual confirmation unless doing a quick RE watch.
   Headed command:
   `CLICKY_GL_TEXGEN_VERBOSE=1 ./scripts/tetris.sh --no-build --timeout 12`
-- Keep changes general: the PC-hook + recorded-char-seq design is a clean
-  runtime ABI model, not a per-title patch. The `0x1801616c` PC is Tetris's
-  binary address for a shared-runtime helper; sibling engines that link the
-  same runtime may hit the same convention (to verify per-game).
+- The PC-hook + recorded-char-seq design is a clean runtime ABI model, not a
+  hardcoded-string patch. The `0x1801616c` PC is Tetris-specific (its EA
+  engine's own text code); sibling engines use different text paths that
+  would need per-game RE if their text accuracy becomes a goal.
