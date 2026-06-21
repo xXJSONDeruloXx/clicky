@@ -414,8 +414,8 @@ Cross-game north-star priorities from this matrix:
 
 1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
 2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
-3. implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token
-4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, and the remaining Tetris pointer-text misses
+3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is UV/upload matching.**
+4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and the remaining Tetris pointer-text misses
 5. investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work
 
 Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`):
@@ -461,6 +461,19 @@ Follow-up validation for the PopCap `0x1080000c` / RAM-aperture blocker:
   - log: `/tmp/clicky_ram64_validate_20260620_203011/66666/logs/tetris_run_20260620_203025.log`
   - latest screenshot: `/tmp/clicky_ram64_validate_20260620_203011/66666_latest.png`
   - startup/menu state remains stable with the same known pointer-text UV/content gaps
+
+Follow-up validation for Texas Hold'em `OpenGLES:37 mode=5`:
+
+- implementation: model `mode=5` as standard GL ES `GL_TRIANGLE_STRIP`; decode
+  the active position/UV arrays for the full vertex count and rasterize
+  `count-2` triangles with the existing textured triangle rasterizer
+- targeted headed artifact root: `/tmp/clicky_mode5_validate_20260620_203634`
+- Texas Hold'em (`33333`) validation:
+  - log: `/tmp/clicky_mode5_validate_20260620_203634/33333/logs/tetris_run_20260620_203634.log`
+  - latest screenshot: `/tmp/clicky_mode5_validate_20260620_203634/33333_latest.png`
+  - prior matrix: repeated `live_draw skipped: unsupported mode=5 first=0 count=11`
+  - after fix: unsupported `mode=5` count is 0
+  - remaining blocker: the triangle-strip draw now skips as `no live upload matched triangle-strip UV span None (handle=0x23)`, so Texas has joined the broader UV/upload-state bucket instead of being blocked on an unknown primitive mode
 
 #### Honest status (stable but green)
 

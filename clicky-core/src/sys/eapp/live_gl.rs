@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::gl_decode::{format_from_gl, pix_payload_size};
 use super::rasterizer::{
-    framebuffer_hash, framebuffer_to_ppm, rasterize_quad_tinted, rasterize_solid_quad, Rgba8,
-    Texture, TextureFormat,
+    framebuffer_hash, framebuffer_to_ppm, rasterize_quad_tinted, rasterize_solid_quad,
+    rasterize_triangle_tinted, Rgba8, Texture, TextureFormat,
 };
 
 pub const FB_WIDTH: usize = 320;
@@ -28,8 +28,12 @@ pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
 /// arrays. Any other array format is preserved but not interpreted.
 pub const GL_FIXED: u32 = 0x140c;
 
-/// Confirmed DrawArrays mode token observed at every ordinal-37 call site.
+/// Confirmed DrawArrays quad mode token observed at most ordinal-37 call sites.
 pub const DRAW_MODE: u32 = 7;
+
+/// Standard GL ES `GL_TRIANGLE_STRIP`, observed in Texas Hold'em as
+/// `OpenGLES:37 mode=5 count=11`.
+pub const DRAW_MODE_TRIANGLE_STRIP: u32 = 5;
 
 /// The observed `mode=7` stream behaves like batched quads: count is always a
 /// positive multiple of 4, and the existing Tetris path is the 1-quad case.
@@ -460,7 +464,11 @@ impl LiveGlState {
     /// quads match by exact UV span; atlas sub-rects (e.g. Tetris menu A8
     /// strips) match the smallest decoded upload that contains the UV extents.
     fn select_upload_for_uvs(&self, uvs: &[(f32, f32); 4]) -> Option<usize> {
-        let (min_u, min_v, max_u, max_v) = uv_extents(uvs);
+        self.select_upload_for_uv_slice(uvs)
+    }
+
+    fn select_upload_for_uv_slice(&self, uvs: &[(f32, f32)]) -> Option<usize> {
+        let (min_u, min_v, max_u, max_v) = uv_extents_slice(uvs);
         let span_w = (max_u - min_u).round().max(1.0) as usize;
         let span_h = (max_v - min_v).round().max(1.0) as usize;
         if let Some(idx) = self.select_upload_by_dims(span_w, span_h) {
@@ -610,6 +618,82 @@ impl LiveGlState {
         record
     }
 
+    pub fn rasterize_triangle_strip_record(
+        &mut self,
+        draw_index: usize,
+        handle: u32,
+        state_ptr: u32,
+        translation: (f32, f32),
+        positions: &[(f32, f32)],
+        uvs: Option<&[(f32, f32)]>,
+        tint: Rgba8,
+    ) -> LiveDrawRecord {
+        let positions4 = first_four_positions(positions);
+        let uvs4 = uvs.map(first_four_uvs).unwrap_or([(0.0, 0.0); 4]);
+        let inferred_dim = uvs.map(infer_dims_from_uv_slice);
+        let selected_upload = uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs));
+        let mut record = LiveDrawRecord {
+            draw_index,
+            handle,
+            state_ptr,
+            translation,
+            positions: positions4,
+            uvs: uvs4,
+            has_uv: uvs.is_some(),
+            solid_color: None,
+            tint,
+            used_generated_uvs: false,
+            position_array: None,
+            uv_array: None,
+            enabled_arrays: Vec::new(),
+            state_words: Vec::new(),
+            bounds: bounds_for_slice(positions),
+            coverage: 0,
+            selected_upload,
+            inferred_dim,
+            skipped_reason: None,
+        };
+        let Some(upload_idx) = selected_upload else {
+            record.skipped_reason = Some(format!(
+                "no live upload matched triangle-strip UV span {:?} (handle={:#x})",
+                inferred_dim, handle
+            ));
+            return record;
+        };
+        let Some(texture) = self.uploads.get(upload_idx).and_then(|u| u.texture.clone()) else {
+            record.skipped_reason = Some(format!("upload #{upload_idx} has no decoded texture"));
+            return record;
+        };
+        if let Some(uvs) = uvs {
+            for i in 0..positions.len().saturating_sub(2) {
+                let tri = [
+                    (positions[i].0, positions[i].1, uvs[i].0, uvs[i].1),
+                    (
+                        positions[i + 1].0,
+                        positions[i + 1].1,
+                        uvs[i + 1].0,
+                        uvs[i + 1].1,
+                    ),
+                    (
+                        positions[i + 2].0,
+                        positions[i + 2].1,
+                        uvs[i + 2].0,
+                        uvs[i + 2].1,
+                    ),
+                ];
+                record.coverage += rasterize_triangle_tinted(
+                    &mut self.framebuffer,
+                    FB_WIDTH,
+                    FB_HEIGHT,
+                    &texture,
+                    &tri,
+                    tint,
+                );
+            }
+        }
+        record
+    }
+
     /// Produce the presented framebuffer (a copy), applying the configurable
     /// vertical presentation flip when enabled. The internal framebuffer is
     /// never mutated by presentation.
@@ -651,6 +735,10 @@ impl LiveGlState {
 }
 
 fn bounds_for(positions: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    bounds_for_slice(positions)
+}
+
+fn bounds_for_slice(positions: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     positions.iter().fold(
         (
             f32::INFINITY,
@@ -662,10 +750,30 @@ fn bounds_for(positions: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
     )
 }
 
+fn first_four_positions(positions: &[(f32, f32)]) -> [(f32, f32); 4] {
+    let mut out = [(0.0, 0.0); 4];
+    for (dst, src) in out.iter_mut().zip(positions.iter().copied()) {
+        *dst = src;
+    }
+    out
+}
+
+fn first_four_uvs(uvs: &[(f32, f32)]) -> [(f32, f32); 4] {
+    let mut out = [(0.0, 0.0); 4];
+    for (dst, src) in out.iter_mut().zip(uvs.iter().copied()) {
+        *dst = src;
+    }
+    out
+}
+
 /// Infer intended texture dimensions from texel-centered UVs. The captured
 /// UVs are half-texel centered (e.g. 0.5 .. 50.5 for a 50px texture), so the
 /// span rounds to the texture dimension.
 fn uv_extents(uvs: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    uv_extents_slice(uvs)
+}
+
+fn uv_extents_slice(uvs: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     uvs.iter().fold(
         (
             f32::INFINITY,
@@ -678,7 +786,11 @@ fn uv_extents(uvs: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
 }
 
 fn infer_dims_from_uvs(uvs: &[(f32, f32); 4]) -> (usize, usize) {
-    let (min_u, min_v, max_u, max_v) = uv_extents(uvs);
+    infer_dims_from_uv_slice(uvs)
+}
+
+fn infer_dims_from_uv_slice(uvs: &[(f32, f32)]) -> (usize, usize) {
+    let (min_u, min_v, max_u, max_v) = uv_extents_slice(uvs);
     let w = (max_u - min_u).round().max(1.0) as usize;
     let h = (max_v - min_v).round().max(1.0) as usize;
     (w, h)

@@ -1522,14 +1522,132 @@ impl Eapp {
         }
     }
 
+    fn live_handle_triangle_strip_draw(&mut self, args: [u32; 4]) {
+        let first = args[1] as usize;
+        let count = args[2] as usize;
+        if first != 0 || count < 3 {
+            warn!(target: "EAPP_GL", "live_draw skipped: unsupported triangle strip first={} count={}", first, count);
+            self.live_finalize_draw(None);
+            return;
+        }
+
+        if let Some(lg) = self.live_gl.as_mut() {
+            if lg.continuous_capture && !lg.frame_active {
+                warn!(target: "EAPP_GL", "triangle-strip draw outside active candidate frame; auto-beginning safely");
+                lg.note_draw_outside_frame();
+            }
+        }
+
+        let (
+            handle,
+            state_ptr,
+            translation,
+            pos_def,
+            pos_enabled,
+            enabled_arrays,
+            draw_index,
+            material_epoch,
+            explicit_uv_def,
+            explicit_uv_enabled,
+        ) =
+            {
+                let lg = match self.live_gl.as_ref() {
+                    Some(lg) => lg,
+                    None => return,
+                };
+                let mut enabled_arrays: Vec<u32> = lg.enabled_arrays.iter().copied().collect();
+                enabled_arrays.sort_unstable();
+                let (explicit_uv_def, explicit_uv_enabled) =
+                    if let Some(def) = lg.arrays.get(&1).cloned() {
+                        (Some(def), lg.enabled_arrays.contains(&1))
+                    } else if let Some(def) = lg.arrays.get(&2).cloned().filter(|d| {
+                        d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                    }) {
+                        (Some(def), lg.enabled_arrays.contains(&2))
+                    } else {
+                        (None, false)
+                    };
+                (
+                    lg.current_handle,
+                    lg.current_state_ptr,
+                    lg.translation,
+                    lg.arrays.get(&0).cloned(),
+                    lg.enabled_arrays.contains(&0),
+                    enabled_arrays,
+                    lg.draws.len(),
+                    lg.current_material_epoch,
+                    explicit_uv_def,
+                    explicit_uv_enabled,
+                )
+            };
+        let state_words = self.read_guest_words(state_ptr, 16);
+        let positions = match self.live_decode_positions_range(
+            &pos_def,
+            pos_enabled,
+            translation,
+            first,
+            count,
+        ) {
+            Some(p) => p,
+            None => {
+                warn!(target: "EAPP_GL", "triangle-strip draw{} skipped: position array unusable handle={:#x}", draw_index + 1, handle);
+                self.live_finalize_draw(None);
+                return;
+            }
+        };
+        let explicit = self.live_decode_uvs_range(
+            &explicit_uv_def,
+            explicit_uv_enabled,
+            material_epoch,
+            first,
+            count,
+        );
+        let tint = Rgba8::rgba(255, 255, 255, 255);
+        let mut record = match self.live_gl.as_mut() {
+            Some(lg) => lg.rasterize_triangle_strip_record(
+                draw_index,
+                handle,
+                state_ptr,
+                translation,
+                &positions,
+                explicit.as_deref(),
+                tint,
+            ),
+            None => return,
+        };
+        record.position_array = pos_def;
+        record.uv_array = explicit_uv_def;
+        record.enabled_arrays = enabled_arrays;
+        record.state_words = state_words;
+        if let Some(reason) = record.skipped_reason.as_ref() {
+            warn!(target: "EAPP_GL", "draw{} skipped: {}", draw_index + 1, reason);
+        } else {
+            info!(
+                target: "EAPP_GL",
+                "draw{} rasterized triangle-strip handle={:#x} vertices={} triangles={} cov={}",
+                draw_index + 1,
+                handle,
+                count,
+                count.saturating_sub(2),
+                record.coverage
+            );
+        }
+        self.live_finalize_draws(vec![record]);
+    }
+
     /// Ordinal 37: observed `DrawArrays(mode=7, first=0, count=4*N)`. Tetris
-    /// uses the single-quad case; several sibling titles batch multiple quads
-    /// in one call. Read the current arrays, apply the accumulated translation,
-    /// and rasterize each logical quad in guest order.
+    /// uses the single-quad case; several sibling titles batch multiple quads.
+    /// `mode=5` is also modeled as standard GL ES `GL_TRIANGLE_STRIP` for
+    /// Texas Hold'em. Read the current arrays, apply the accumulated
+    /// translation, and rasterize the guest primitives in order.
     fn live_handle_draw(&mut self, args: [u32; 4]) {
         let mode = args[0];
         let first = args[1] as usize;
         let count = args[2] as usize;
+        if mode == live_gl::DRAW_MODE_TRIANGLE_STRIP {
+            self.live_handle_triangle_strip_draw(args);
+            return;
+        }
         let Some(quad_groups) = live_gl::quad_group_count(mode, first, count) else {
             warn!(
                 target: "EAPP_GL",
