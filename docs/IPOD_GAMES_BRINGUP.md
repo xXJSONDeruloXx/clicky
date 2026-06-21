@@ -714,6 +714,53 @@ Follow-up investigation: UV/upload matching for PAC-MAN / Ms. PAC-MAN / Mini Gol
   would route such handles to their file-backed texture rather than skipping.
   No code patched this round; evidence recorded for the UV-matching workstream.
 
+Code-path map for the zero-UV decode gap (future-hardening reference)
+
+- The "no live upload matched UV span None" skip is emitted at
+  `clicky-core/src/sys/eapp/live_gl.rs:636` (the quad path,
+  `rasterize_quad_record`) and at `live_gl.rs:697` (the triangle-strip path,
+  `rasterize_triangle_strip_record`).
+- For ord37 `mode=7` quads (Tetris / PAC-MAN / Ms. PAC-MAN family) `has_uv=false`
+  arises in `clicky-core/src/sys/eapp/mod.rs` inside `live_handle_draw`
+  (the `quad_groups == 1` branch), when ALL of:
+  (a) the explicit UV array (`arrays[1]`, or `arrays[2]` when it is
+  `GL_FIXED` + 2 components) is absent/invalid/unenabled, AND
+  (b) `live_decode_generated_uvs(state_ptr)` returns `None` (no texgen text
+  object found for that handle), AND
+  (c) `quad_groups == 1` (single-quad fast path; multi-quad batches only
+  consult the explicit UV array).
+- For ord37 `mode=5` triangle strips (Texas Hold'em / Holdem) the matching
+  gap is in `live_handle_triangle_strip_draw` via
+  `live_decode_uvs_range_any_epoch` (epoch-agnostic, because arrays persist
+  across `159` material binds in this engine).
+- PAC-MAN confirmation (`/tmp/clicky_pacman_trace_20260620_221704/pacman.log`):
+  all 124 skips are `UV span None` for handles `0x19` (draw1) and `0x02`
+  (draw38); the draws have a valid position array but no explicit UV array and
+  no texgen object. The existing per-draw dim/handle heuristic matches the
+  105,696 rasterized draws correctly; only the no-UV draws skip.
+- Candidate general fix (not yet implemented, needs Tetris golden guard): for
+  no-UV draws that DO have a matching live upload by dims/handle, synthesize
+  full-coverage default UVs `[(0,0),(1,0),(1,1),(0,1)]` instead of skipping.
+  Must verify this does not regress Tetris, whose no-UV draws may be
+  intentional clears / solid fills handled elsewhere.
+
+Lifecycle semantics for the no-`ord158` engine family (Sims / Sudoku / Solitaire)
+
+- These titles emit `OpenGLES:157` (present) with NO `OpenGLES:158` (begin).
+  This is NOT a frame-discard bug: `live_handle_draw_elements` (ord38) at
+  `clicky-core/src/sys/eapp/mod.rs:1886` already calls `begin_frame()`
+  implicitly when no frame is active, so frames reach `status=presented`.
+- The `begin=@None` shown in `frame_diag` lines is only a missing-label
+  display artifact — the diag builder searches `ordinal_trace` for the
+  `candidate_begin_ordinal` (158) and prints `@None` when absent; the implicit
+  begin via `begin_frame()` does not push a 158 entry to `ordinal_trace`.
+  No runtime impact; purely cosmetic in logs.
+- These titles idle (boot-render then sit on a static title screen) because
+  the headless harness injects no clickwheel input (`app_events=[]`
+  throughout `EAPP_PROGRESS`). Sims Bowling is the working sibling because it
+  has an animated attract mode. Advancing them needs a headless
+  input-injection harness, not an eapp runtime change.
+
 Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
 
 - instrumentation: added a register-state dump at the eapp memory-fault path

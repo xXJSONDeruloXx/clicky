@@ -87,6 +87,23 @@ literal target array (module, ordinal) -> function
 | `GL:159` | confirmed count | only `r0`, `r1` are set at the call site; other registers are caller leftovers |
 | `GL:175` | confirmed count | only `r0`, `r1`, `r2` are set at the call site; `r3=0` |
 
+### Cross-title ordinal decoding (post-matrix hardening)
+
+Resolved during the 2026-06-20 eapp matrix hardening pass. These are
+ABI-level facts confirmed across multiple titles; per-game evidence lives in
+`docs/IPOD_GAMES_BRINGUP.md`.
+
+| Ordinal | Resolved semantics | Cross-title evidence |
+|---------|--------------------|----------------------|
+| `GL:37` | `DrawArrays(mode, first, count)`. `mode=7` = `GL_QUADS` (Tetris / PAC-MAN / Ms. PAC-MAN); `mode=5` = `GL_TRIANGLE_STRIP` (Texas Hold'em); other modes guarded. Triangle-strip UV decode is epoch-agnostic because vertex arrays persist across `159` material binds. | Tetris, PAC-MAN, Ms. PAC-MAN, Texas Hold'em |
+| `GL:38` | `DrawElements(GL_TRIANGLE_STRIP, count, GL_UNSIGNED_SHORT, indices_ptr)`: `r0=0x5`, `r1=count`, `r2=0x1403`, `r3=index_ptr`. Sims/Sudoku/Solitaire family draw path. Used by engines that emit NO `GL:158` begin; the first `DrawElements` is the practical frame begin. | Sims Bowling/Pool, Sudoku, Royal Solitaire |
+| `GL:99` | Texture upload (Tex[Sub]Image2D). See ABI table above. New `GL_LUMINANCE_ALPHA` (`0x190a`) + `GL_UNSIGNED_BYTE` (`0x1401`) path decoded for Cubis 2 / LOST. | Tetris, PAC-MAN, Ms. PAC-MAN, Mini Golf(no live uploads), Cubis 2, LOST |
+| `GL:45` | TWO distinct layouts depending on engine family: (Tetris/Holdem) descriptor at `r1` where word1 = GL texture name, word2 = source_format, word4/5 = width/height; tagging `LiveGlUpload.tex_name` from word1 is exact. (Mahjong) `r1+0x04` → texture object; obj word2 = material handle, word4 = packed dims (`h<<16\|w`), word9 = pixel ptr, word10 = format token (`0x8808`/`0x0801`). (Holdem) `r1` points to zeroed work-RAM scratch — no tex name; do not tag. | Tetris, Holdem, Mahjong |
+| `GL:159` | Material/texture bind: `r0` = GL texture name (handle). Pairs `LiveGlUpload`s to draw-time handles. | all titles |
+| `GL:149` | Safe no-op per-draw bind of a fixed runtime state object. Constant args `r0=0 r1=1 r2=0 r3=<BSS ptr>`; `r3` is beyond the file-backed image and the guest never derefs it. Classified as provably safe to no-op. | Sims family |
+| `GL:157` | Frame present (surface handle bind + swap). `r0=0x0`, `r2=0xbf800000`(-1.0f), `r3=0x3f800000`(1.0f). | all titles |
+| `GL:158` | Frame begin. Some engine families (Sims/Sudoku/Solitaire) emit ZERO `158`s and rely on the `GL:38` path's implicit `begin_frame()` instead. | Tetris (uses 158), Sims/Sudoku/Solitaire (no 158) |
+
 ### 99 ABI table
 
 | Field | Location | Meaning |
@@ -195,6 +212,18 @@ entry()            → game initialization
 init(app_obj)      → optional runtime init
 aux(app_obj)       → recurring callback (frame-like in Tetris; not universally confirmed as the sole frame callback)
 ```
+
+### GL frame begin/present ordinals
+
+- `GL:158` = frame begin, `GL:157` = frame present (surface handle bind +
+  swap). Tetris emits the strict `158 ... draws ... 157` sequence per frame.
+- A second engine family (Sims Bowling/Pool, Sudoku, Royal Solitaire) emits
+  `GL:157` presents with **no `GL:158` begin**; their draw path is `GL:38`
+  (`DrawElements`), and the HLE treats the first `GL:38` of a frame as an
+  implicit `begin_frame()` so frames still reach `presented` status. The
+  `begin=@None` shown in `frame_diag` logs for these titles is cosmetic only
+  (the diag searches `ordinal_trace` for the 158 ordinal and prints `@None`
+  when absent); it is not a frame-discard bug.
 
 ---
 
