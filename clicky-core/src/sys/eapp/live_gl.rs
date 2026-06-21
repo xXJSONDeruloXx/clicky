@@ -204,6 +204,17 @@ pub struct LiveGlState {
     pub first_changed_frame: Option<u64>,
     pub unique_presented_hashes: HashSet<u64>,
     pub repeated_presented_count: u64,
+    /// Per-frame scalar-formatter char sequences captured from the guest
+    /// `text_push_char` callsite (e.g. `0x1801616c`). Keyed by the text_obj
+    /// pointer passed as `r0`. Each call appends the char (`r1`) so that an
+    /// ordered run like `HH:MM AM` becomes `['H','H',':','M','M','A','M']`.
+    /// This is the general model for clickwheel-game runtime text pushers
+    /// that compute chars in registers rather than writing a UTF-16 buffer.
+    pub text_char_seqs: HashMap<u32, Vec<u32>>,
+    /// Per-run consumption index into `text_char_seqs[text_obj]`. Advanced by
+    /// one each time a draw consumes a recorded char. Reset on material bind
+    /// and per-frame so each glyph run restarts at index 0.
+    pub text_char_consumed: HashMap<u32, usize>,
 }
 
 impl LiveGlState {
@@ -251,6 +262,8 @@ impl LiveGlState {
             unique_presented_hashes: HashSet::new(),
             repeated_presented_count: 0,
             presented: None,
+            text_char_seqs: HashMap::new(),
+            text_char_consumed: HashMap::new(),
         }
     }
 
@@ -267,6 +280,39 @@ impl LiveGlState {
         self.draws.clear();
         self.draw_count_in_frame = 0;
         self.ordinal_trace.clear();
+        // Scalar-formatter char sequences are rebuilt by the guest each frame,
+        // so drop the prior frame's recorded pushes+consumption.
+        self.text_char_seqs.clear();
+        self.text_char_consumed.clear();
+    }
+
+    /// Record one scalar-formatter char push captured at the guest
+    /// `text_push_char` callsite (`r0=text_obj`, `r1=char`). The sequence is
+    /// consumed in order by draws that bind this text_obj's handle. This is
+    /// the general model for clickwheel-game runtime text pushers that pass
+    /// chars in registers rather than writing a UTF-16 buffer.
+    pub fn record_text_char_push(&mut self, text_obj: u32, char: u32) {
+        self.text_char_seqs.entry(text_obj).or_default().push(char);
+    }
+
+    /// Take the next recorded char for `text_obj`, advancing the per-run
+    /// consumption index. Returns `None` if no chars have been recorded for
+    /// this text_obj or the run has already consumed all of them.
+    pub fn take_text_char_for_draw(&mut self, text_obj: u32) -> Option<u32> {
+        let seq = self.text_char_seqs.get(&text_obj)?;
+        let idx = self.text_char_consumed.entry(text_obj).or_insert(0);
+        if *idx >= seq.len() {
+            return None;
+        }
+        let ch = seq[*idx];
+        *idx += 1;
+        Some(ch)
+    }
+
+    /// Reset the per-run consumption index for a text_obj on material bind,
+    /// so a freshly-bound text run restarts its char consumption at index 0.
+    pub fn reset_text_char_consumption(&mut self, text_obj: u32) {
+        self.text_char_consumed.insert(text_obj, 0);
     }
 
     /// Format the current frame's ordinal trace into a compact one-line

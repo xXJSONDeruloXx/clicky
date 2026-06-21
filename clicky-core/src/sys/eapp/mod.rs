@@ -47,6 +47,20 @@ const WORK_RAM_BASE: u32 = 0x1000_0000;
 // guest heaps/arenas: PopCap titles were observed copying assets past both
 // 0x1080_0000 (8 MiB) and 0x1200_0000 (32 MiB).
 const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
+
+/// Guest callsite for the shared eapp text-runtime "push one char into a
+/// text object" helper. Convention (recovered from disassembly of the Tetris
+/// scalar formatter at `0x18008480..0x1800857c`): `r0 = text_obj`,
+/// `r1 = char code unit` (ASCII for digits/letters/`:`, UTF-16 for wider
+/// glyphs). The helper computes the per-glyph texgen UVs internally, but for
+/// titles that share this runtime (Tetris and its sibling engine family) the
+/// pushed char is the authoritative per-glyph selector and is only available
+/// at this callsite — it is never written into a UTF-16 buffer for the scalar
+/// (register-computed) formatter path. Recording it here lets the renderer
+/// reconstruct the intended text without hardcoding strings. The constant is a
+/// per-binary address, but the convention is shared-runtime; non-Tetris titles
+/// simply never hit this PC and are unaffected.
+const TEXT_PUSH_CHAR_PC: u32 = 0x1801_616c;
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
 const TRAMPOLINE_STRIDE: u32 = 0x20;
@@ -900,6 +914,19 @@ impl Eapp {
         if let Some(&import_idx) = self.trampoline_to_import.get(&pc) {
             self.handle_import(import_idx)?;
             return Ok(());
+        }
+
+        // Capture scalar-formatter char pushes at the shared-runtime text
+        // helper callsite. The char (r1) is the authoritative per-glyph
+        // selector for the register-computed formatter path (Tetris draws
+        // 9-14, `HH:MM AM/PM`), where no UTF-16 buffer is ever written.
+        if pc == TEXT_PUSH_CHAR_PC {
+            let mode = self.cpu.mode();
+            let text_obj = self.cpu.reg_get(mode, 0);
+            let char_code = self.cpu.reg_get(mode, 1);
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.record_text_char_push(text_obj, char_code);
+            }
         }
 
         self.maybe_patch_guest_state(pc);
@@ -2504,10 +2531,25 @@ impl Eapp {
             Some(ptr) if self.live_is_texgen_text_object(ptr, Some(state_ptr)) => ptr,
             _ => self.live_find_texgen_text_object()?,
         };
-        let text_ptr = self.live_find_texgen_text_cursor(text_obj).or_else(|| {
-            self.read_guest_u32(sp.wrapping_add(0x10))
-                .filter(|ptr| *ptr != 0)
-        })?;
+        // Prefer the per-frame recorded char sequence captured at the guest
+        // `text_push_char` callsite. This is the authoritative per-glyph
+        // selector for the scalar (register-computed) formatter path, which
+        // never writes a UTF-16 buffer. Falls back to the cursor scan when no
+        // char has been recorded (e.g. curser-advance UTF-16 path).
+        let recorded_ch = self
+            .live_gl
+            .as_mut()
+            .and_then(|lg| lg.take_text_char_for_draw(text_obj));
+        // `text_ptr` is only used by the cursor-scan fallback; keep a
+        // sentinel for logging when the recorded path is taken.
+        let text_ptr = recorded_ch
+            .map(|_| 0u32)
+            .or_else(|| {
+                self.live_find_texgen_text_cursor(text_obj).or_else(|| {
+                    self.read_guest_u32(sp.wrapping_add(0x10))
+                        .filter(|ptr| *ptr != 0)
+                })
+            })?;
         let font_obj = match self.read_guest_u32(text_obj.wrapping_add(0x14)) {
             Some(ptr) if ptr != 0 => ptr,
             _ => {
@@ -2539,24 +2581,28 @@ impl Eapp {
                 return None;
             }
         };
-        let ch = match (
-            self.read_guest_u8(text_ptr),
-            self.read_guest_u8(text_ptr.wrapping_add(1)),
-        ) {
-            (Some(lo), Some(hi)) => u16::from_le_bytes([lo, hi]) as u32,
-            _ => {
-                if texgen_verbose_enabled() {
-                    info!(
-                        target: "EAPP_GL",
-                        "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} state_ptr={:#010x} reason=missing_text_bytes",
-                        text_obj,
-                        text_ptr,
-                        font_obj,
-                        table_a,
-                        state_ptr
-                    );
+        let ch = if let Some(ch) = recorded_ch {
+            ch
+        } else {
+            match (
+                self.read_guest_u8(text_ptr),
+                self.read_guest_u8(text_ptr.wrapping_add(1)),
+            ) {
+                (Some(lo), Some(hi)) => u16::from_le_bytes([lo, hi]) as u32,
+                _ => {
+                    if texgen_verbose_enabled() {
+                        info!(
+                            target: "EAPP_GL",
+                            "texgen_generated_uvs_fail text_obj={:#010x} text_ptr={:#010x} font_obj={:#010x} table_a={:#010x} state_ptr={:#010x} reason=missing_text_bytes",
+                            text_obj,
+                            text_ptr,
+                            font_obj,
+                            table_a,
+                            state_ptr
+                        );
+                    }
+                    return None;
                 }
-                return None;
             }
         };
         if ch == 0 || !Self::is_plausible_texgen_char(ch as u16) {
