@@ -171,6 +171,7 @@ fn main() -> DynResult<()> {
             None => system.run(),
         };
         system.log_top_imports(25);
+        system.drain_watch_log();
         if std::env::var("EAPP_RAMSCAN").is_ok() {
             system.scan_for_framebuffer();
         }

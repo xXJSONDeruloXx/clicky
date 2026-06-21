@@ -504,6 +504,40 @@ impl Eapp {
         Ok(())
     }
 
+    /// Drain and log the accumulated write-watchpoint hits, if any. The watch
+    /// range is set via `CLICKY_EAPP_WATCH=addr,len`. Unlike the fatal-path
+    /// dump, this is safe to call on graceful shutdown / after a bounded run,
+    /// which makes the RE tool usable for titles that never fault (e.g.
+    /// Tetris). Each hit is tagged with the guest PC that performed the write
+    /// so the writer of any watched field can be identified.
+    pub fn drain_watch_log(&mut self) {
+        if self.bus.watch_log.is_empty() {
+            return;
+        }
+        let total = self.bus.watch_log.len();
+        warn!(
+            target: "EAPP",
+            "watch drain: {} hits; logging all:",
+            total,
+        );
+        for hit in self.bus.watch_log.drain(..) {
+            // Render the value as both hex and a plausible ASCII char, since
+            // the most common RE question is "where did the guest store this
+            // character?". A u16/char value shows up as a low-byte printable.
+            let lo = (hit.val & 0xff) as u8;
+            let ascii = if (0x20..=0x7e).contains(&lo) {
+                format!(" '{}'", lo as char)
+            } else {
+                String::new()
+            };
+            warn!(
+                target: "EAPP",
+                "  write addr={:#010x} val={:#010x}{} pc={:#010x}",
+                hit.addr, hit.val, ascii, hit.pc,
+            );
+        }
+    }
+
     /// Log the most-frequent import calls seen so far. Useful for finding
     /// render-critical ordinals inside the per-frame loop.
     pub fn log_top_imports(&self, limit: usize) {
@@ -4750,6 +4784,18 @@ impl Memory for EappBus {
     }
 
     fn w8(&mut self, offset: u32, val: u8) -> MemResult<()> {
+        if let Some((start, end)) = self.watch {
+            if (start..end).contains(&offset) {
+                self.watch_log.push(WatchHit {
+                    addr: offset,
+                    val: val as u32,
+                    pc: self.pending_pc,
+                });
+                if self.watch_log.len() > 4096 {
+                    self.watch_log.truncate(4096);
+                }
+            }
+        }
         match offset {
             FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
                 self.image.w8(offset - FILE_VMA_BASE, val)
@@ -4762,6 +4808,18 @@ impl Memory for EappBus {
     }
 
     fn w16(&mut self, offset: u32, val: u16) -> MemResult<()> {
+        if let Some((start, end)) = self.watch {
+            if (start..end).contains(&offset) {
+                self.watch_log.push(WatchHit {
+                    addr: offset,
+                    val: val as u32,
+                    pc: self.pending_pc,
+                });
+                if self.watch_log.len() > 4096 {
+                    self.watch_log.truncate(4096);
+                }
+            }
+        }
         match offset {
             FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
                 self.image.w16(offset - FILE_VMA_BASE, val)
