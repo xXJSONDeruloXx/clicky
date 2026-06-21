@@ -1742,3 +1742,247 @@ out WHO is SUPPOSED to write byte [0x18025674]. Candidate leads:
 5. Re-enable `CLICKY_EAPP_ASYNC3_COMPLETE=1` alongside the byte writer to see
    if BOTH need to fire for the loader path to complete properly.
 
+
+## Iteration 18 — REVERSED: legit byte-setter `0x18005034` + 4 callers + ABI gap suspected
+
+Goal: act on iter-17 next-step priorities. Find the legitimate host-bound writer of
+`[0x18025674]` byte and replace the env-gated TEST_READY injection with a real ABI fix.
+NO code changes this iteration (pure RE); default path unchanged (golden).
+
+### Static RE: the legit byte-setter function
+
+Iteration 17 found that **byte `[0x18025674]` is never written by guest code** and
+wrote it via a TEST_READY env hack. Iteration 18 traced what would happen
+if the byte were set legitimately: the writer exists at **`0x18005034`**, a tiny
+4-instruction leaf function:
+
+```
+0x18005034: e59f1008  ldr  r1, [pc, #8]   @ 0x18005044  ; r1 = 0x18025674
+0x18005038: e3a00001  mov  r0, #1                       ; r0 = 1
+0x1800503c: e5c10000  strb r0, [r1]                     ; [0x18025674] = byte 1  ★ WRITER
+0x18005040: e12fff1e  bx   lr                            ; return
+0x18005044: 18025674 (literal pool: the byte address)
+```
+
+### Static RE: four callers of the byte-setter
+
+Found exactly **4 callers** of `0x18005034`:
+
+| caller | instr | outer fn | path |
+|---|---|---|---|
+| `0x180125fc: bl 0x18005034` | bl | `0x180125c0` | input-driven (bit 0x10 = menu button) |
+| `0x18015874: bl 0x18005034` | bl | `0x18015830` | input-driven (bit 0x10 = menu button) |
+| `0x1801b814: b 0x18005034`   | tail-call | `0x1801b630` | audio-completion-driven (clock sub call) |
+| `0x1801c038: b 0x18005034`   | tail-call | `0x1801bfd8` | audio-cleanup-driven (via standalone fn `0x18004060`) |
+
+### Caller 1 (`0x180125fc`) and Caller 2 (`0x18015874`) — input-driven
+
+Both functions check `tst r5, #16` (bit `0x10`) of an event-flag arg, after a
+shared call `bl 0x1800908c`. If bit `0x10` is set, they `bl 0x18005034` (set the
+byte). This matches iter-9's hypothesis: **scripted `menu` event id 1 → bit
+`0x10` → byte-setter fires**. So pressing the menu button on a controller would
+legitimately write the byte, advancing state past the legal screen.
+
+`0x1800908c(arg2)` is itself: `tst r2,#8 → mov r0,#8`; `tst r2,#2 → r0,#2`;
+`tst r2,#4 → r0,#4`; else `r0, #0`. So it's an event-bit dispatch.
+
+### Caller 3 (`0x1801b814`) — audio-completion path via state-machine
+
+Call chain:
+1. state-machine sub `0x18004088` (called by `0x18005314`) enters the
+   `count>=3 && byte==0` branch and tail-calls `b 0x1801b8b4` (`0x180040cc`).
+2. Function `0x1801b8b4` (a clock/aio-related function) `bl 0x1801b630` from
+   `0x1801b97c`.
+3. Function `0x1801b630` (388-byte-slot audio destructor-style loop) eventually
+   tail-calls `b 0x18005034` at `0x1801b814` to set the ready byte.
+
+`0x18004088` HAS been confirmed in iter 17 to run every frame in state=1 status
+(`0x1800531c` writes to `[r4]` `0x4088` 238 times with return 2 — but wait, return
+2 doesn't set the byte!).
+
+Hmm, there's a contradiction: iter 17 said `0x18004088` returns 2 most frames
+then 0 (clock tail call); never 5. But the chain `0x1801b8b4 → 0x1801b630 →
+0x18005034` would always write the byte if executed — which contradicts iter
+17's "byte never written" finding.
+
+Resolution: either `0x1801b8b4` doesn't reach `0x1801b630` every time the
+state-machine tail-calls it (some short-circuit / null-object/path condition),
+or `0x1801b630` doesn't reach caller 3 (`0x1801b814`) without some precondition.
+
+### Caller 4 (`0x1801c038`) — audio-cleanup via standalone function
+
+Call chain:
+1. Standalone function `0x18004060..0x1800407c` loads count from `[*0x18025678]`,
+   if `count >= 3` branches `bge 0x1801bfd8` (caller 4's function). Called from
+   `0x180043f0: bl 0x18004060` and `0x1800538c: bl 0x18004060`.
+2. Function `0x1801bfd8` (caller 4 function body):
+   ```
+   0x1801bfd8: push {r4, lr}
+   0x1801bfdc: mov r4, r0                        ; r4 = arg0 (clock_obj passed in)
+   0x1801bfe0: ldr r0, [r0, #0x2c]                ; r0 = [clock_obj+0x2c]
+   0x1801bfe4: cmp r0, #0
+   0x1801bfe8: moveq r0, #1
+   0x1801bfec: popeq {r4, pc}                      ; ← if [clock_obj+0x2c]==0, return 1 (NO byte write)
+   0x1801bff0: ldr r1, [r0]                        ; r1 = [r0+0] = vtable
+   0x1801bff4: add lr, pc, #4                      ; lr = next instr
+   0x1801bff8: ldr r1, [r1, #0x40]                 ; r1 = vtable[16] (vcall)
+   0x1801bffc: bx r1                               ; → second vtable method
+   0x1801c000: ldr r0, [r4, #0x2c]
+   0x1801c004: bl 0x18009118                       ; some cleanup sub
+   0x1801c008: mov r1, r0
+   0x1801c00c: ldr r0, [r4, #0xb8]                 ; r0 = [arg0+0xb8] (audio thing)
+   0x1801c010: bl 0x18020744                       ; release call
+   0x1801c014: ldr r0, [r4, #0x2c]
+   0x1801c018: add lr, pc, #8
+   0x1801c01c: ldr r1, [r0]                         ; vtable again
+   0x1801c020: ldr r1, [r1, #0x44]                 ; slot 17
+   0x1801c024: bx r1                                ; → third vtable method (finalizer?)
+   0x1801c028: mov r0, #1
+   0x1801c02c: pop {r4, pc}                         ; return 1
+   0x1801c030: mov r1, #1
+   0x1801c034: strb r1, [r0, #0x54]                 ; ← final path: write 1 to [r0+0x54]
+   0x1801c038: b 0x18005034                          ; ← tail-call byte-setter
+   ```
+3. So `0x1801bfd8` either returns early (if audio queue is null) OR does a
+   complete destructor dance and tail-calls byte-setter.
+
+**The KEY gate**: `[clock_obj+0x2c]` (= `0x1005f713c` since clock_obj = `0x1005f710`).
+This field holds a pointer to an audio sub-object. If null (no audio queue
+initialized), `0x1801bfd8` returns 1 immediately without setting the byte.
+
+### The suspected ABI gap: Audio:0 / Audio:1 / Audio:23 + callback structs
+
+From the iter-17/18 startup_progress imports:
+```
+imports=[...,Audio:0=10,Audio:1=10,Audio:23=10,...]
+```
+
+When Tetris calls Audio:23 (= host import 23 on the Audio interface):
+- lr=0x180059a0 (= site `0x1800599c: bl 0x18000758` — wait, actually LR
+  matches `bl 0x18000758` so 0x18000758 is the tetris-side audio wrapper)
+- r2=**0x1801bfc0** (= a callback FUNCTION-POINTER ARRAY / vtable struct)
+- r3=**0x18002c5c** (ctx)
+
+The address `0x1801bfc0` is a literal offset within the caller-4 block —
+specifically, `0x1801bfc0` is the START of a small 4-entry function table:
+
+| offset | vma | function | behavior |
+|---|---|---|---|
+| +0x00 | `0x1801bfc0` | `mov r0, #3; bx lr` | returns 3 |
+| +0x08 | `0x1801bfc8` | `add r0, r0, #0x70; bx lr` | r0 += 0x70 |
+| +0x10 | `0x1801bfd0` | `mov r0, #1; bx lr` | returns 1 |
+| +0x18 | `0x1801bfd8` | (caller-4 function) | audio destructor + byte-setter |
+
+The TI firmware Audio:23 / Audio:1 receives this callback-struct pointer in
+`r2`, presumably stores it, and **invokes index 0x18 (`0x1801bfd8`) when an
+audio sample finishes playing** to notify Tetris. That call eventually
+tail-calls `0x18005034` (the byte-setter), advancing state legal→menu.
+
+**On our emulator**, Audio:23 / Audio:1 are stubbed to return success without
+ever invoking any registered callback later. Hence:
+- The audio callback struct is registered but the host never schedules the
+  completion callback.
+- `[clock_obj+0x2c]` (the audio queue) may stay null or unconfigured
+  because the Audio:23 ABI didn't fully run.
+- Therefore `0x1801bfd8` short-circuits at `0x1801bfec: popeq {r4, pc}` every
+  time it's reached, because `[clock_obj+0x2c] == 0`.
+- Therefore the legitimate byte writer `0x18005034` is never called via caller 4.
+- Same gating likely applies to caller 3's chain via `0x1801b8b4 → 0x1801b630`.
+
+### Dynamic RE: experiment with TEST_READY + ASYNC3_COMPLETE together
+
+Ran `CLICKY_EAPP_TEST_READY=1 CLICKY_EAPP_ASYNC3_COMPLETE=1` (the env flag from
+iter 17 that force-writes byte 1, plus the iter-10 ABI completion fix that's
+off by default).
+
+Results (`/tmp/tet_iter18_test_ready_async3.log`,
+`/tmp/tet_iter18Verbose.log`):
+- frame 1: state=0, count=0, byte=0
+- frame 2: state=1, count=1, byte=1 (loader kicked in; TEST_READY wrote byte)
+- frame 3: state=5, count=4, byte=1 (state advanced 1→5)
+- frame 4+: state=6 stable, byte=1, fb_hash=0x68c64e2693747153
+- 0 fatal, 0 skip, maxframe ~5550
+
+**Labels DID partially materialize** — 2 text_obj diagnostics at frame 2:
+- `0x100e5a80` and `0x100e5c00`, both with `pushed=93 consumed=0` MISMATCH
+- ASCII: `"Tetris(R)&(C)1985-2006TetrisHoldingLLC.GameDesignbyAlexeyPajitnov.TetrisLogoDesignByRogerDean"`
+
+These are **legal-text objects** (93 chars × 2 text_objs = 188 total chars).
+With `CLICKY_GL_TEXGEN_VERBOSE=1`, draw_detail count for frame 2 shot up to
+**191 draws** dominated by `file=f8x10text3_a8.pix` (the legal font atlas) —
+**186 of 191 draws actually rendered the legal text glyphs** (1 DrawDetail × 1
+background `screenBG_565.pix`, 1 logo `tetrisLogoT_4444.pix`, 1 EA logo,
+186 legal-text glyphs).
+
+Iter 17's TEST_READY-only run produced framebuffer hash `0x50ab75c7bf00e5a4`
+(only logos + bg). Enabling ASYNC3_COMPLETE changed the hash to
+`0x68c64e2693747153` — meaning additional content (the legal text glyphs)
+WAS added.
+
+**However no expected menu labels (MENU/PLAY/...) are pushed or drawn**, because:
+- The byte write happens too early — by frame 4 state already advanced to 6
+  before the legal-screen dwell completed.
+- After state reaches 6 the game's render loop doesn't issue additional text
+  pushes; the framebuffer freezes mid-legal-text.
+
+### Screenshot artifact (state=1 / legal-text frame)
+
+`/tmp/tetris_iter18_test_ready_async3_menu.png` (320x240 RGB). Pixel analysis:
+- avg lum 69.3/255 (medium bright)
+- avg r/g/b 47/60/101 (bluish legal-screen palette)
+- 64.7% pixels have lum > 40 (significant content)
+- 5.0% pixels have lum > 180 (bright = glyphs/sprites)
+- **bright content bbox: x=[9..279] y=[12..237]** — wider/taller than iter 17's
+  xbbox of `x=[63..279] y=[12..153]`, consistent with the legal text glyphs
+  being drawn across most of the vertical screen range.
+
+Capture manifest: only one startup ppm captured (at frame 2: hash
+`0xd0cb4fe54923dbbd`). Final hash `0x68c64e2693747153` is the state=6 frozen
+frame (no separate capture triggered because the script only dumps on
+hash-change events).
+
+### Conclusion
+
+Iter 18 REVERSED the legit byte-setter `0x18005034` and its 4 callers.
+- 2 callers are input-driven (menu button) — proven via iter 9 already.
+- 2 callers are audio-completion-driven, gated on the audio queue being
+  initialized (`[clock_obj+0x2c] != 0`).
+
+The legit trigger is likely the Audio:23 / Audio:1 callback ABI:
+Audio:23 takes a callback struct (`r2=0x1801bfc0`) containing a 4-entry
+vtable of mini-functions; the TI firmware invokes index 0x18 (`0x1801bfd8`)
+on audio completion; that runs the destructor dance and tail-calls
+`0x18005034` (byte-setter) — advancing state legal→menu.
+
+Our emulator returns Audio:23 / Audio:1 as success without invoking the
+registered callbacks later, so the legit byte-write never fires and the
+state machine is gated on byte `[0x18025674]=0` forever.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- Default (no env) golden headed: 0 fatal, 0 skip, maxframe 140 (golden).
+- TEST_READY+ASYNC3_COMPLETE combined: 0 fatal, 0 skip, maxframe ~5550;
+  legal text loads (188 glyph draws). No menu labels yet.
+
+### Next (iteration 19 priorities)
+
+1. **Watch `[clock_obj+0x2c]` (`0x1005f713c`) on default boot** — confirm the
+   suspected null gate. Use `CLICKY_EAPP_WATCH=0x1005f713c,4`.
+2. **Reverse Audio:23/Audio:1 ABI**: identify what the firmware struct fields
+   mean (callback table, completion notification dispatch). Most likely the
+   TI firmware Audio:23 stores `r2` (callback ctx) + `r3` (ctx-arg) in an
+   internal table; when an audio sample finishes, it dispatches the
+   callback struct index 0x18 with a `bl 0x1801bfd8`.
+3. **Emulate the Audio:23 completion callback** in our handler:
+   - Track Tetris's registered `r2` callback struct + `r3` ctx.
+   - After some emulated host time (say N ms), invoke
+     `0x1801bfd8(ctx_or_obj_ptr)` via the runner's pending-call queue.
+4. **OR alternatively**: time the TEST_READY byte write to fire AFTER the
+   legal-screen dwell time completes (e.g., delay writes by 80+ frames),
+   letting the legal text fully render before state advances to 6. Verify
+   whether menu labels materialize at state=6 after the proper dwell.
+5. Once proper menu labels appear: ask user to visually confirm the menu
+   screenshot matches the oracle (MENU/PLAY/VOLUME/OPTIONS/RECORDS/HELP/EXIT).
+6. Cleanup: remove temp RE hooks once labels are sane.
+
