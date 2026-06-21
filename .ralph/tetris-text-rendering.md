@@ -2331,3 +2331,138 @@ Will commit the new env diagnostics + the PC-hook env (`CLICKY_EAPP_AUDIO_SLOT_B
    injection once the legitimate source of `[0x18025eb0]` is identified and
    emulated.
 
+
+## Iteration 21 — REFLECTION: mailbox confirmed + state=6 evo with menu glyphs
+
+Reflection checkpoint before continuing iteration's 3 items.
+
+### Progress assessment
+
+1. **Major proof points from prior iterations**
+   - Iter 17-20: full state-machine gate decoded; byte-setter `0x18005034`
+     advances state 1→5→6 when `[0x18025674]=1`.
+   - Iter 19: real final gate is audio slot byte `[output+0x8c]` bits 0x10/0x08
+     — must be set for caller-3's `0x1b630` to reach byte-setter.
+   - Iter 20: PC-hook injection at entry of `0x1b630` that rewrites
+     `0x18025eb0` (BSS source of `0x5a64`'s copy) causes accumulator at
+     `[state+0x34]` (= `[0x18025580]`) to reach 2000 (~40 frames) and NATURALLY
+     fires the byte-setter (no env `TEST_READY`). State advances 1→5→6.
+
+2. **What's working well**
+   - RE tools (write-watchpoint, PC-hook env, periodic watch drain) are reliable.
+   - Reproducible proof that state advance IS now polishing past iter-19's
+     "state=6 freezes framebuffer" finding.
+
+3. **Iter-21 work — 3 priorities addressed**
+
+### Priority 1: Find legit writers of `[0x18025eb0]`
+
+Watched `0x18025eac, 0x40` on default boot over 200 frames. Found THREE writer PCs:
+
+- `0x18002620` (init writer, fires few times at boot): generic `memset`
+  routine writes 0 across the audio-config-global range as part of BSS init.
+- `0x18005cf8` (steady-state, fires 656 times): a tiny leaf
+  function `0x18005cf0`: `ldr r1, =0x18025eac; mov r0, #0; str r0, [r1, #4];
+  bx lr` — explicitly clears the byte.
+- `0x18005a98` (steady-state, fires 328 times): a tiny leaf at `0x18005a94`:
+  `ldr r1, =0x18025eac; str r0, [r1, #4]; bx lr` — stores CALLER-SUPPLIED r0.
+  In all 328 observed cases, callers of `0x5a94` pass `r0 = 0`.
+
+Callers:
+- `0x5a94` called from `0x1800530c` (state=1 main-frame, just before `bl 0x4088`),
+  `0x1faf0`, `0x1fb14`.
+- `0x5cf0` called from `0x1800512c` (state=0 case), `0x18005330` (state=1 case
+  just after the state-write), `0x1b6b0` (inside `0x1b630` audio mixer itself).
+
+**KEY CONCLUSION: There is NO legitimate GUEST-code writer that ever writes a
+non-zero value to `[0x18025eb0]`. Only the firmware/host audio subsystem
+should set bit 0x10 (sample-playing) or 0x08 (sample-completed) here. Tetris
+just polls and clears it (`0x5cf0`/`0x5a98` clear after consuming).**
+
+This confirms the iter-19/20 hypothesis definitively: **the gap is host-side
+audio-event emulation**. Without a host audio-event scheduler that periodically
+sets `0x18025eb0` non-zero, the per-frame poll sees stale 0 → gate never
+passes → byte-setter never fires NATURALLY.
+
+The iter-20 PC-hook env injection (`CLICKY_EAPP_AUDIO_SLOT_BIT`) is currently
+the only mechanism that reproduces the firmware's behavior. Replacing it with
+a proper emulator-side audio-event scheduler is a separate, larger task.
+
+### Priority 2: Investigate post-state=6 framebuffer evolution
+
+Iter 19 said state=6 case doesn't render. Iter-21 confirmed this is INCOMPLETE —
+on the iter-20 PC-hook test run, the framebuffer hash does NOT stop at
+`54422ff99d87f7af` (the state=6 initial freeze). Instead:
+
+| frame_range | fb_hash | description |
+|---|---|---|
+| 1-19 | ~various | legal/loading splash transitions |
+| 20-37 | `54422ff99d87f7af` | state=6 initial freeze (legal text + glyphs frozen) |
+| **38+** | `9d1cba2d8a96e05d` | **NEW content: actual menu glyphs!** |
+
+Pixel analysis of frame 38 (saved as `/tmp/tetris_iter21_pc_hook_menu_evo.png`):
+
+- Overall avg luminance: 55.1/255 (dim, menu-like)
+- Only ONE text band: y=122..139 (height 18), avg 30 bright pixels/row
+- For row y=128, runs (separated bright clusters): `[5, 2, 16, 1, 15, 2, 6]`
+- For row y=129: `[5, 2, 12, 8, 14, 2, 6]`
+- For row y=137: `[5, 8, 10, 7, 1, 6]`
+- x-range of band rows: y=122 x=108..208, y=139 x=87..229
+  (band grows wider toward bottom — characteristic of text glyphs)
+
+**These run-width patterns (5-2-16-1-15-2-6 with 1-2 pixel gaps) are
+characteristic of TEXT GLYPH STROKES in a small font**, NOT solid blocks. The
+capture matches what a row of small-font menu labels (e.g., the small `MENU`
+header text in the bottom menu area) would look like.
+
+So although the rendering is partial (only one text band, ~30-40 bright pixels
+per row), THERE IS MENU-LIKE TEXT BEING DRAWN post-state=6 at frame 38.
+
+Comparing with hash `54422ff99d87f7af` (state=6 frozen legal text): the
+post-state=6 hash clearly differs, indicating something DIFFERENT rendered.
+
+### Priority 3: Investigate state=6 sub-state rendering conditions
+
+Iter-19 said state=6 case's render work requires `[state+0] != 0 && [state+0xc]==2`
+which fails because `[state+0xc]` was set to 4 by state=3/4/5 case. But the
+evo proves SOMETHING draws after state=6.
+
+Possible explanation: the post-state=6 render work is in one of the OTHER
+per-frame routines called from `0x180222a4` AFTER `0x180050c0`:
+`0x53c8`, `0x55dc`, `0x50b0`, `0x2d8`. These routines run every frame
+regardless of state=6 gate status and likely include the actual menu-render
+code. State=6 case just increments a counter; MENU rendering happens
+independent of the state=6 gate.
+
+This needs confirming via disassembly of `0x55a0`/`0x53c8`/`0x55dc` — left
+for iteration 22.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- Default (no env) golden headed: 0 fatal, 0 skip, maxframe 162 (no regression)
+- PC-hook long-run (90s headless): state advanced 1→6 at frame ~20 (faster
+  than iter-20's frame 50); framebuffer evo'd to `9d1cba2d8a96e05d` at frame
+  38 with menu-text-like glyphs visible at y=122..139.
+- Screenshot at: `/tmp/tetris_iter21_pc_hook_menu_evo.png`
+
+### Iteration 21 commit
+
+Will commit: task file + RE notes (no code changes needed this iteration).
+
+### Next priorities for iteration 22
+
+1. **Disassemble `0x55a0`, `0x53c8`, `0x55dc`, `0x50b0`, `0x2d8`** to find
+   which per-frame routine renders menu labels. Match the call path with
+   the framebuffer evolution at frame 38.
+2. **User visual confirmation**: ask user to inspect
+   `/tmp/tetris_iter21_pc_hook_menu_evo.png` to verify whether the rendered
+   content IS menu text (specifically the expected English labels `MENU` /
+   `PLAY` / `VOLUME` / `OPTIONS` / `RECORDS` / `HELP` / `EXIT`).
+3. **Implement an actual emulator-side audio-event scheduler** (replacing the
+   PC-hook env injection). When Tetris calls its audio "play sample" or audio
+   "queue event" import (need to identify which Audio:N ordinal), the runner
+   should schedule a per-guest-time callback that writes 0x18 to
+   `[0x18025eb0]` every N us, simulating the firmware's periodic audio IRQ.
+
