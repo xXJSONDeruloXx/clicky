@@ -1528,3 +1528,217 @@ advancement, the legal→menu gate would open.**
   state machine is understood; default stays reverted/golden.
 - Cleanup: remove temp RE hooks `TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`,
   `scan_for_strings`, `EAPP_STRING_TRACE` once labels materialize on the menu.
+
+## Iteration 17 — REVERSED STATE-MACHINE GATE: state advances 1→5→6 when [0x18025674]=1
+
+Reflection leftover from iter 16 said "no writer of state=2 (legal→menu)". Iter 17
+fixed the wrong-base-address misread in iter 16 and uncovered the actual gate.
+
+### Static RE: `0x18004088` (= state-machine sub-routine called at 0x18005314)
+
+Disassembled `0x18004088`:
+
+```
+0x18004088: push {r4, lr}
+0x1800408c: mov r4, r0          ; r4 = saved r0 (= sl from caller, app_state_ptr)
+0x18004090: ldr r0, [pc, #56]   ; literal at 0x180040d0 = 0x18025678
+0x18004094: ldr r0, [r0]        ; r0 = [*0x18025678]
+0x18004098: cmp r0, #3
+0x1800409c: movlt r0, #2        ; if [*0x18025678] < 3 → return 2
+0x180040a0: poplt {r4, pc}
+0x180040a4: ldr r0, [pc, #40]   ; literal at 0x180040d4 = 0x18025674
+0x180040a8: ldrb r0, [r0]       ; r0 = byte [0x18025674]
+0x180040ac: cmp r0, #0
+0x180040b0: movne r0, #5        ; if byte != 0 → return 5 (STATE ADVANCE)
+0x180040b4: popne {r4, pc}
+0x180040b8: bl 0x39f0           ; otherwise call 0x39f0
+0x180040bc: ldr r0, [pc, #20]   ; literal at 0x180040d8 = 0x180255d4
+0x180040c0: mov r1, r4          ; r1 = saved r0
+0x180040c4: ldr r0, [r0]        ; r0 = [*0x180255d4] (= 0x1005f710 clock obj)
+0x180040c8: pop {r4, lr}
+0x180040cc: b 0x1b8b4           ; tail-call 0x1b8b4(clock_obj, sl) and return its result
+```
+
+The function returns:
+- **2** when `[*0x18025678] < 3` (legal/loading pending) → caller bumps `[0x1802554c]`, no state change.
+- **5** when `[*0x18025678] >= 3 AND [*0x18025674] (byte) != 0` → caller writes 5 to `frame_state[0]` (the 1→5 advance gate!).
+- otherwise the tail call returns (clock-driven animation/timer value, usually 0 → no state change).
+
+### Wider main loop function at `0x180050c0` (function entry)
+
+Full main-frame dispatch:
+
+```
+0x180050c0: push {r4..sl, lr}
+0x180050c4: ldr r4, [pc, #740]   ; literal at 0x18005053b0 = 0x1802554c  ← STATE STRUCT BASE (NOT 0x180256b4!)
+0x180050c8: sub sp, sp, #32
+0x180050cc: stmib r4, {r0, r1}  ; [r4+4]=[0x18025550]=arg0 (app_object=0x100015a0), [r4+8]=[0x18025554]=arg1 (frame_context=0x100035a0)
+0x180050d0: ldr r2, [r4, #20]    ; r2 = [r4+0x14] = [0x18025560] (per-frame counter, starts 0)
+0x180050dc: mov r6, #1           ; r6 = 1
+0x180050e0: mov r5, #0           ; r5 = 0
+0x180050e4: bne 0x5140           ; if per-frame counter != 0, dispatch 1/etc.
+   ... [0x180050e8 .. 0x1800513c]: the state == 0 / counter == 0 path
+0x18005140: cmp r2, #1
+0x18005144: bne 0x5168           ; if counter != 1, jump to state-machine dispatch
+   ... [0x18005148 .. 0x18005164]: the state == 1 / counter == 1 path
+0x18005168: ldr r2, [r0, #4]
+   ... (compute frame delta etc.)
+0x18005180: ldrb r3, [r0]       ; r3 = frame_state byte
+0x18005184: mov lr, #6           ; lr = 6
+0x18005188: mov ip, #4           ; ip = 4
+0x1800518c: cmp r3, #6
+0x18005190: mov r7, #2           ; r7 = 2
+0x18005194: strb r3, [r4, #1]   ; [0x1802554d] = r3 (current state byte)
+0x18005198: ldrls pc, [pc, r3, lsl #2] ; JUMP TABLE dispatch on r3 (frame_state)
+   jump table at 0x180051a0:
+   r3=0 → 0x180051bc (state=0 case)
+   r3=1 → 0x180051f0 (state=1 case = legal/loading)
+   r3=2 → 0x180053a8 (state=2 case — strb ip,[r1] ip=4, → state 4!)
+   r3=3,4,5 → 0x1800533c (state=3/4/5 case — sets state 6)
+   r3=6 → 0x1800535c (state=6 case)
+0x1800519c: b 0x53a8              ; if r3 > 6 fallback
+```
+
+State-machine summary:
+
+- state=0 case `0x180051bc`:
+  - writes r7 (=2) to `[r4+0xc] = [0x18025558]`
+  - writes r6 (=1) to `[r4+1] = [0x1802554d]`
+  - writes r6 (=1) to `*frame_context_ptr = [0x100035a0]` ★ frame_state 0→1 transition
+  - branches to function tail
+
+- state=1 case `0x180051f0` (where we're STUCK):
+  - reads `[r4+0xc] = [0x18025558]`; if != 2, branches to tail WITHOUT calling `0x4088`
+  - else falls through and computes legal-screen animation progress
+  - calls `0x1800530c: bl 0x5a94` (some pre-state work)
+  - calls `0x18005314: bl 0x4088(sl)` ← state-machine sub-routine
+  - if returns 2 → write r6 (=1) to `[0x1802554c]` (NOT frame_state!) — just progress counter
+  - if returns 5 → write 5 to `*frame_state_ptr = [0x100035a0]` ★ frame_state 1→5 transition
+  - jump tail
+
+- state=3/4/5 case `0x1800533c`:
+  - writes ip (=4) to `[r4+0xc] = [0x18025558]` (so future state=1 case short-circuits)
+  - writes lr (=6) to `*frame_state_ptr` ★ frame_state → 6 transition
+  - calls `0x18005 0: bl 0x5048; bl 0x59f4; bl 0x55a0`
+
+- state=6 case `0x1800535c`:
+  - reads `[r4+0]` and loops back to the function tail (steady state)
+
+### Static value verification (binary file)
+
+```
+addr=0x18025678  byte=0x00 word=0x00000000 (static dword) → [*0x18025678] starts at 0
+addr=0x18025674  byte=0x00 (static) → never written by guest code
+addr=0x18025670  (heap obj pointer) = 0x10001560 (set at boot by PC 0x18021d60)
+addr=0x180255d4  (*pointer to clock obj) = written by PC 0x180043e8 with val 0x1005f710
+addr=0x18025558  (= [r4+0xc] gating byte) = written by PC 0x180051dc with val 2 (state=0 case)
+```
+
+### Dynamic RE (watches)
+
+Watch `0x1802554c, 0x40` (= `[r4+0..r4+0x40]` state struct):
+
+- `[0x1802554c]` (= `[r4]`) → 477 writes. 239 from PC `0x1800517c` (strb r5=0 at start of state=1 case) + 238 from PC `0x1800531c` (strbeq r6=1 when `0x4088` returns 2). Confirms **state=1 case IS being entered every frame and `0x4088` IS returning 2 most frames**.
+- `[0x18025558]` (= `[r4+0xc]`) → 1 write by PC `0x180051dc` (val 2). State=0 case set this so state=1 case falls through to call `0x4088`.
+- `[0x18025560]` (= `[r4+0x14]`) → 240 writes by PC `0x18005398` with values 2,3,4,5,...,240. Per-frame counter (counts frames run).
+
+Watch `0x18025674, 0x8` (state-machine decision fields):
+- `[0x18025674]` (byte): ZERO writes. Static 0.
+- `[0x18025678]` (word): 9 writes monotonically increasing 1,2,3,4,5,5,6,6,7 via PCs `0x18003c0c, 0x18004ffc, 0x180058c8, 0x180058d4, 0x18005480, 0x18003d8c, 0x18005014, 0x18003dd4, 0x18004fe4` — loader-progress-related increments during boot.
+
+So the state machine gate is COMPLETELY UNDERSTOOD:
+- `[0x18025678]` (= loader progress counter) reaches >= 3 quickly during boot.
+- `[0x18025674]` (byte) is NEVER WRITTEN by the guest code; static 0.
+- Therefore `0x4088` returns:
+  - 2 (during early boot while counter < 3) — no state advance.
+  - 0 (after counter >= 3, falls through to clock-obj tail-call) — no state advance.
+  - NEVER returns 5 because byte is always 0.
+
+### Hypothesis test: env-gated `CLICKY_EAPP_TEST_READY=1` writes byte 1 to 0x18025674
+
+Added env-gated diagnostic in `maybe_log_startup_progress` that writes
+`write_guest_u32(0x1802_5674, 1)` each progress interval when env is set.
+
+Also added `statemach_count` (= [*0x18025678]) and `statemach_byte` (= byte [0x18025674])
+to the `startup_progress` line so RE values are visible per-frame.
+
+**RESULT: Confirmed!**
+Headless run `CLICKY_EAPP_TEST_READY=1 CLICKY_STARTUP_PROGRESS_INTERVAL=5 --timeout 18`:
+
+- frame=1: state=0, count=0, byte=0  (initial splash)
+- frame=2: state=1, count=1, byte=1  (boot loader kicked in, TEST_READY wrote byte=1)
+- frame=3: state=5, count=7, byte=1  ★ `0x4088` returned 5 → frame_state advanced 1→5
+- frame=4: state=6, count=7, byte=1  ★ state=3/4/5 case advanced 5→6
+- frame=5+: state=6 stable, hash unchanged
+
+Also headed 14s run (`/tmp/tetris_iter17_test_ready_headed.log`) reached frame 8580
+at state=6 cleanly, no fatal/skip — the menu screen renders fine.
+
+### Visual confirmation (state=6 menu rendered)
+
+Saved `/tmp/tetris_iter17_test_ready_menu.png` (320x240 RGB, color type 2). Pixel analysis:
+- avg lum = 68.9 / 255 (medium brightness, NOT all-black)
+- avg r/g/b = 47/60/101 — strong blue channel (consistent with blue Tetris menu BG)
+- 64.4 % pixels have lum > 40 (significant visible content)
+- 4.9 % pixels have lum > 180 (bright content = glyphs/sprites)
+- bright content bbox: x=[63..279] y=[12..153] — looks like a centered text/label region
+
+Compare to default golden run (no TEST_READY env):
+- frame=3: state=1, count=7, byte=0  (stuck on legal screen)
+- state_machine_byte remains 0, frame_state stays at 1 forever.
+
+### Conclusion
+
+Iter-15/16's "splash_phase frozen forever" was really "legal-screen state machine
+gated on byte `[*0x18025674]` which is NEVER set by guest code". The byte is read
+by `0x4088` (state-machine sub) to decide whether to return 2/5/0:
+- 5 → 1→5 → 6 transition (legal → menu)
+- 2 → no advance
+- 0 → no advance
+
+Writing byte 1 → state advances cleanly 1→5→6 within 3 frames.
+
+The byte is supposed to be set by some service/event we don't emulate (no guest
+writer found in either static or dynamic RE). The next iteration's job: figure
+out WHO is SUPPOSED to write byte [0x18025674]. Candidate leads:
+- The 14 literal-pool refs to `0x18025674` (file offsets 0x3a9c, 0x3df8, 0x3fe4,
+  0x405c, 0x40d4, 0x41d8, 0x462c, 0x5020, 0x5044, 0x53fc, 0x5488, 0x58f4,
+  0x6008, 0x6034) — disassemble each to find STRB/STREQ/STREQB writes to
+  offset +0 of the loaded `0x18025674` base.
+- Look at writers to nearby fields ([0x18025670]=0x10001560 via 0x18021d60,
+  [0x18025678] via the loader-progress sites) and check if there's a sibling
+  writer for byte at +0.
+- Check bike-shed cases `[0x180255dc]` (front/back ping-pong buffer via PCs
+  0x18007fc0 / 0x18007e80) and `[0x180255e0]` (write 1/2/3 by PC 0x18007fcc) —
+  what service drives those; same source may set [0x18025674]=1 on some event.
+- Check the `0x180040a4` line specifically: it loads the byte after
+  `[*0x18025678] >= 3`. Maybe byte at 0x18025674 is only written when the BOOT
+  reaches a specific phase; or it's the "first user input received" flag.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed.
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed.
+- Default (no env) golden headed: 0 fatal, 0 skip, maxframe 244 — no regression.
+- TEST_READY headed 14s: 0 fatal, 0 skip, maxframe 8580 — state 6 steady.
+- `CLICKY_EAPP_TEST_READY=1` still default-OFF: production Tetris run unchanged.
+- Saved state=6 screenshot: `/tmp/tetris_iter17_test_ready_menu.png` (320x240 RGB).
+
+### Next (iteration 18 priorities)
+
+1. Disassemble the 14 literal-pool reference functions for `0x18025674` to find
+   the legitimate host-bound writer of `[0x18025674]` byte.
+2. If no guest writer exists (likely), identify the emulator-side ABI gap that
+   should have set this byte (probably a service/event import that we never
+   deliver: e.g., "audio initialization complete" or "screen transition
+   trigger"). Look at the `0x18007fc0`/`0x18007e80` ping-pong producers to
+   see what service they're calling.
+3. Once the legitimate source is found, replace the env-gated TEST_READY
+   injection with a real ABI fix (a TI/host-event dispatcher that the runner
+   fires once loads complete).
+4. Ask user to visually confirm the state=6 menu screenshot
+   `/tmp/tetris_iter17_test_ready_menu.png` matches the expected menu labels
+   (MENU, PLAY, VOLUME, OPTIONS, RECORDS, HELP, EXIT).
+5. Re-enable `CLICKY_EAPP_ASYNC3_COMPLETE=1` alongside the byte writer to see
+   if BOTH need to fire for the loader path to complete properly.
+

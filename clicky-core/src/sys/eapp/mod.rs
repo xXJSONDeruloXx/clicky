@@ -4596,6 +4596,23 @@ impl Eapp {
         let splash_time_c = self
             .read_guest_u32(splash_base.wrapping_add(0x20))
             .unwrap_or(0);
+        // State-machine RE (iter 17): the legal→menu gate. `0x18004088` returns
+        // 2 if `[*0x18025678] < 3`, else returns 5 if the byte `[*0x18025674] != 0`,
+        // else tail-calls into the clock object at `*0x180255d4`. So the 1→5
+        // transition (legal screen → menu) requires BOTH conditions.
+        let statemach_count = self.read_guest_u32(0x1802_5678).unwrap_or(0xff_ffff);
+        let statemach_byte = self.read_guest_u8(0x1802_5674).unwrap_or(0xff);
+        // Env-gated diagnostic: write byte 1 to 0x18025674 once per progress
+        // interval to prove the gate theory. No guest writer is observed in
+        // the binary for this byte, so the value is normally static 0.
+        let test_ready = std::env::var("CLICKY_EAPP_TEST_READY")
+            .ok()
+            .as_deref()
+            .map(|s| s == "1")
+            .unwrap_or(false);
+        if test_ready {
+            let _ = self.write_guest_u32(0x1802_5674, 1);
+        }
         let import_summary = self.format_frame_import_counts(8);
         let trace_summary = if string_trace_enabled() && !self.string_trace_hits.is_empty() {
             let mut entries: Vec<(u32, u32)> =
@@ -4609,7 +4626,7 @@ impl Eapp {
         };
         info!(
             target: "EAPP_PROGRESS",
-            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
+            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] statemach_count={} statemach_byte={} async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
             frame,
             self.host_start.elapsed().as_micros() as u64,
             fb_hash,
@@ -4628,6 +4645,8 @@ impl Eapp {
             splash_time_a,
             splash_time_b,
             splash_time_c,
+            statemach_count,
+            statemach_byte,
             self.async_request_count,
             self.async_callback_queued_count,
             self.guest_callback_invocation_count,
