@@ -1239,6 +1239,172 @@ Tetris-specific guesswork, contradicting the "generic and accurate" goal. The
 tracer + this ABI table are the reusable deliverables; the null-object-provider
 fix is the unblocker.
 
+## Null-vtable teardown crash: investigation (2026-06-20)
+
+Motivation: the null-object-provider fatal is the single highest-leverage
+remaining item — it blocks Tetris gameplay (and thus the audio play-ABI
+capture), plus iQuiz and Vortex (two currently-dead titles). All three were
+previously grouped as "null-destination buffer/object pointer that an upstream
+HLE call should have populated," but the specific owning import was unproven.
+This investigation dissects the Tetris `66666` case concretely.
+
+### Reproduction
+
+Reproduced deterministically (5/5 runs, identical register state) with:
+`CLICKY_EAPP_INPUT_SCRIPT="menu:50-120"` + the standard live-GL env, 12M
+cycc headless. Note: the crash fires on the **Menu** button (exit-to-shell
+path), NOT on Select/Action — Select at the wrong guest frame does nothing, and
+Select during menu-select hits a *different* fatal (`pc=0x180206fc` offset 0x14,
+but only after reacing `Audio:13/14/15/2`); the reliable trigger is Menu-hold.
+
+The faulting object address is **stable across runs**: `r0=0x100e4be0`,
+`r5=r6=0x1019f7f0` (list anchor), `r7=0x3` (count). Determinism of the
+allocation pattern (modulo the wall-clock-driven `miscTBD:9` time API, which
+affects timing not addresses) lets a faulting object be re-identified across
+runs.
+
+### Crash mechanism (disassembled)
+
+Faulting instruction: `0x180206fc` (`bx r1`). The fault is a Read at
+`offset=0x14` (unmapped). Decoded ARM at `0x206b0..0x206fc`:
+
+```
+0x206b0: cmp r0, #0          ; r0 = object ptr (the list node)
+0x206b4: bxne lr             ; early-out if null
+0x206b8: push {r4-r8, lr}
+0x206bc: subs r7, r1, #0     ; r7 = count (from caller r1 = 3)
+0x206c0: mov r6, r0          ; r6 = array base
+0x206c4: mov r4, #0          ; r4 = index
+0x206c8: ble ...              ; if count<=0 skip
+0x206d0: add r5, r6, r4, lsl #2  ; r5 = &array[i]  (4-byte ptr table)
+0x206d8: ldr r0, [r5]        ; r0 = array[i] = object ptr
+0x206dc: cmp r0, #0
+0x206e4: ldr r1, [r0, #4]    ; r1 = refcount (object word 1)
+0x206e8: subs r1, r1, #1     ; refcount--
+0x206ec: str r1, [r0, #4]
+0x206f0: ldreq r1, [r0]      ; if refcount==0: r1 = vtable (object word 0)
+0x206f4: addeq lr, pc, #4
+0x206f8: ldreq r1, [r1, #0x14] ; r1 = vtable[5] (destructor slot)
+0x206fc: bxeq r1             ; call destructor   <-- FAULT: r1 (vtable) was 0
+```
+
+So this is a **generic release-list function** at `0x206b0`: takes
+`(r0=array_ptr, r1=count)`, iterates an array of object pointers, drops each
+one's refcount, and dispatches `vtable[5]` (offset `0x14`) as the destructor for
+any whose refcount hits zero. The list anchor at `0x1019f7f0` holds
+`[0x100e4be0, 0x100e4e00, 0x100e5020, 0, ...]` — three 544-byte objects spaced
+`0x220` apart.
+
+The faulting node's memory dump (added a generic `fault object @r0` dump to
+the fault handler this round):
+```
+fault object @r0 words=[0x00000000,0x00000000,0x100e4c00, 0×13 zeros]
+fault object sibling @r0[2]=0x100e4c00 words=[all zeros]
+fault list anchor @r5=0x1019f7f0 words=[0x100e4be0,0x100e4e00,0x100e5020, 0×5 zeros]
+```
+
+The faulting node is `{vtable=0, refcount=0, next=0x100e4c00, zeros}`. Note:
+for the destructor to fire at all, `refcount` must have been written to exactly
+`1` at some earlier point (so `1-1=0` sets the `ldreq` condition). So the
+object's **refcount WAS initialized** but its **vtable was never written**.
+
+### Call path into the crash
+
+The recent-pc-trace shows the release-list loop (`0x206b0..0x206fc`) is
+called from `0x7868: bl 0x206b0`, whose caller at `0x783c` does:
+```
+0x7854: str r0, [r4]         ; writes the CONTAINER's vtable from a literal
+0x7858: ldr r1, [r4, #0x54]  ; container field at +0x54 (count)
+0x7864: ldr r0, [r4, #0x5c]  ; container field at +0x5c (array ptr) = the list
+0x7868: bl 0x206b0           ; release the contained array
+```
+So the container's own vtable IS set properly (from a game-image literal); the
+three *contained* nodes are the ones missing vtables. This is a one-level-deep
+init gap, not a wholesale broken object.
+
+### Imports fired immediately before the fault
+
+From the full log (~40 lines before fatal), the Menu-press teardown sequence
+is:
+1. `AsyncFileIO:3` re-reads every `.wav` header (44 B each) — preparing to
+   release audio buffers
+2. `AsyncFileIO:3` re-reads `prefs.sav` / `game.sav` (saves on exit)
+3. `OpenGLES:158` (present) + `candidate_begin double-begin detected`
+4. `Audio:52/51/56/40/55/53/48/43` (audio teardown / source release)
+5. **`Metadata:62 r0=0xffffffff r1=0x101a9a18 r2=0xb r3=1.0f`**
+6. **`Metadata:134 r0=0 r1=0x101a9a18 r2=0xb r3=1.0f`**
+7. `miscTBD:14` (block copy), `Audio:40` (allocate), `miscTBD:12`
+8. → release-list loop → fault on node `0x100e4be0`
+
+`Metadata:62` and `Metadata:134` both go to the **stubbed** `Metadata` module
+(`return 0`). Both share `r1=0x101a9a18` (work-RAM context) and `r2=0xb`. This
+keeps the earlier "a `Metadata` object-provider is implicated" hypothesis alive
+(iQuiz's fatal was attributed to `Metadata` too) — but see the next finding,
+which complicates it.
+
+### Key finding: the faulting object is NOT from the main HLE allocator
+
+Added an env-gated `CLICKY_ALLOC_TRACE=1` log of every `miscTBD:0` allocation's
+`(caller_lr, returned_addr, len)`. Results:
+
+- **`0x100e4be0` does not appear in any `miscTBD:0` return.** Every logged
+  allocation returns addresses in `0x101d42d0..0x101e11c0` (the post-bootstrap
+  heap region). The faulting object at `0x100e4be0` lives in the *earlier*
+  `0x1000_1000..0x101d_42d0` region — ~1.9 MiB of work-RAM that was consumed
+  *before* the first logged `miscTBD:0` call (the allocator's `next_alloc`
+  was already at `0x101d42d0` when logging began).
+- Every single `miscTBD:0` call shares `lr=0x18021b68` — the runtime funnels
+  all allocations through one allocator trampoline, so `lr` does **not**
+  distinguish allocation sites. A per-site attribution would need either the
+  trampoline's caller (one frame up the stack) or a memory-write watchpoint.
+
+**Implication:** the faulting object is either a bootstrap/early reservation
+or a sub-allocation the game carves from a large early arena (a common pattern:
+the runtime hands the game one big arena, and the game runs its own malloc on
+top). If the latter, the object's vtable would be written by **game code**, not
+by an HLE stub — which would make the crash a "game expects the OS to handle
+part of the teardown" issue rather than a simple "stub forgot to fill in the
+vtable" fix.
+
+This is consistent with the doc's prior note that the Menu-press crash happens
+because there is "no RetailOS shell to return to" — i.e. the game's exit path
+expects the OS to participate in the teardown, and our eapp spike has no OS.
+
+### Candidate fix shapes (not yet implemented)
+
+1. **Populate the missing vtable via an HLE init call.** Only viable if
+   `0x100e4be0` turns out to be an HLE-allocated object whose constructor
+   lives in a stubbed module. The `Metadata:62/134` calls right before the
+   fault are the leading candidates, but we have no RetailOS RE to tell us
+   what object they should return. This is the "accuracy" path but needs
+   reference RE we don't currently have.
+2. **Intercept the exit-to-shell request.** Detect (via the Menu-hold
+   `InputEvents` signal, or a specific `miscTBD`/`Metadata` ordinal the game
+   uses to signal "quit") when the game wants to exit, and either halt the
+   eapp cleanly or short-circuit the doomed refcount teardown. This is
+   "graceful degradation" rather than true emulation accuracy, but it is
+   honest about the no-OS reality and would stop the crash deterministically.
+3. **Trace the object's constructor via a memory-write watchpoint.** Add a
+   generic `CLICKY_EAPP_WATCH=0xADDR,0xLEN` env-gated watch on
+   `0x100e4be0..+0x220` to find (a) who sets `refcount=1` (word 1) and (b)
+   whether anything ever writes word 0. If word 0 is written by a guest
+   literal load, the object is game-owned and fix-shape #2 applies; if word 0
+   is meant to be written by an HLE return, fix-shape #1 applies.
+
+The next concrete step is #3 (the write-watch), to decide between #1 and #2.
+
+### Diagnostics added this round (both permanent, env-gated, generic)
+
+- `fault object @r0` dump: on every fatal, reads 16 words at `r0` plus any
+  work-RAM pointer-field siblings and the `r5==r6` list anchor. Surfaces the
+  object layout + sibling vtables + which-node-in-list faulted, without
+  needing to re-run with custom instrumentation. Fires only in the fatal
+  path so it costs nothing in normal runs.
+- `CLICKY_ALLOC_TRACE=1`: logs every `miscTBD:0` allocation's
+  `(caller_lr, returned_addr, requested_len)`. Generic RE tool for
+  attributing any future faulting work-RAM object to an allocation (modulo
+  the trampoline-funnel caveat noted above).
+
 ## Working rule for this branch
 
 When in doubt, prefer:

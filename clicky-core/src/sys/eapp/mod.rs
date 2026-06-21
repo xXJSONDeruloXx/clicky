@@ -871,6 +871,66 @@ impl Eapp {
                 self.cpu.reg_get(mode, reg::SP),
                 self.cpu.reg_get(mode, reg::LR),
             );
+            // Dump the object whose access faulted (r0 for the common
+            // null-deref / null-vtable cases) so the vtable word and
+            // surrounding header fields are visible at the fault. This is a
+            // generic diagnostic, only fires on fatal, and is intentionally
+            // bounded to avoid pulling huge regions into logs.
+            if let Some(obj) = self.read_guest_words(self.cpu.reg_get(mode, 0), 16).get(0..16) {
+                warn!(
+                    target: "EAPP",
+                    "fault object @r0 words=[{}]",
+                    obj.iter()
+                        .map(|w| format!("{:#010x}", w))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            // For null-deref-via-pointer cases, also dump whatever the
+            // faulting object's pointer-fields reference. This surfaces the
+            // "next" sibling in intrusive-list cleanup loops (the most
+            // common teardown pattern), which carries a valid vtable when the
+            // faulting node does not — revealing the expected class pointer.
+            let obj_base = self.cpu.reg_get(mode, 0);
+            if let Some(obj) = self.read_guest_words(obj_base, 4).get(0..4) {
+                for (i, ptr) in obj.iter().copied().enumerate() {
+                    if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&ptr)
+                        && ptr != obj_base
+                    {
+                        if let Some(sib) = self.read_guest_words(ptr, 8).get(0..8) {
+                            warn!(
+                                target: "EAPP",
+                                "fault object sibling @r0[{}]={:#010x} words=[{}]",
+                                i,
+                                ptr,
+                                sib.iter()
+                                    .map(|w| format!("{:#010x}", w))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                        }
+                    }
+                }
+            }
+            // If r5 looks like a list anchor (the common cleanup-loop pattern
+            // where r5 == r6 == list head), dump a few nodes starting from it.
+            let anchor = self.cpu.reg_get(mode, 5);
+            if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&anchor)
+                && anchor != obj_base
+                && anchor == self.cpu.reg_get(mode, 6)
+            {
+                if let Some(head) = self.read_guest_words(anchor, 8).get(0..8) {
+                    warn!(
+                        target: "EAPP",
+                        "fault list anchor @r5={:#010x} words=[{}]",
+                        anchor,
+                        head.iter()
+                            .map(|w| format!("{:#010x}", w))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+            }
             e.resolve(
                 "EAPP",
                 MemExceptionCtx {
@@ -961,6 +1021,20 @@ impl Eapp {
 
         if import.module == "OpenGLES" {
             self.capture_open_gl_import(import.ordinal, pc, lr, args, ret);
+        }
+
+        // Env-gated (`CLICKY_ALLOC_TRACE=1`) allocator-return log. `miscTBD:0`
+        // is the runtime allocator and the only path that returns freshly-
+        // zeroed guest memory; logging its (caller_lr, returned_addr, len)
+        // lets any faulting work-RAM object be attributed to the guest call
+        // site that created it. Useful for null-vtable / null-deref teardown
+        // investigations.
+        if import.module == "miscTBD" && import.ordinal == 0 && std::env::var_os("CLICKY_ALLOC_TRACE").is_some() {
+            info!(
+                target: "EAPP_ALLOC",
+                "miscTBD:0 alloc lr={:#010x} ret={:#010x} len={}",
+                lr, ret, args[0]
+            );
         }
 
         self.cpu.reg_set(self.cpu.mode(), 0, ret);
