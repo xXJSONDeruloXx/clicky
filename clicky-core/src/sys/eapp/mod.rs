@@ -1173,6 +1173,30 @@ impl Eapp {
         if desc_ptr == 0 || prep_width == 0 || prep_height == 0 {
             return;
         }
+        // Cross-title evidence (Tetris, Texas Hold'em): the ordinal-45
+        // descriptor at r1 is the texture object itself (not a pointer to
+        // one) with layout:
+        //   word0 = 0, word1 = GL texture name (small int, e.g. 0x13),
+        //   word2 = source_format (GL_RGB/GL_RGBA/GL_ALPHA/GL_LUMINANCE_ALPHA),
+        //   word3 = pixel_type, word4 = width, word5 = height, ...
+        // The texture name is the same handle later bound by ordinal 159, so
+        // capturing it here lets the following ordinal-99 `glTexImage2D` tag
+        // its upload with the GL texture name and draw-time selection can match
+        // by handle instead of (lossy) dimension inference. Distinguish this
+        // layout from Mahjong's pointer-to-object layout by checking that
+        // word1 is a small integer and word2 is a recognized GL format enum.
+        if let (Some(w1), Some(w2)) = (
+            self.read_guest_u32(desc_ptr.wrapping_add(4)),
+            self.read_guest_u32(desc_ptr.wrapping_add(8)),
+        ) {
+            let is_small_handle = w1 != 0 && w1 < WORK_RAM_BASE;
+            let is_gl_format = matches!(w2, 0x1906 | 0x1907 | 0x1908 | 0x190a);
+            if is_small_handle && is_gl_format {
+                if let Some(lg) = self.live_gl.as_mut() {
+                    lg.pending_tex_name = Some(w1);
+                }
+            }
+        }
         let Some(texture_obj) = self.read_guest_u32(desc_ptr.wrapping_add(4)) else {
             return;
         };
@@ -1267,6 +1291,7 @@ impl Eapp {
                 source_file_offset: None,
                 format: Some(format),
                 texture: Some(texture),
+                tex_name: Some(material_handle),
             });
             lg.resource_uploads_by_handle.insert(material_handle, index);
             info!(
@@ -1326,6 +1351,7 @@ impl Eapp {
 
         let index = self.live_gl.as_ref().map(|l| l.uploads.len()).unwrap_or(0);
         let backing = self.file_backing_for_addr(source_ptr);
+        let tex_name = self.live_gl.as_mut().and_then(|l| l.pending_tex_name.take());
         let mut upload = LiveGlState::build_upload(
             index,
             target,
@@ -1335,6 +1361,7 @@ impl Eapp {
             pixel_type,
             source_ptr,
             &payload,
+            tex_name,
         );
         if let Some(backing) = backing {
             upload.source_file_offset = Some(source_ptr.saturating_sub(backing.base_addr));
@@ -1342,7 +1369,7 @@ impl Eapp {
         }
         info!(
             target: "EAPP_GL",
-            "live_upload idx={} {}x{} format={:?} src_fmt={:#x} pix_type={:#x} src_ptr={:#010x} bytes={} file={} file_off={}",
+            "live_upload idx={} {}x{} format={:?} src_fmt={:#x} pix_type={:#x} src_ptr={:#010x} bytes={} file={} file_off={} tex_name={}",
             index,
             width,
             height,
@@ -1355,7 +1382,11 @@ impl Eapp {
             upload
                 .source_file_offset
                 .map(|off| format!("{}", off))
-                .unwrap_or_else(|| "<unknown>".to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            upload
+                .tex_name
+                .map(|n| format!("{:#x}", n))
+                .unwrap_or_else(|| "<none>".to_string()),
         );
         if let Some(lg) = self.live_gl.as_mut() {
             lg.uploads.push(upload);

@@ -618,6 +618,48 @@ Follow-up fix: ordinal-37 `mode=5` triangle-strip UV epoch guard (Texas Hold'em)
   falls back to UV-extent/dimension matching. Texas Hold'em now rasterizes
   geometry but texture-name -> upload association is the next accuracy step.
 
+Follow-up fix: associate ordinal-99 uploads with GL texture names (Tetris family)
+
+- evidence root: `/tmp/clicky_bind_capture_20260620_220000/tetris_gl.json`
+  (Tetris `66666` GL capture frames 0-3). Decoded the ordinal-45 descriptor
+  (`r1`) layout for the Tetris/Texas-Hold'em bind path:
+    - word0 = 0
+    - word1 = GL texture name (small int, e.g. `0x13`, `0x1b`, `0xe`, `0x8`)
+    - word2 = source_format (`0x1907`/`0x1908`/`0x1906`/`0x190a`)
+    - word3 = pixel_type, word4 = width, word5 = height
+  Crucially, the ord45 word1 texture name equals the handle later bound by
+  ordinal 159 at draw time (e.g. upload idx=0 desc word1=`0x13` <-> later
+  `159 handle=0x13`; upload idx=1 word1=`0x1b` <-> `159 handle=0x1b`).
+  This means no separate `glBindTexture` ordinal is needed for this engine:
+  ord45 itself binds the texture object whose name lives at descriptor word1.
+- fix: `live_handle_resource_upload` (ord45) now reads descriptor word1/word2
+  and, when word1 is a small integer and word2 is a recognized GL format enum
+  (the Tetris/Holdem layout, distinguished from Mahjong's pointer-to-object
+  layout where word1 is a work-RAM pointer), stores it as `pending_tex_name`.
+  The following ordinal-99 `glTexImage2D` consumes it and tags the resulting
+  `LiveGlUpload` with `tex_name`. Mahjong resource uploads also set
+  `tex_name` to their decoded `material_handle` for consistency. Draw-time
+  selection (`rasterize_draw` and `rasterize_triangle_strip_record`) now
+  prefers `select_upload_by_tex_name(handle)` and falls back to the existing
+  UV-extent/dimension heuristics when no tex-name match exists.
+- validation root: `/tmp/clicky_texname_validate_20260620_221500`
+  - Tetris `66666`: 38/38 uploads now carry a `tex_name`; 4808 rasterized, 9
+    skipped (unchanged zero-UV pointer-text glyph draws), 0 fatals.
+  - Texas Hold'em `33333`: 9 uploads (tex_name still `<none>` because its
+    ord45 fires once for many uploads to distinct textures — see below);
+    2324 rasterized, 176 triangle-strips, 31 skipped, 0 fatals — byte-identical
+    to baseline, confirming no regression.
+  - Baseline comparison at 8M cycles (`/tmp/clicky_texname_baseline_20260620_222700`):
+    Tetris 4813/9 vs 4808/9, Holdem 2324/176/31 vs 2324/176/31.
+  - `cargo test -p clicky-core --lib`: 14 passed (incl. new
+    `select_upload_prefers_tex_name_then_falls_back_to_dims`).
+  - `cargo test -p clicky-core --test eapp_gl_decode`: 15 passed.
+- remaining: Texas Hold'em's ord45 fires only once for many `glTexImage2D`
+  uploads to distinct textures, so per-upload tex-name tagging needs the
+  Holdem-specific bind ordinal (still open). For Tetris-family engines the
+  association is now exact, enabling future removal of lossy dimension
+  matching for tagged uploads.
+
 Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
 
 - instrumentation: added a register-state dump at the eapp memory-fault path
@@ -782,13 +824,13 @@ GL_QUADS      = 0x0007  (draw primitive confirmed from disassembly)
 
 | Ordinal   | Function                 | Key args / evidence |
 |-----------|--------------------------|---------------------|
-| `GL:4`    | glTexParameteri / bind   | r0=GL_TEXTURE_2D; called once/texture before upload |
+| `GL:4`    | glTexParameteri         | r0=GL_TEXTURE_2D; called once/texture before upload (and per-frame bind in Mahjong) |
 | `GL:12`   | glClear (init only)      | r0=0x4000=GL_COLOR_BUFFER_BIT |
 | `GL:13`   | glClearColor (init only) | r0,r1,r2,r3 = 0,0,0,1.0 (black) |
 | `GL:37`   | **glDrawArrays** ✓       | mode=7 batched quads; mode=5 `GL_TRIANGLE_STRIP` seen in Texas Hold'em |
 | `GL:38`   | **glDrawElements** ✓     | Sims/Sudoku/Solitaire family: r0=mode=5, r1=count, r2=0x1403 `GL_UNSIGNED_SHORT`, r3=index pointer |
 | `GL:40`   | enableClientArray        | r0=array_index |
-| `GL:45`   | createTexture / initObj  | r0=tex_name, r1=descriptor_ptr, r2=width, r3=height; once/texture |
+| `GL:45`   | createTexture + bindTex  | r0=obj_tag, r1=texture-object descriptor; Tetris/Holdem layout: desc word1=GL_tex_name, word2=source_format, word4/5=w/h; Mahjong layout: desc word1=ptr to obj whose word2=tex_name, word4=packed dims, word9=pixel_ptr |
 | `GL:99`   | **glTexImage2D** ✓       | r0=GL_TEXTURE_2D, r1=level=0, r2=GL_RGB/RGBA/ALPHA, r3=width; once/texture |
 | `GL:125`  | prepareDraw              | r0=0, r1=1, r2=0, r3=state_ptr |
 | `GL:137`  | setVertexArrayFormat     | r0=array_idx, r1=components, r2=GL_FIXED, r3=stride, stack:ptr |

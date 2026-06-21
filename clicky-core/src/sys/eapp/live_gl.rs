@@ -64,6 +64,11 @@ pub struct LiveGlUpload {
     pub source_file_offset: Option<u32>,
     pub format: Option<TextureFormat>,
     pub texture: Option<Texture>,
+    /// GL texture name this upload is bound to, decoded from the preceding
+    /// ordinal-45 descriptor (Tetris/Holdem layout: descriptor word 1).
+    /// `None` for uploads captured before ord45-tex-name tracking existed or
+    /// for Mahjong resource uploads (which use `resource_uploads_by_handle`).
+    pub tex_name: Option<u32>,
 }
 
 /// A vertex array definition recorded from ordinal-137. Unknown slots are
@@ -128,6 +133,11 @@ pub struct LiveGlState {
     /// pre-bind UV array belongs to the material, not as a substitute for real
     /// UV coordinates.
     pub resource_uploads_by_handle: HashMap<u32, usize>,
+    /// GL texture name captured from the most recent ordinal-45 descriptor
+    /// (Tetris/Holdem layout, word 1). Consumed by the following ordinal-99
+    /// `glTexImage2D` so its upload can be associated with the GL texture
+    /// name later bound by ordinal 159 at draw time.
+    pub pending_tex_name: Option<u32>,
     pub arrays: HashMap<u32, LiveArrayDef>,
     pub enabled_arrays: HashSet<u32>,
     pub current_handle: u32,
@@ -201,6 +211,7 @@ impl LiveGlState {
         Self {
             uploads: Vec::new(),
             resource_uploads_by_handle: HashMap::new(),
+            pending_tex_name: None,
             arrays: HashMap::new(),
             enabled_arrays: HashSet::new(),
             current_handle: 0,
@@ -429,6 +440,7 @@ impl LiveGlState {
         pixel_type: u32,
         source_ptr: u32,
         payload: &[u8],
+        tex_name: Option<u32>,
     ) -> LiveGlUpload {
         let format = format_from_gl(source_format, pixel_type);
         let texture = format.and_then(|fmt| {
@@ -457,6 +469,7 @@ impl LiveGlState {
             source_file_offset: None,
             format,
             texture,
+            tex_name,
         }
     }
 
@@ -467,6 +480,19 @@ impl LiveGlState {
         self.uploads
             .iter()
             .find(|u| u.texture.is_some() && u.width == w && u.height == h)
+            .map(|u| u.index)
+    }
+
+    /// Select a live texture by its decoded GL texture name. This is the most
+    /// reliable association when ord45 supplied a tex-name in its descriptor
+    /// (Tetris/Holdem layout). Prefers the most recent matching upload so that
+    /// level-0 reloads replace earlier ones. Only matches uploads that actually
+    /// decoded a texture.
+    pub fn select_upload_by_tex_name(&self, tex_name: u32) -> Option<usize> {
+        self.uploads
+            .iter()
+            .rev()
+            .find(|u| u.texture.is_some() && u.tex_name == Some(tex_name))
             .map(|u| u.index)
     }
 
@@ -549,14 +575,15 @@ impl LiveGlState {
             None
         };
 
-        let selected_upload =
-            if has_uv && used_generated_uvs && (0x1000_0000..0x1080_0000).contains(&handle) {
-                self.select_upload_for_generated_text_uvs(&uvs)
-            } else if has_uv {
-                self.select_upload_for_uvs(&uvs)
-            } else {
-                None
-            };
+        let selected_upload = if has_uv && used_generated_uvs && (0x1000_0000..0x1080_0000).contains(&handle) {
+            self.select_upload_by_tex_name(handle)
+                .or_else(|| self.select_upload_for_generated_text_uvs(&uvs))
+        } else if has_uv {
+            self.select_upload_by_tex_name(handle)
+                .or_else(|| self.select_upload_for_uvs(&uvs))
+        } else {
+            self.select_upload_by_tex_name(handle)
+        };
 
         let mut record = LiveDrawRecord {
             draw_index,
@@ -641,7 +668,9 @@ impl LiveGlState {
         let positions4 = first_four_positions(positions);
         let uvs4 = uvs.map(first_four_uvs).unwrap_or([(0.0, 0.0); 4]);
         let inferred_dim = uvs.map(infer_dims_from_uv_slice);
-        let selected_upload = uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs));
+        let selected_upload = uvs
+            .and_then(|_| self.select_upload_by_tex_name(handle))
+            .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs)));
         let mut record = LiveDrawRecord {
             draw_index,
             handle,
@@ -830,7 +859,7 @@ mod tests {
     fn build_upload_decodes_pixels_and_preserves_dims() {
         let payload = rgb565_2x2();
         let upload =
-            LiveGlState::build_upload(0, 0x0de1, 2, 2, 0x1907, 0x8363, 0x1000_0000, &payload);
+            LiveGlState::build_upload(0, 0x0de1, 2, 2, 0x1907, 0x8363, 0x1000_0000, &payload, None);
         assert_eq!(upload.format, Some(TextureFormat::Rgb565));
         assert_eq!(upload.width, 2);
         assert_eq!(upload.height, 2);
@@ -846,16 +875,62 @@ mod tests {
     fn build_upload_rejects_short_payload() {
         let payload = vec![0u8; 2]; // far too short for 2x2 RGB565
         let upload =
-            LiveGlState::build_upload(0, 0x0de1, 2, 2, 0x1907, 0x8363, 0x1000_0000, &payload);
+            LiveGlState::build_upload(0, 0x0de1, 2, 2, 0x1907, 0x8363, 0x1000_0000, &payload, None);
         assert_eq!(upload.format, Some(TextureFormat::Rgb565));
         assert!(upload.texture.is_none(), "short payload must not decode");
     }
 
     #[test]
     fn build_upload_rejects_unsupported_format() {
-        let upload = LiveGlState::build_upload(0, 0x0de1, 2, 2, 0xdead, 0xbeef, 0x1000_0000, &[]);
+        let upload = LiveGlState::build_upload(0, 0x0de1, 2, 2, 0xdead, 0xbeef, 0x1000_0000, &[], None);
         assert!(upload.format.is_none());
         assert!(upload.texture.is_none());
+    }
+
+    #[test]
+    fn select_upload_prefers_tex_name_then_falls_back_to_dims() {
+        let mut lg = LiveGlState::new(true, false, false);
+        // Two uploads with identical dimensions but distinct GL texture names.
+        lg.uploads.push(LiveGlState::build_upload(
+            0,
+            0x0de1,
+            50,
+            50,
+            0x1908,
+            0x8034,
+            0x1000_0000,
+            &vec![0u8; 50 * 50 * 2],
+            Some(0x13),
+        ));
+        lg.uploads.push(LiveGlState::build_upload(
+            1,
+            0x0de1,
+            50,
+            50,
+            0x1908,
+            0x8034,
+            0x1000_0010,
+            &vec![0u8; 50 * 50 * 2],
+            Some(0x23),
+        ));
+        // Draw bound to handle 0x23 must pick upload #1, not the dim-matched #0.
+        assert_eq!(lg.select_upload_by_tex_name(0x23), Some(1));
+        assert_eq!(lg.select_upload_by_tex_name(0x13), Some(0));
+        // Unknown handle falls back to None (caller then uses dim/UV matching).
+        assert_eq!(lg.select_upload_by_tex_name(0x99), None);
+        // Reloads of the same name resolve to the most recent upload.
+        lg.uploads.push(LiveGlState::build_upload(
+            2,
+            0x0de1,
+            50,
+            50,
+            0x1908,
+            0x8034,
+            0x1000_0020,
+            &vec![0u8; 50 * 50 * 2],
+            Some(0x13),
+        ));
+        assert_eq!(lg.select_upload_by_tex_name(0x13), Some(2));
     }
 
     #[test]
@@ -870,6 +945,7 @@ mod tests {
             0x8034,
             0x1000_0000,
             &vec![0u8; 50 * 50 * 2],
+            None,
         ));
         lg.uploads.push(LiveGlState::build_upload(
             1,
@@ -880,6 +956,7 @@ mod tests {
             0x8033,
             0x1000_0010,
             &vec![0u8; 250 * 162 * 2],
+            None,
         ));
         assert_eq!(lg.select_upload_by_dims(50, 50), Some(0));
         assert_eq!(lg.select_upload_by_dims(250, 162), Some(1));
@@ -898,6 +975,7 @@ mod tests {
             0x1401,
             0x1000_0000,
             &vec![0xff; 980 * 24],
+            None,
         ));
         lg.uploads.push(LiveGlState::build_upload(
             1,
@@ -908,6 +986,7 @@ mod tests {
             0x1401,
             0x1000_0010,
             &vec![0xff; 320 * 99],
+            None,
         ));
         let menu_strip_uvs = [(0.5, 37.5), (0.5, 3.5), (308.5, 3.5), (308.5, 37.5)];
         assert_eq!(lg.select_upload_for_uvs(&menu_strip_uvs), Some(1));
@@ -925,6 +1004,7 @@ mod tests {
             0x1401,
             0x1000_0000,
             &vec![0xff; 36 * 20],
+            None,
         ));
         lg.uploads.push(LiveGlState::build_upload(
             1,
@@ -935,6 +1015,7 @@ mod tests {
             0x1401,
             0x1000_0800,
             &vec![0xff; 32 * 32],
+            None,
         ));
         lg.uploads.push(LiveGlState::build_upload(
             2,
@@ -945,6 +1026,7 @@ mod tests {
             0x1401,
             0x1000_1000,
             &vec![0xff; 784 * 20],
+            None,
         ));
         lg.uploads.push(LiveGlState::build_upload(
             3,
@@ -955,6 +1037,7 @@ mod tests {
             0x1401,
             0x1000_2000,
             &vec![0xff; 1568 * 32],
+            None,
         ));
         let glyph_16_uvs = [(400.5, 15.5), (400.5, 0.5), (415.5, 0.5), (415.5, 15.5)];
         assert_eq!(
@@ -1006,6 +1089,7 @@ mod tests {
             0x8363,
             0x1000_0000,
             &rgb565_2x2(),
+            None,
         ));
         lg.translation = (10.0, 20.0);
         lg.draw_count_in_frame = 2;
