@@ -65,6 +65,16 @@ const HLE_INFO_FRAMEBUFFER: u32 = 0xff203040;
 const HLE_WARN_FRAMEBUFFER: u32 = 0xff604020;
 const HLE_OPENGL_FRAMEBUFFER: u32 = 0xff205020;
 
+fn ordinal45_resource_format(format: u32) -> Option<TextureFormat> {
+    match format {
+        // Observed in Mahjong resource texture objects. These are copied from
+        // guest work RAM and decoded as alpha masks with white tint until more
+        // exact palette/color state is proven.
+        0x8808 | 0x0801 => Some(TextureFormat::A8),
+        _ => None,
+    }
+}
+
 fn quad_from_slice(pts: &[(f32, f32)]) -> [(f32, f32); 4] {
     debug_assert!(pts.len() >= 4);
     [pts[0], pts[1], pts[2], pts[3]]
@@ -1044,6 +1054,7 @@ impl Eapp {
             159 => self.live_handle_bind_material(args),
             37 => self.live_handle_draw(args),
             38 => self.live_handle_draw_elements(args),
+            45 => self.live_handle_resource_upload(args),
             // Candidate lifecycle from observed live ordering:
             // 158 always precedes all steady-state draws; 157 always follows.
             // Neutral names until exact ABI semantics are proven.
@@ -1056,9 +1067,9 @@ impl Eapp {
             // menu phase. Evidence: r0=4, r1=1, r2=0x101029e8 (work RAM ptr).
             // Semantics not yet confirmed — capture args for analysis.
             148 => self.live_handle_ordinal_148(args),
-            // Upload prep/bind ordinals; not required for dimension-based
-            // live texture selection.
-            45 | 4 => {}
+            // Upload prep/bind ordinals; ordinal 45 is handled above when it
+            // carries a Mahjong-style work-RAM resource descriptor.
+            4 => {}
             _ => {
                 // Unknown/unsupported ordinal; fail safe (no panic).
             }
@@ -1120,6 +1131,131 @@ impl Eapp {
             if self.live_gl.as_ref().map(|lg| lg.gate_b).unwrap_or(false) {
                 self.live_present_completed_to_window();
             }
+        }
+    }
+
+    /// Ordinal 45: Mahjong-style resource texture descriptor. Captures show
+    /// r1 pointing at a stack descriptor whose word 1 points at a work-RAM
+    /// texture object. That object carries packed dimensions at word 4,
+    /// material handle at word 2, pixel pointer at word 9, and a format-ish
+    /// word at word 10 (`0x8808`/`0x0801` observed as A8 resources).
+    ///
+    /// This is deliberately guarded to copied guest bytes from mapped work RAM;
+    /// unsupported shapes are ignored so ordinal-99 remains the primary upload
+    /// path for Tetris and most other games.
+    fn live_handle_resource_upload(&mut self, args: [u32; 4]) {
+        let desc_ptr = args[1];
+        let prep_width = args[2] as usize;
+        let prep_height = args[3] as usize;
+        if desc_ptr == 0 || prep_width == 0 || prep_height == 0 {
+            return;
+        }
+        let Some(texture_obj) = self.read_guest_u32(desc_ptr.wrapping_add(4)) else {
+            return;
+        };
+        if !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&texture_obj) {
+            return;
+        }
+        let Some(words) = self.read_guest_words_exact(texture_obj, 12) else {
+            return;
+        };
+        let material_handle = words[2];
+        let packed_dims = words[4];
+        let width = (packed_dims & 0xffff) as usize;
+        let height = (packed_dims >> 16) as usize;
+        let pixel_ptr = words[9];
+        let resource_format = words[10];
+        if width == 0
+            || height == 0
+            || width != prep_width
+            || height != prep_height
+            || material_handle == 0
+            || pixel_ptr == 0
+            || width > 4096
+            || height > 4096
+        {
+            return;
+        }
+        let Some(format) = ordinal45_resource_format(resource_format) else {
+            warn!(
+                target: "EAPP_GL",
+                "ordinal45 resource skipped: unsupported fmt={:#x} handle={:#x} {}x{} ptr={:#010x}",
+                resource_format,
+                material_handle,
+                width,
+                height,
+                pixel_ptr
+            );
+            return;
+        };
+        let byte_len = match format {
+            TextureFormat::Rgb565 | TextureFormat::Rgba5551 | TextureFormat::Rgba4444 => {
+                width.saturating_mul(height).saturating_mul(2)
+            }
+            TextureFormat::Rgba8888 => width.saturating_mul(height).saturating_mul(4),
+            TextureFormat::LuminanceAlpha88 => width.saturating_mul(height).saturating_mul(2),
+            TextureFormat::A8 => width.saturating_mul(height),
+        };
+        if byte_len == 0 || byte_len > 16 * 1024 * 1024 {
+            return;
+        }
+        let Some(bytes) = self.read_guest_bytes(pixel_ptr, byte_len) else {
+            warn!(
+                target: "EAPP_GL",
+                "ordinal45 resource skipped: invalid pixel ptr {:#010x} len={} handle={:#x}",
+                pixel_ptr,
+                byte_len,
+                material_handle
+            );
+            return;
+        };
+        if bytes.len() != byte_len {
+            return;
+        }
+
+        if let Some(lg) = self.live_gl.as_mut() {
+            if let Some(existing) = lg.uploads.iter().find(|u| {
+                u.source_ptr == pixel_ptr
+                    && u.width == width
+                    && u.height == height
+                    && u.source_format == resource_format
+            }) {
+                lg.resource_uploads_by_handle
+                    .insert(material_handle, existing.index);
+                return;
+            }
+            let index = lg.uploads.len();
+            let texture = Texture::from_bytes(
+                &bytes,
+                width,
+                height,
+                format,
+                Rgba8::rgba(255, 255, 255, 255),
+            );
+            lg.uploads.push(live_gl::LiveGlUpload {
+                index,
+                target: 0,
+                width,
+                height,
+                source_format: resource_format,
+                pixel_type: 0,
+                source_ptr: pixel_ptr,
+                source_file: None,
+                source_file_offset: None,
+                format: Some(format),
+                texture: Some(texture),
+            });
+            lg.resource_uploads_by_handle.insert(material_handle, index);
+            info!(
+                target: "EAPP_GL",
+                "ordinal45 resource upload #{} handle={:#x} {}x{} fmt={:#x} ptr={:#010x}",
+                index,
+                material_handle,
+                width,
+                height,
+                resource_format,
+                pixel_ptr
+            );
         }
     }
 
@@ -1831,6 +1967,7 @@ impl Eapp {
             material_epoch,
             explicit_uv_def,
             explicit_uv_enabled,
+            has_resource_upload,
         ) =
             {
                 let lg = match self.live_gl.as_ref() {
@@ -1860,6 +1997,8 @@ impl Eapp {
                     lg.current_material_epoch,
                     explicit_uv_def,
                     explicit_uv_enabled,
+                    lg.resource_uploads_by_handle
+                        .contains_key(&lg.current_handle),
                 )
             };
         let pointer_handle =
@@ -1927,13 +2066,24 @@ impl Eapp {
         } else {
             None
         };
-        let explicit = self.live_decode_uvs_range(
-            &explicit_uv_def,
-            explicit_uv_enabled,
-            material_epoch,
-            first,
-            count,
-        );
+        let explicit = self
+            .live_decode_uvs_range(
+                &explicit_uv_def,
+                explicit_uv_enabled,
+                material_epoch,
+                first,
+                count,
+            )
+            .or_else(|| {
+                has_resource_upload.then(|| {
+                    self.live_decode_uvs_range_any_epoch(
+                        &explicit_uv_def,
+                        explicit_uv_enabled,
+                        first,
+                        count,
+                    )
+                })?
+            });
         let solid_color = if handle == 0x3 {
             self.live_decode_solid_color(&explicit_uv_def, explicit_uv_enabled, material_epoch)
         } else {
@@ -2532,6 +2682,26 @@ impl Eapp {
             || def.format != live_gl::GL_FIXED
             || def.component_count != 2
         {
+            return None;
+        }
+        self.read_fixed_array_range(
+            def.guest_ptr,
+            def.component_count as usize,
+            def.stride as usize,
+            first,
+            count,
+        )
+    }
+
+    fn live_decode_uvs_range_any_epoch(
+        &mut self,
+        def: &Option<live_gl::LiveArrayDef>,
+        enabled: bool,
+        first: usize,
+        count: usize,
+    ) -> Option<Vec<(f32, f32)>> {
+        let def = def.as_ref()?;
+        if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count != 2 {
             return None;
         }
         self.read_fixed_array_range(
@@ -3633,6 +3803,18 @@ impl Eapp {
                 self.read_guest_u32(a).unwrap_or(0xffff_ffff)
             })
             .collect()
+    }
+
+    fn read_guest_words_exact(&mut self, addr: u32, count: usize) -> Option<Vec<u32>> {
+        if addr == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let a = addr.wrapping_add((i * 4) as u32);
+            out.push(self.read_guest_u32(a)?);
+        }
+        Some(out)
     }
 
     fn preview_words(&mut self, addr: u32, count: usize) -> String {

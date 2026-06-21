@@ -123,6 +123,11 @@ pub struct CompletedFrame {
 /// Tetris stream. Stored on `Eapp` only when the experimental flag is set.
 pub struct LiveGlState {
     pub uploads: Vec<LiveGlUpload>,
+    /// Material handle -> upload index for texture objects decoded from
+    /// ordinal-45 resource descriptors. This is used only as evidence that a
+    /// pre-bind UV array belongs to the material, not as a substitute for real
+    /// UV coordinates.
+    pub resource_uploads_by_handle: HashMap<u32, usize>,
     pub arrays: HashMap<u32, LiveArrayDef>,
     pub enabled_arrays: HashSet<u32>,
     pub current_handle: u32,
@@ -195,6 +200,7 @@ impl LiveGlState {
     pub fn new(present_vflip: bool, gate_b: bool, continuous_capture: bool) -> Self {
         Self {
             uploads: Vec::new(),
+            resource_uploads_by_handle: HashMap::new(),
             arrays: HashMap::new(),
             enabled_arrays: HashSet::new(),
             current_handle: 0,

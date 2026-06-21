@@ -415,7 +415,7 @@ Cross-game north-star priorities from this matrix:
 1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
 2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
 3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is UV/upload matching.**
-4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and the remaining Tetris pointer-text misses
+4. improve UV/upload matching for zero/degenerate UV cases; Mahjong's ordinal-45 resource-upload path is now decoded enough to render its main handles; PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and remaining Tetris pointer-text misses still need work
 5. ~~investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work~~ **Partially resolved for the Sims/Sudoku/Solitaire engine family:** `OpenGLES:38` is indexed triangle-strip draw; iQuiz/Vortex remain early fatal object-layout cases.
 
 Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`):
@@ -494,13 +494,39 @@ Additional UV/upload-state evidence from Mahjong (`77777`):
 - unlike Tetris/Cubis, Mahjong emits no ordinal-99 texture uploads in this
   path. The pointer capture shows `GL:45 r1` points at a stack/descriptor area
   that in turn references work-RAM resource objects containing packed dimensions
-  and format-ish words. This strongly suggests `OpenGLES:45` has an alternate
-  descriptor/upload or resource-bind role in this engine, not just the
-  Tetris-style upload-prep role.
-- current safe conclusion: do **not** hardcode Mahjong textures or infer UVs
-  from zero arrays. The next accuracy-first step is to decode the ordinal-45
-  descriptor/object layout and identify the real pixel pointer / format / UV or
-  texture-coordinate source.
+  and format-ish words. This proves `OpenGLES:45` has an alternate descriptor /
+  resource-upload role in this engine, not just the Tetris-style upload-prep
+  role.
+- decoded resource-object layout used by the live renderer:
+  - `r1 + 0x04` → work-RAM texture object pointer
+  - object word 2 → material/draw handle (`0x19` for the 552×110 resource,
+    `0x12` for the 40×36 resource)
+  - object word 4 → packed dimensions (`height << 16 | width`)
+  - object word 9 → pixel pointer (`0x100253e0` / `0x100430d0` in capture)
+  - object word 10 → format-ish token (`0x8808` / `0x0801`, currently decoded
+    as copied A8 masks with white tint)
+- ordinal-37 UV epoch caveat: Mahjong defines position/UV arrays before the
+  `159` material bind, so the normal Tetris-protective material-epoch guard
+  discarded valid UVs. The implementation relaxes epoch matching only when the
+  current handle has a decoded ordinal-45 resource upload.
+- follow-up validation:
+  - headless root: `/tmp/clicky_ord45_validate_20260620_210929`
+  - `77777` headless: 2 ordinal-45 resource uploads, 33,095 rasterized draws,
+    1 skipped draw, 0 fatal errors
+  - `66666` Tetris short headless regression:
+    `/tmp/clicky_ord45_validate_20260620_210929/66666_short.log`; 0
+    ordinal-45 resource uploads, 3,253 rasterized draws, 0 fatal errors
+  - headed root: `/tmp/clicky_ord45_headed_20260620_211224`
+  - headed Mahjong log:
+    `/tmp/clicky_ord45_headed_20260620_211224/tetris_run_20260620_211224.log`
+  - headed Mahjong captures:
+    `/tmp/clicky_ord45_headed_20260620_211224/tetris_capture_20260620_211224/`
+    (33 PPM files)
+  - headed Mahjong counts: 2 ordinal-45 resource uploads, 1,664 rasterized draw
+    lines, 1 skipped draw, 132 frame diagnostics, 0 fatal errors
+- remaining caution: this is still evidence-driven and guarded, not a generic
+  arbitrary-pointer texture guess. The `0x8808`/`0x0801` color interpretation is
+  provisional A8, and handle `0x2` still needs separate state/UV semantics.
 
 Additional lifecycle/no-draw evidence from the no-capture titles:
 
