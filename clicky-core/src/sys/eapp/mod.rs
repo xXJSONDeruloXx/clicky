@@ -1043,6 +1043,7 @@ impl Eapp {
             169 => self.live_handle_translate(args),
             159 => self.live_handle_bind_material(args),
             37 => self.live_handle_draw(args),
+            38 => self.live_handle_draw_elements(args),
             // Candidate lifecycle from observed live ordering:
             // 158 always precedes all steady-state draws; 157 always follows.
             // Neutral names until exact ABI semantics are proven.
@@ -1050,7 +1051,7 @@ impl Eapp {
             157 => self.live_handle_candidate_present(),
             165 => {}
             // Draw-adjacent state ordinals; recorded by observation only.
-            175 | 125 | 36 => {}
+            175 | 149 | 125 | 36 => {}
             // Ordinal 148 appears before pointer-backed material draws in the
             // menu phase. Evidence: r0=4, r1=1, r2=0x101029e8 (work RAM ptr).
             // Semantics not yet confirmed — capture args for analysis.
@@ -1635,6 +1636,160 @@ impl Eapp {
         self.live_finalize_draws(vec![record]);
     }
 
+    /// Ordinal 38: observed in the Sims/Sudoku/Solitaire engine family as
+    /// `DrawElements(mode=5, count=N, type=GL_UNSIGNED_SHORT, indices=ptr)`.
+    /// Decode indexed triangle strips using the currently enabled client
+    /// arrays. Malformed pointers/types fail safely and record a skipped draw.
+    fn live_handle_draw_elements(&mut self, args: [u32; 4]) {
+        let mode = args[0];
+        let count = args[1] as usize;
+        let index_type = args[2];
+        let indices_ptr = args[3];
+        if mode != live_gl::DRAW_MODE_TRIANGLE_STRIP
+            || index_type != live_gl::GL_UNSIGNED_SHORT
+            || count < 3
+            || count > 4096
+            || indices_ptr == 0
+        {
+            warn!(
+                target: "EAPP_GL",
+                "draw-elements skipped: unsupported mode={} count={} type={:#x} indices={:#010x}",
+                mode,
+                count,
+                index_type,
+                indices_ptr
+            );
+            self.live_finalize_draw(None);
+            return;
+        }
+        let index_bytes = match self.read_guest_bytes(indices_ptr, count.saturating_mul(2)) {
+            Some(bytes) if bytes.len() == count * 2 => bytes,
+            _ => {
+                warn!(
+                    target: "EAPP_GL",
+                    "draw-elements skipped: invalid index ptr {:#010x} count={}",
+                    indices_ptr,
+                    count
+                );
+                self.live_finalize_draw(None);
+                return;
+            }
+        };
+        let indices: Vec<usize> = index_bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .collect();
+
+        if let Some(lg) = self.live_gl.as_mut() {
+            if lg.continuous_capture && !lg.frame_active {
+                // This engine family has no observed ordinal-158 begin; the
+                // first DrawElements call is the practical frame begin and is
+                // followed by ordinal-157 present. Treat it as a normal
+                // implicit begin rather than an anomaly.
+                if matches!(lg.begin_frame(), live_gl::BeginOutcome::DoubleBegin) {
+                    warn!(target: "EAPP_GL", "draw-elements implicit begin hit an active frame");
+                }
+            }
+        }
+
+        let (
+            handle,
+            state_ptr,
+            translation,
+            pos_def,
+            pos_enabled,
+            enabled_arrays,
+            draw_index,
+            explicit_uv_def,
+            explicit_uv_enabled,
+        ) =
+            {
+                let lg = match self.live_gl.as_ref() {
+                    Some(lg) => lg,
+                    None => return,
+                };
+                let mut enabled_arrays: Vec<u32> = lg.enabled_arrays.iter().copied().collect();
+                enabled_arrays.sort_unstable();
+                let (explicit_uv_def, explicit_uv_enabled) =
+                    if let Some(def) = lg.arrays.get(&1).cloned() {
+                        (Some(def), lg.enabled_arrays.contains(&1))
+                    } else if let Some(def) = lg.arrays.get(&2).cloned().filter(|d| {
+                        d.valid && d.format == live_gl::GL_FIXED && d.component_count == 2
+                    }) {
+                        (Some(def), lg.enabled_arrays.contains(&2))
+                    } else {
+                        (None, false)
+                    };
+                (
+                    lg.current_handle,
+                    lg.current_state_ptr,
+                    lg.translation,
+                    lg.arrays.get(&0).cloned(),
+                    lg.enabled_arrays.contains(&0),
+                    enabled_arrays,
+                    lg.draws.len(),
+                    explicit_uv_def,
+                    explicit_uv_enabled,
+                )
+            };
+        let state_words = self.read_guest_words(state_ptr, 16);
+        let positions = match self.live_decode_positions_indices(
+            &pos_def,
+            pos_enabled,
+            translation,
+            &indices,
+        ) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    target: "EAPP_GL",
+                    "draw{} skipped: indexed position array unusable handle={:#x}",
+                    draw_index + 1,
+                    handle
+                );
+                self.live_finalize_draw(None);
+                return;
+            }
+        };
+        // Ordinal-38 captures show array definitions before the material bind
+        // (`137,40,137,40,4,159,149,38`). For this indexed path, accept the
+        // enabled UV array regardless of material epoch; stale-epoch protection
+        // remains in the ordinal-37 DrawArrays path where it was needed.
+        let explicit =
+            self.live_decode_uvs_indices(&explicit_uv_def, explicit_uv_enabled, &indices);
+        let tint = Rgba8::rgba(255, 255, 255, 255);
+        let mut record = match self.live_gl.as_mut() {
+            Some(lg) => lg.rasterize_triangle_strip_record(
+                draw_index,
+                handle,
+                state_ptr,
+                translation,
+                &positions,
+                explicit.as_deref(),
+                tint,
+            ),
+            None => return,
+        };
+        record.position_array = pos_def;
+        record.uv_array = explicit_uv_def;
+        record.enabled_arrays = enabled_arrays;
+        record.state_words = state_words;
+        if let Some(reason) = record.skipped_reason.as_ref() {
+            warn!(target: "EAPP_GL", "draw{} skipped: {}", draw_index + 1, reason);
+        } else {
+            info!(
+                target: "EAPP_GL",
+                "draw{} rasterized draw-elements triangle-strip handle={:#x} indices={} triangles={} cov={}",
+                draw_index + 1,
+                handle,
+                count,
+                count.saturating_sub(2),
+                record.coverage
+            );
+        }
+        self.live_finalize_draws(vec![record]);
+    }
+
     /// Ordinal 37: observed `DrawArrays(mode=7, first=0, count=4*N)`. Tetris
     /// uses the single-quad case; several sibling titles batch multiple quads.
     /// `mode=5` is also modeled as standard GL ES `GL_TRIANGLE_STRIP` for
@@ -1860,6 +2015,30 @@ impl Eapp {
         }
 
         self.live_finalize_draws(records);
+    }
+
+    fn live_decode_positions_indices(
+        &mut self,
+        def: &Option<live_gl::LiveArrayDef>,
+        enabled: bool,
+        translation: (f32, f32),
+        indices: &[usize],
+    ) -> Option<Vec<(f32, f32)>> {
+        let def = def.as_ref()?;
+        if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count < 2 {
+            return None;
+        }
+        let pts = self.read_fixed_array_indices(
+            def.guest_ptr,
+            def.component_count as usize,
+            def.stride as usize,
+            indices,
+        )?;
+        Some(
+            pts.into_iter()
+                .map(|(x, y)| (x + translation.0, y + translation.1))
+                .collect(),
+        )
     }
 
     /// Decode position vertices (array 0, GL_FIXED) and apply the current
@@ -2361,6 +2540,24 @@ impl Eapp {
             def.stride as usize,
             first,
             count,
+        )
+    }
+
+    fn live_decode_uvs_indices(
+        &mut self,
+        def: &Option<live_gl::LiveArrayDef>,
+        enabled: bool,
+        indices: &[usize],
+    ) -> Option<Vec<(f32, f32)>> {
+        let def = def.as_ref()?;
+        if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count != 2 {
+            return None;
+        }
+        self.read_fixed_array_indices(
+            def.guest_ptr,
+            def.component_count as usize,
+            def.stride as usize,
+            indices,
         )
     }
 
@@ -3611,6 +3808,39 @@ impl Eapp {
             out.push(self.bus.r8(addr.wrapping_add(i as u32)).ok()?);
         }
         Some(out)
+    }
+
+    fn read_fixed_array_indices(
+        &mut self,
+        guest_ptr: u32,
+        components: usize,
+        stride_bytes: usize,
+        indices: &[usize],
+    ) -> Option<Vec<(f32, f32)>> {
+        let tight_stride = components * 4;
+        let stride = if stride_bytes == 0 {
+            tight_stride
+        } else {
+            stride_bytes.max(tight_stride)
+        };
+        let mut pts = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let start = index.checked_mul(stride)?;
+            let bytes =
+                self.read_guest_bytes(guest_ptr.wrapping_add(start as u32), tight_stride)?;
+            if bytes.len() < tight_stride || bytes.len() < 8 {
+                return None;
+            }
+            let x =
+                decode_fixed_16_16(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            let y = if components >= 2 {
+                decode_fixed_16_16(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+            } else {
+                0.0
+            };
+            pts.push((x, y));
+        }
+        Some(pts)
     }
 
     /// Decode `vertex_count` vertices of `components` signed-16.16 fixed-point

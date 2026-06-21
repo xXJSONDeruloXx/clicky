@@ -28,6 +28,10 @@ pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
 /// arrays. Any other array format is preserved but not interpreted.
 pub const GL_FIXED: u32 = 0x140c;
 
+/// GL_UNSIGNED_SHORT (0x1403), observed as the index type for ordinal-38
+/// `DrawElements` triangle strips in the Sims/Sudoku/Solitaire engine family.
+pub const GL_UNSIGNED_SHORT: u32 = 0x1403;
+
 /// Confirmed DrawArrays quad mode token observed at most ordinal-37 call sites.
 pub const DRAW_MODE: u32 = 7;
 

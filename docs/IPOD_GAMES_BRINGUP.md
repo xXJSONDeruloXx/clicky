@@ -416,7 +416,7 @@ Cross-game north-star priorities from this matrix:
 2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
 3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is UV/upload matching.**
 4. improve UV/upload matching for zero/degenerate UV cases; this affects Mahjong, PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and the remaining Tetris pointer-text misses
-5. investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work
+5. ~~investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work~~ **Partially resolved for the Sims/Sudoku/Solitaire engine family:** `OpenGLES:38` is indexed triangle-strip draw; iQuiz/Vortex remain early fatal object-layout cases.
 
 Follow-up validation for `GL_LUMINANCE_ALPHA` (`src_fmt=0x190a pix_type=0x1401`):
 
@@ -510,13 +510,15 @@ Additional lifecycle/no-draw evidence from the no-capture titles:
   - both perform real uploads and array definitions
   - representative lifecycle traces include `... 159(h0x27),149,38 ...` and
     `... 159(h0x19),149,38 ...` instead of `OpenGLES:37`
-  - likely next renderer gap: identify ordinal `38` and/or `149` draw/state
-    semantics used by this engine family
+  - follow-up capture proved `OpenGLES:38` is `DrawElements(mode=5,
+    count=N, type=0x1403/GL_UNSIGNED_SHORT, indices=ptr)` for this engine
+    family
 - `50513` Sudoku and `50514` Royal Solitaire:
   - also perform uploads/array definitions without ordinal-37 draws
   - traces similarly show `159(...),149,38` sequences after uploads
-  - likely shares the Sims/Solitaire-style draw/state path rather than being a
-    file or timer stall
+  - likely shares the Sims/Solitaire-style draw-state path rather than being a
+    file or timer stall; Sudoku produced one indexed strip in a short bounded
+    validation run
 - `1B200` LOST:
   - after `GL_LUMINANCE_ALPHA` support, the previous unsupported upload is gone
   - still no completed draws; steady lifecycle is mostly `13,12,159(h0xe),157`
@@ -528,6 +530,35 @@ Additional lifecycle/no-draw evidence from the no-capture titles:
   - Vortex: `FatalMemException pc=0x18014d58 kind=Write off=0x00000004`
   - both happen after early GL setup/uploads and need separate object/runtime
     layout investigation
+
+Follow-up validation for `OpenGLES:38` indexed draws:
+
+- argument-level capture root: `/tmp/clicky_ord38_capture2_20260620_204826`
+  - `1500C` capture: `/tmp/clicky_ord38_capture2_20260620_204826/1500C/gl.json`
+  - `50513` capture: `/tmp/clicky_ord38_capture2_20260620_204826/50513/gl.json`
+  - representative `1500C` call: `r0=0x5`, `r1=0xa`, `r2=0x1403`,
+    `r3=0x10003014`, with index bytes decoding to unsigned-short strip
+    indices like `[0,1,3,2,2,4,4,5,7,6]`
+- implementation: `OpenGLES:38` is modeled as `glDrawElements` for
+  `GL_TRIANGLE_STRIP` + `GL_UNSIGNED_SHORT`; it decodes indexed position/UV
+  arrays and treats the first indexed draw as an implicit frame begin for this
+  no-ordinal-158 engine family
+- headless validation root: `/tmp/clicky_draw_elements_validate2_20260620_205657`
+  - `1500C`: 950 `rasterized draw-elements` logs, 132 `frame_diag` logs, 0
+    fatal errors, 0 `outside active candidate frame` warnings
+  - `50513`: 1 `rasterized draw-elements` log, 2 `frame_diag` logs, 0 fatal
+    errors
+  - `66666` Tetris regression: 0 fatal errors; no ordinal-38 use
+- headed validation root: `/tmp/clicky_draw_elements_headed_20260620_205755`
+  - `1500C` log: `/tmp/clicky_draw_elements_headed_20260620_205755/1500C/tetris_run_20260620_205755.log`
+  - `1500C`: 234 indexed draw-elements rasterizations in a 5s headed run, 9
+    startup capture files, 0 fatal errors
+  - `66666` log: `/tmp/clicky_draw_elements_headed_20260620_205755/66666/tetris_run_20260620_205800.log`
+  - `66666`: 20 startup capture files, 0 fatal errors
+- remaining renderer gaps: much Sims coverage is still zero/tiny or skips due
+  to UV/upload/state matching (for example handle `0x27` UV spans that do not
+  match a decoded upload); ordinal `149` remains draw-adjacent state and is
+  recorded as a no-op until its exact semantics are proven.
 
 #### Honest status (stable but green)
 
@@ -635,7 +666,8 @@ GL_QUADS      = 0x0007  (draw primitive confirmed from disassembly)
 | `GL:4`    | glTexParameteri / bind   | r0=GL_TEXTURE_2D; called once/texture before upload |
 | `GL:12`   | glClear (init only)      | r0=0x4000=GL_COLOR_BUFFER_BIT |
 | `GL:13`   | glClearColor (init only) | r0,r1,r2,r3 = 0,0,0,1.0 (black) |
-| `GL:37`   | **glDrawArrays** ✓       | disasm confirmed: mode=GL_QUADS(7), first=0, count=4 |
+| `GL:37`   | **glDrawArrays** ✓       | mode=7 batched quads; mode=5 `GL_TRIANGLE_STRIP` seen in Texas Hold'em |
+| `GL:38`   | **glDrawElements** ✓     | Sims/Sudoku/Solitaire family: r0=mode=5, r1=count, r2=0x1403 `GL_UNSIGNED_SHORT`, r3=index pointer |
 | `GL:40`   | enableClientArray        | r0=array_index |
 | `GL:45`   | createTexture / initObj  | r0=tex_name, r1=descriptor_ptr, r2=width, r3=height; once/texture |
 | `GL:99`   | **glTexImage2D** ✓       | r0=GL_TEXTURE_2D, r1=level=0, r2=GL_RGB/RGBA/ALPHA, r3=width; once/texture |
