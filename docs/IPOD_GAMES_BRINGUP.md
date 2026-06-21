@@ -475,6 +475,33 @@ Follow-up validation for Texas Hold'em `OpenGLES:37 mode=5`:
   - after fix: unsupported `mode=5` count is 0
   - remaining blocker: the triangle-strip draw now skips as `no live upload matched triangle-strip UV span None (handle=0x23)`, so Texas has joined the broader UV/upload-state bucket instead of being blocked on an unknown primitive mode
 
+Additional UV/upload-state evidence from Mahjong (`77777`):
+
+- trace artifact root: `/tmp/clicky_mahjong_trace_20260620_203851`
+- JSON pointer capture root: `/tmp/clicky_mahjong_capture2_20260620_204015`
+- JSON capture: `/tmp/clicky_mahjong_capture2_20260620_204015/mahjong_gl.json`
+- observed first active frame sequence:
+  - `GL:137` defines position array slot 0 at `0x10003190`
+  - `GL:137` defines UV-like slot 1 at `0x10003d90`
+  - `GL:45 r0=1 r1=0x13ffee30 r2=0x228 r3=0x6e`
+  - `GL:4 r0=0x0de1 r1=0 r2=0x228 r3=0x8808`
+  - `GL:159 r0=0x19 ... r2=0x228 r3=0x8808`
+  - `GL:37 mode=7 first=0 count=16`
+- later in the same frame:
+  - `GL:45 r0=1 r1=0x13ffef48 r2=0x28 r3=0x24`
+  - `GL:159 r0=0x12 ... r2=0x28 r3=0x0801`
+  - `GL:37 mode=7 first=0 count=8`
+- unlike Tetris/Cubis, Mahjong emits no ordinal-99 texture uploads in this
+  path. The pointer capture shows `GL:45 r1` points at a stack/descriptor area
+  that in turn references work-RAM resource objects containing packed dimensions
+  and format-ish words. This strongly suggests `OpenGLES:45` has an alternate
+  descriptor/upload or resource-bind role in this engine, not just the
+  Tetris-style upload-prep role.
+- current safe conclusion: do **not** hardcode Mahjong textures or infer UVs
+  from zero arrays. The next accuracy-first step is to decode the ordinal-45
+  descriptor/object layout and identify the real pixel pointer / format / UV or
+  texture-coordinate source.
+
 #### Honest status (stable but green)
 
 Running the desktop (non-headless) runner today shows a flat green window. That
