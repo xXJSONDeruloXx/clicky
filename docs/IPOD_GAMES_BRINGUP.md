@@ -587,6 +587,37 @@ Follow-up validation for `OpenGLES:38` indexed draws:
   match a decoded upload); ordinal `149` is classified below as a safe no-op
   per-draw state bind.
 
+Follow-up fix: ordinal-37 `mode=5` triangle-strip UV epoch guard (Texas Hold'em)
+
+- evidence root: `/tmp/clicky_uv_evidence_20260620_213000/holdem.log` (Texas
+  Hold'em `33333`). Observed `159 handle=0x6`/`0x23` binds (small integer
+  handles = GL texture names) interleaved with `137` array definitions; arrays
+  were defined at one material epoch and the draw ran at the next epoch after a
+  fresh `159` bind, so the strict `material_epoch` guard in
+  `live_decode_uvs_range` rejected valid UVs ("no live upload matched ... UV
+  span None").
+- root cause: vertex arrays are independent GL state that persists across
+  texture (material) binds; the strict epoch guard was a stale-UV heuristic
+  that produced false negatives on this engine.
+- fix: `live_handle_triangle_strip_draw` (ordinal 37 `mode=5`) now uses the
+  epoch-agnostic `live_decode_uvs_range_any_epoch`, matching the ordinal-38
+  `DrawElements` path and real GL semantics. The `mode=7` quad path (Tetris,
+  separate function) is untouched.
+- validation root: `/tmp/clicky_uv_fix_20260620_213500`
+  - Texas Hold'em `33333`: `no live upload matched` count `164 -> 1` (the
+    remaining 1 is the irreducible first draw before any array is defined);
+    rasterized triangle-strips went to `165`.
+  - Tetris `66666` golden regression: 0 fatals, 1005 rasterized, 2 skipped
+    (unchanged).
+  - Sims Bowling `1500C` (ordinal-38 engine): 0 fatals, 763 rasterized, 0
+    skipped (no regression).
+  - `cargo test -p clicky-core --test eapp_gl_decode`: 15 passed.
+- remaining: uploads still are not associated with their GL texture names
+  (ordinal 99 `glTexImage2D` has no name in its args; we lack the
+  `glBindTexture` ordinal), so upload selection for multi-texture draws still
+  falls back to UV-extent/dimension matching. Texas Hold'em now rasterizes
+  geometry but texture-name -> upload association is the next accuracy step.
+
 Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
 
 - instrumentation: added a register-state dump at the eapp memory-fault path

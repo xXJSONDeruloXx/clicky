@@ -1740,6 +1740,7 @@ impl Eapp {
                     explicit_uv_enabled,
                 )
             };
+        let _ = material_epoch;
         let state_words = self.read_guest_words(state_ptr, 16);
         let positions = match self.live_decode_positions_range(
             &pos_def,
@@ -1755,10 +1756,16 @@ impl Eapp {
                 return;
             }
         };
-        let explicit = self.live_decode_uvs_range(
+        // Vertex arrays are independent GL state that persists across texture
+        // (material) binds. Observed in Texas Hold'em: arrays are defined at
+        // one material epoch, then a `159` bind bumps the epoch before the
+        // `37 mode=5` draw, so a strict material-epoch guard would reject
+        // valid UVs. Use the epoch-agnostic decode, consistent with the
+        // ordinal-38 DrawElements path. Tetris uses mode=7 quads (a separate
+        // code path), so this does not affect the golden regression.
+        let explicit = self.live_decode_uvs_range_any_epoch(
             &explicit_uv_def,
             explicit_uv_enabled,
-            material_epoch,
             first,
             count,
         );
