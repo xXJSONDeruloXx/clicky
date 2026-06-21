@@ -1140,6 +1140,28 @@ impl Eapp {
                 lg.record_text_char_push(text_obj, char_code);
             }
         }
+        // RE (iter 20): caller-3 entry points that decide whether the legit
+        // byte-setter `0x18005034` fires. `0x1b8b4` is tail-called from
+        // `0x18004088`; it in turn calls `0x1b630`. The slot bit test at
+        // `0x1b7ac/0x1b7b8` requires `clock_obj+idx*16+0x8c` to have bit
+        // 0x10 (or 0x08) for BOTH slot indices; guest code may clear these
+        // bytes mid-frame BEFORE `0x1b630` reads them. To RE the natural
+        // path, optionally re-inject the bits just before the gate runs.
+        if std::env::var_os("CLICKY_EAPP_AUDIO_SLOT_BIT").is_some()
+            && pc == 0x1801_b630u32
+        {
+            // RE (iter 20): `0x1b630` calls `0x5a64` which copies the global at
+            // `0x18025eac` (4 bytes 0/4/8/24 offsets) to `slot+0x88/0x90/0x94/0xa0`.
+            // The slot+0x8c byte (from the +4 field at `0x18025eb0`) gates the
+            // caller-3 byte-setter via `tst r5, #16` / `tst r5, #8` at 0x1b7ac.
+            // The guest resets `0x18025eb0` periodically between progress logs,
+            // so re-inject each time we enter `0x1b630` (right before `bl 0x5a64`).
+            let bit: u32 = std::env::var("CLICKY_EAPP_AUDIO_SLOT_BIT_VAL")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x10);
+            let _ = self.write_guest_u32(0x1802_5eb0, bit);
+        }
 
         // Temporary RE: observe cluster-A clock-formatter entry (VMA
         // 0x180083b4, after the `cmp r3,#0; bxeq lr` guard). r0=text_obj,
@@ -4616,6 +4638,31 @@ impl Eapp {
         let clock_sum2 = self.read_guest_u32(0x1005f710 + 0x5c).unwrap_or(0);
         let clock_threshold = self.read_guest_u32(0x1005f710 + 0x60).unwrap_or(0);
         let clock_count = self.read_guest_u32(0x1005f710 + 0x6c).unwrap_or(0);
+        // RE: caller-3 (`0x1b8b4` → `0x1b630`) reads slot indexes [clock_obj+0xa8]
+        // and [clock_obj+0xac], then loads a state byte from [clock_obj+idx*16+0x8c].
+        // That byte's bits 0x10 and 0x08 must be set for the byte-setter tail
+        // call at `0x1b814: b 0x18005034` to fire.
+        let clock_idx_a8 = self.read_guest_u32(0x1005f710 + 0xa8).unwrap_or(0);
+        let clock_idx_ac = self.read_guest_u32(0x1005f710 + 0xac).unwrap_or(0);
+        let clock_slot_byte_a8 = self.read_guest_u8(0x1005f710 + clock_idx_a8 * 16 + 0x8c).unwrap_or(0);
+        let clock_slot_byte_ac = self.read_guest_u8(0x1005f710 + clock_idx_ac * 16 + 0x8c).unwrap_or(0);
+        // RE (iter 20): caller-3 (`0x1b630`) tail-calls `0x90c0(r0=audio_queue)` which
+        // returns `[audio_queue+0x14]`. Then `cmp r0, #100; poplt` returns early WITHOUT
+        // setting the byte. So the byte-setter `0x18005034` only fires when
+        // `[[clock_obj+0x2c]+0x14] >= 100`. This is the real audio-event counter.
+        let clock_audio_bytecount: u32 = {
+            if clock_audio_queue != 0 {
+                self.read_guest_u32(clock_audio_queue + 0x14).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        // RE (iter 20): AFTER the byte/bit gate at 0x1b7ac passes, caller-3
+        // accumulates `[0x18025580] += r1` each frame (r1=[sp+40] = per-frame
+        // delta = approximately per-frame ms or audio samples). If the
+        // accumulator >= 2000 then byte-setter `0x18005034` fires (after a few
+        // more sub-gates). [0x18025580] = [state_struct+0x34] = `[r4+0x34]`.
+        let audio_accumulator = self.read_guest_u32(0x1802_5580).unwrap_or(0);
         // Env-gated diagnostic: write byte 1 to 0x18025674 once per progress
         // interval to prove the gate theory. No guest writer is observed in
         // the binary for this byte, so the value is normally static 0.
@@ -4636,6 +4683,28 @@ impl Eapp {
             // Use u32 write (overwrites 4 bytes; adjacent bytes stay 0).
             let _ = self.write_guest_u32(0x1802_5674, 1);
         }
+        // RE (iter 20): caller-3 gate `[clock_obj+idx*16+0x8c] & 0x10 || ...0x08`.
+        // The audio slot state byte is never written by guest code, so the bit
+        // is always 0 and the byte-setter `0x18005034` is never reached via the
+        // natural audio-completion path. Env-gated injection used for RE
+        // only; observe whether state advances past 1 when both slots get
+        // a bit set. The literal value can be overridden via
+        // `CLICKY_EAPP_AUDIO_SLOT_BIT_VAL=0xNN` (default 0x10).
+        let slot_bit: u32 = std::env::var("CLICKY_EAPP_AUDIO_SLOT_BIT_VAL")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x10);
+        if std::env::var_os("CLICKY_EAPP_AUDIO_SLOT_BIT").is_some() {
+            // clock_obj=0x1005f710. slot 0 == clock_obj+0x8c, slot 1 == clock_obj+0x9c.
+            // Inject only the low byte (0x10) by writing a u32 (0x10) at the
+            // target address; upper 3 bytes are 0 (matches the static value).
+            let _ = self.write_guest_u32(0x1005f710 + 0x00 * 16 + 0x8c, slot_bit);
+            let _ = self.write_guest_u32(0x1005f710 + 0x01 * 16 + 0x8c, slot_bit);
+            // RE (iter 20): `0x1b630` calls `0x5a64` which COPIES the field
+            // at `0x18025eb0` to `[slot+0x8c]` (overwriting any value we
+            // inject here). So inject the byte at the source: `0x18025eb0`.
+            let _ = self.write_guest_u32(0x1802_5eb0, slot_bit);
+        }
         let import_summary = self.format_frame_import_counts(8);
         let trace_summary = if string_trace_enabled() && !self.string_trace_hits.is_empty() {
             let mut entries: Vec<(u32, u32)> =
@@ -4649,7 +4718,7 @@ impl Eapp {
         };
         info!(
             target: "EAPP_PROGRESS",
-            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] statemach_count={} statemach_byte={} clock_audio_queue={:#010x} clock_ready_byte={} clock_sum2={} clock_threshold={} clock_count={} async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
+            "startup_progress frame={} host_us={} fb_hash={:#018x} hash_changed={} first_hash_change={:?} app_time_current={} app_time_delta={} frame_state={} frame_event_mask={:#010x} app_event_head={:#010x} app_events=[{}] splash_phase={} splash_flags={:#010x} splash_timeout_a={} splash_timeout_b={} splash_times=[{},{},{}] statemach_count={} statemach_byte={} clock_audio_queue={:#010x} clock_ready_byte={} clock_sum2={} clock_threshold={} clock_count={} clock_idx_a8={} clock_idx_ac={} clock_slot_byte_a8={} clock_slot_byte_ac={} clock_audio_bytecount={} audio_accumulator={} async=req:{} queued:{} callbacks:{} pending:{} staged:{} imports=[{}] trace=[{}]",
             frame,
             self.host_start.elapsed().as_micros() as u64,
             fb_hash,
@@ -4675,6 +4744,12 @@ impl Eapp {
             clock_sum2,
             clock_threshold,
             clock_count,
+            clock_idx_a8,
+            clock_idx_ac,
+            clock_slot_byte_a8,
+            clock_slot_byte_ac,
+            clock_audio_bytecount,
+            audio_accumulator,
             self.async_request_count,
             self.async_callback_queued_count,
             self.guest_callback_invocation_count,

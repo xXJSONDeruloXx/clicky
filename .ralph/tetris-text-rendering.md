@@ -2217,3 +2217,117 @@ fires, so state is gated at 1 forever.
 5. **Supplementary**: investigate what `0x1801bc90` (called at `0x1b98c`)
    does — this might be the "request next audio sample" routine.
 
+
+## Iteration 20 — BREAKTHROUGH: NATURAL byte-setter fire via `[0x18025eb0]` injection
+
+Goal: implement iter-19 priorities. (1) Confirm where `[slot+0x8c]` audio
+state byte is supposed to be written; (2) emulate Audio:23 completion
+callback; (3) alternative — investigate `0x1801bfd8` caller-4 gate requirements.
+
+### (1) Audio:23/Audio:1 — REVISITED: not actually called by Tetris
+
+Iter 18's note claimed Audio:23/Audio:1 were called 10x per boot. Re-running
+with `CLICKY_AUDIO_TRACE=1` reveals: only `Audio:0` is called 10x per boot
+(at `lr=0x180054d4`, `r0=1`, `r1=0..9` = slot index, `r2=0x18025ec8` = audio
+array). Then `Audio:40/48/51/52/53/55/56` are each called 1-2 times during
+boot. NO Audio:23, Audio:1 (those ordinals from iter 18's note were an
+artifact of bad ordinal decoding). So the "Audio:23 callback struct" path
+doesn't apply.
+
+### (2) Iter 19 "audio slot bit injection" hypothesis — partially confirmed
+
+Iter 19 reasoned: caller 3's `0x1b630 → 0x1b97c: bl 0x1b630` reaches
+`0x1b7ac: tst r5, #16 ; tst r5, #8` checks on a per-slot byte at
+`[clock_obj+idx*16+0x8c]`, and that byte was always 0 because "an audio
+event would normally set the bit".
+
+This iteration's empirical experiments:
+- Injecting `0x10`, `0x08`, AND `0x18` directly to
+  `clock_obj+(0..1)*16+0x8c` via env-gated diag did NOT advance state. The
+  guest CLEARED slot 0 byte mid-frame via `pc=0x1801b680: str r1, [r5, #4]`
+  (part of `0x1b630` itself, after a `bl 0x5a64` helper call).
+- `0x5a64`: copies 4 fields from a fixed global at `0x18025eac` to a stack
+  buffer. `0x1b630` then writes those stack values to `[slot+0x88/0x8c/0x90/
+  0x94]`. So `[slot+0x8c]`'s value comes from the source `[0x18025eb0]` (= the
+  +4 field of the global at `0x18025eac`).
+- `0x18025eac` is in BSS — file offset `0x25eac` (= 155308) > bin file size
+  (`0x256ec` = 153324). So it's beyond the binary file, lives in RAM.
+- Initially `[0x18025eb0] = 0` (= BSS zero), hence `[slot+0x8c] = 0`.
+
+### (3) The accumulator + the natural advance
+
+Once `[0x18025eb0]` has bit 0x10 AND/OR 0x08 set (via PC hook at entry of
+`0x1b630`, re-injecting the value right before `bl 0x5a64` runs), the path in
+`0x1b630` advances to `0x1b7cc` which:
+- `r6 = literal-load [0x1b8b0] = 0x1802557c` (the state-struct+0x30 area)
+- `r0 = [r6+4] = [0x18025580]` (audio accumulator — `[state+0x34]`)
+- `r0 += r1` (frame delta; observed ~37/frame)
+- store back to `[0x18025580]`
+- `cmp r0, #2000; blt 0x1b818` — if accumulator >= 2000, fall through to
+  `0x1b7e8: strb fp, [r4, #0x55]` (set ready byte 0x55) and tail-call
+  `0x18005034` (THE legit byte-setter) at `0x1b814`.
+
+### PROVEN: state advances NATURALLY from 1 to 6 via the natural path
+
+Test run: `CLICKY_EAPP_AUDIO_SLOT_BIT=1
+CLICKY_EAPP_AUDIO_SLOT_BIT_VAL=0x18 --timeout 30 --headless`.
+
+```
+frame=10  statemach_byte=0  audio_accumulator=1134   frame_state=1
+frame=20  statemach_byte=0  audio_accumulator=1491   frame_state=1
+frame=30  statemach_byte=0  audio_accumulator=1741   frame_state=1
+frame=40  statemach_byte=1  audio_accumulator=2022   frame_state=1   # ← byte set! acc crosses 2000
+frame=50  statemach_byte=1  audio_accumulator=2022   frame_state=6   # ← state advanced
+frame=60+ statemach_byte=1  audio_accumulator=2022   frame_state=6   # ← stable
+```
+
+So with the PC-hook injection at `0x18025eb0` (= source of `0x5a64`'s copy),
+the byte-setter fires NATURALLY (no env `TEST_READY` direct write).
+The accumulator reaches 2000 after ~40 frames (~5s at 8 fps).
+
+### (4) State=6 framebuffer does NOT show menu labels (yet)
+
+Frame at frame 60 (state=6, fb_hash `0x54422ff99d87f7af`) saved to
+`/tmp/tetris_iter20_pc_hook_state6.png` (320x240 RGB). Pixel analysis:
+- avg lum 67.6/255 (medium brightness)
+- text_rows (bright>20 per row): y=11..32 (Tetris logo band), y=81 (EA logo),
+  y=126..138 (small bright row at menu-label Y range)
+- y=126-138 region looks like an attempt at menu text BUT only ~30 bright
+  pixels per row (light rendering, not full labels)
+
+So we get partial content at the menu-label row position, suggesting some
+state=6 calls TRY to draw menu labels but the rendering is incomplete. This
+matches iter 19's finding that state=6 case `[state+0] != 0 && [state+0xc]==2`
+short-circuits without the render work.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- default (no env) golden headed: 0 fatal, 0 skip, maxframe 135 (no regression)
+- PC-hook test (AUDIO_SLOT_BIT=0x18): state advances cleanly 1→6 at frame ~40,
+  stays at state=6 stable, 0 fatal/skip
+- Screenshot: `/tmp/tetris_iter20_pc_hook_state6.png`
+
+### Iteration 20 commits
+
+Will commit the new env diagnostics + the PC-hook env (`CLICKY_EAPP_AUDIO_SLOT_BIT`,
+`CLICKY_EAPP_AUDIO_SLOT_BIT_VAL`).
+
+### Next priorities for iteration 21
+
+1. **Find what writes `[0x18025eb0]` legitimately.** Watch `0x18025eac, 0x40`
+   to find all WRITERS of the audio global config struct. (Likely a Tetris
+   audio:init routine that hasn't been traced yet.)
+2. **Understand what natural state=6 rendering should look like.** Disassemble
+   the state=6 case `0x1800535c..0x180053a4` further. The `[state+0] != 0`
+   check is unsatisfied (state+0 might be the byte `[*0x18025674]`; need to
+   confirm). Find what writes `[state+0xc]` (= `[0x18025558]`) to 2 instead of
+   4 so state=6 case does its rendering work.
+3. **Investigate what happens to the framebuffer after frame 40 (state just
+   advanced).** Save frames 40-50 specifically — these may be the menu being
+   drawn before freezing. The menu labels may render in a brief window.
+4. **Cleanup later**: remove the temporary RE hooks and the `TEST_READY`
+   injection once the legitimate source of `[0x18025eb0]` is identified and
+   emulated.
+
