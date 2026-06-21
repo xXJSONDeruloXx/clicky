@@ -2675,3 +2675,201 @@ patching `0x18025eb0` at `0x1b630`.
 4. Eventually remove the iter-20 downstream PC hook once the upstream
    host-event path and/or real input behavior is fully understood.
 
+
+## Iteration 23 — fixed InputEvents stale-event semantics; traced label refs/readers
+
+Goal for this iteration: work the next ~3 items from iteration 22:
+(1) trace expected label string refs after `ASYNC3_COMPLETE` and after state=6,
+(2) map delayed event semantics beyond `menu`, and (3) narrow the actual
+menu-label render/create routine.
+
+### Item 1 — fixed a real InputEvents event-list bug
+
+The delayed event sweep initially exposed a genuine emulator bug in our
+`InputEvents:0` implementation:
+
+- When a scripted/live button produced an event node, the handler wrote the
+  node pointer to `input_obj+0x30`.
+- When no event node was produced later, the handler left `input_obj+0x30`
+  untouched.
+- Result: Tetris kept re-consuming a stale press node forever. In logs, a
+  one-shot `menu:25-30` or `action:25-30` kept showing the same `app_event_head`
+  node and `splash_flags` toggled on/off indefinitely.
+
+Implemented a more accurate event-list ingress:
+
+- Added `Eapp::input_event_prev_mask`.
+- `build_input_event_list()` now emits transition nodes only:
+  - byte 0 = event id
+  - byte 1 = `2` for press, `1` for release
+- It always overwrites `input_obj+0x30`, including with zero, so stale event
+  lists are cleared.
+- Held-state is still returned via the compact bitfield from `InputEvents:0`.
+
+Validation after rebuild:
+
+- `menu:25-30` logs exactly one press node at frame 25 and one release node at
+  frame 31 (`EAPP_INPUT`); progress sampling later sees `app_event_head=0`.
+- The stale repeated event is gone.
+- Default headed smoke remains golden: 0 fatal / 0 skipped.
+
+### Item 2 — mapped delayed event semantics with `ASYNC3_COMPLETE=1`
+
+Fresh sweep after the edge fix:
+
+```bash
+CLICKY_EAPP_ASYNC3_COMPLETE=1 \
+CLICKY_EAPP_INPUT_SCRIPT='<key>:25-30' \
+CLICKY_STARTUP_PROGRESS_FRAMES=70 \
+CLICKY_STARTUP_PROGRESS_INTERVAL=5 \
+./scripts/tetris.sh --no-build --headless --timeout 10 --no-capture
+```
+
+Logs: `/tmp/tet_iter23_edge_all/{menu,action,left,right,up,down}.log`.
+
+| key | host bits | event id | `splash_flags` / slot byte | state effect |
+|---|---:|---:|---:|---|
+| `menu` | `0x20` | 1 | `0x10` | advances state 1→6 (`statemach_byte=1`) |
+| `action` | `0x10` | 2 | `0x01` | state stays 1 |
+| `left` | `0x04` | 3 | `0x02` | state stays 1 |
+| `right` | `0x08` | 4 | `0x04` | state stays 1 |
+| `up` | `0x01` | 5 | `0x08` | state stays 1 |
+| `down` | `0x02` | 5 | `0x08` | state stays 1 |
+
+So only `menu`/event-id 1 triggers the byte-setter/state advance on the legal
+screen. Direction/action events correctly reach the mailbox path but do not
+advance the state or produce labels.
+
+### Item 3 — label pointer tracing: labels parse, but no render/read path uses them
+
+Added reusable `EAPP_STRING_TRACE=1` probes for the string-object helpers:
+
+- `0x180126d8`: string object value pointer getter (`return [obj+8]`)
+- `0x18012704`: string object length getter (`return [obj+0xc]`)
+- `0x1801270c`: string object setter (`[obj+8]=ptr`, `[obj+0xc]=len`)
+
+These log object fields plus LR/callsite.
+
+Clean direct binary runs used `--cycles` instead of script timeout so
+`EAPP_STRING_SCAN=1` and trace-total drains execute:
+
+- `/tmp/tet_iter23_state6_string_scan_direct.log`
+- `/tmp/tet_iter23_label_ptr_watch.log`
+- `/tmp/tet_iter23_string_helper_trace_rebuilt.log`
+- `/tmp/tet_iter23_string_helper_trace_menu_state6.log`
+
+#### Parser/table writers
+
+Watching `0x100ee000,0x1200` with `ASYNC3_COMPLETE=1` found the expected label
+pointers being written by two parser/setup PCs:
+
+- `0x18006314` — the bulk `Strings.dta` row/column parser. It fills the
+  secondary 97×12 column table (`[r4+0x14]`) with pointers into the UTF-16BE
+  file buffer.
+- `0x1801271c` — the selected-language string-object setter. It stores the
+  chosen value pointer into each string object's `[obj+8]`.
+
+Examples:
+
+```text
+0x100ee238 = 0x10003e6c  Play     pc=0x1801271c
+0x100ee278 = 0x10003fb0  Records  pc=0x1801271c
+0x100ee298 = 0x10004078  Help     pc=0x1801271c
+0x100ee2b8 = 0x10004116  Options  pc=0x1801271c
+0x100ee2d8 = 0x10004206  Exit     pc=0x1801271c
+0x100ee7d8 = 0x1000b9b2  Menu     pc=0x1801271c
+0x100eec98 = 0x10010044  Volume   pc=0x1801271c
+```
+
+Secondary table examples from `0x18006314`:
+
+```text
+0x100eeebc = 0x10003e6c  Play
+0x100eeec4 = 0x10003fb0  Records
+0x100eeec8 = 0x10004078  Help
+0x100eeecc = 0x10004116  Options
+0x100eeed0 = 0x10004206  Exit
+0x100eef70 = 0x1000b9b2  Menu
+0x100ef008 = 0x10010044  Volume
+```
+
+Disassembly confirms:
+
+- `0x180061e8..0x180063f4` constructs the localization table object.
+- `0x18006314` stores current field pointers into the 97×12 table and splits
+  rows on tab/newline/CR.
+- `0x180063bc..0x180063e4` selects one language column and calls
+  `0x1801270c` for all 97 string objects.
+
+#### No expected label objects are read by the renderer path
+
+`EAPP_STRING_TRACE=1` with `ASYNC3_COMPLETE=1` and no input:
+
+- `0x1801270c` setter hit 97 times at frame 2, including all expected labels.
+- The only string getter callsites were:
+  - `0x180126d8` with `lr=0x18009518`
+  - `0x18012704` with `lr=0x18009524`
+- Those are the UTF-16 text-render loop around `0x18009514..0x18009574`.
+- Getter pointers were only the legal-text chunks:
+  - `0x1000f668 len=31`
+  - `0x1000f6a8 len=34`
+  - `0x1000f6ee len=31`
+  - `0x1000f72e len=10`
+- No getter ever returned or read the expected label pointers.
+
+`EAPP_STRING_TRACE=1` with `ASYNC3_COMPLETE=1` plus `menu:25-30` (state reaches
+6 by frame 30 and remains there through frame 260) showed the same result:
+
+- State reaches 6; framebuffer hash stays `0x97ce4ebbe87a1ae7`.
+- Getter totals: `0x180126d8=200`, `0x18012704=200`, all from
+  `lr=0x18009518/0x18009524`.
+- Getter pointers are still only legal-text chunks.
+- The expected label pointers appear only in the parser setter logs at frame 2,
+  never in reader/getter logs after state=6.
+
+This is the strongest negative evidence so far: **labels are parsed correctly,
+but the main-menu label string objects are never selected/read by the active
+render path.** The renderer is faithfully drawing the legal text because that
+is the only string content the guest asks it to render.
+
+### Static callsite narrowing
+
+Callers of `0x18012704` (string-object length getter):
+
+```text
+0x18009520  UTF-16 text renderer / legal-text draw path
+0x1801928c, 0x18019380, 0x180193cc, 0x18019480  decorative/sample text editor
+0x1801f068, 0x1801f474, 0x1801f6ec  menu/resource object code cluster
+```
+
+Dynamic trace in the proper `ASYNC3_COMPLETE` path only hit the
+`0x18009520` renderer callsite. None of the `0x1801f0xx` menu/resource getter
+callsites fired. So the next lead is no longer glyph decode or string parsing;
+it is why the menu/resource object cluster around `0x1801f000..0x1801f7ff`
+never activates on the path that parses strings.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo test -p clicky-core --lib live_gl::tests` → 14 passed
+- Default headed smoke after input fix + traces: `/tmp/tet_iter23_default_headed.log`
+  - 0 fatal
+  - 0 skipped
+  - maxframe 181
+
+### Next priorities for iteration 24
+
+1. Trace the `0x1801f000..0x1801f7ff` menu/resource object cluster directly:
+   add PCs `0x1801f068`, `0x1801f474`, `0x1801f6ec` and constructor/activation
+   entries around `0x1801eed8`, `0x1801f394`, `0x1801f558`, `0x1801f69c` to
+   `STRING_TRACE_PCS`, then compare default fallback vs `ASYNC3_COMPLETE`.
+2. Find what state/resource bit decides between the legal-text object list
+   (`0x100f0b00` chunks) and the expected menu label string objects
+   (`0x100ee230`/`270`/`290`/`2b0`/`2d0`/`7d0`/`ec90`).
+3. Keep the InputEvents edge fix; it is a real ABI improvement and makes event
+   RE reliable. The old repeated-event logs from iteration 22 should be treated
+   as tainted by the stale head bug.
+4. Once menu/resource activation is understood, revisit whether upstream
+   host-event flags should be turned into a non-diagnostic scheduler and remove
+   the older downstream `CLICKY_EAPP_AUDIO_SLOT_BIT` hook.
+

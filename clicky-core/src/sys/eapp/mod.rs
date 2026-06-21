@@ -69,6 +69,9 @@ const TEXT_FORMAT_TIME_ENTRY_PC: u32 = 0x1800_83b4;
 /// path. These are reverse-engineering diagnostics only; default execution is
 /// unchanged unless `EAPP_STRING_TRACE=1` is set.
 const STRING_TRACE_PCS: &[u32] = &[
+    0x1801_26d8, // string object value-ptr getter: returns [obj+8]
+    0x1801_2704, // string object length getter: returns [obj+0xc]
+    0x1801_270c, // string object setter: [obj+8]=ptr, [obj+0xc]=len
     0x1801_d76c, // dispatcher: pop head of pending list, link/unlink entry
     0x1801_e0fc, // file-table parse step
     0x1801_e45c, // file-table async completion trampoline
@@ -287,6 +290,11 @@ pub struct Eapp {
     logged_imports: HashSet<(String, u32)>,
     recent_pcs: VecDeque<u32>,
     input_state: Arc<Mutex<EappInputState>>,
+    /// Previous logical InputEvents event-id mask. The firmware event-list API
+    /// reports button transitions (press/release nodes), not a permanently
+    /// valid pointer to the current held-state. Keep the prior mask so we can
+    /// emit edge nodes and clear the guest list head when no edge occurred.
+    input_event_prev_mask: u8,
     render_state: Arc<Mutex<Vec<u32>>>,
     controls: Option<EappBinds>,
     next_alloc: u32,
@@ -486,6 +494,7 @@ impl Eapp {
             logged_imports: HashSet::new(),
             recent_pcs: VecDeque::with_capacity(RECENT_PC_LIMIT),
             input_state,
+            input_event_prev_mask: 0,
             render_state,
             controls: Some(controls),
             next_alloc: WORK_RAM_BASE + 0x1000,
@@ -3897,12 +3906,12 @@ impl Eapp {
                 let event_list = self.build_input_event_list(&state);
                 let input_obj = self.cpu.reg_get(self.cpu.mode(), 4);
                 let input_ctx = self.cpu.reg_get(self.cpu.mode(), 5);
-                if event_list != 0
-                    && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&input_obj)
-                {
+                if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&input_obj) {
                     // Tetris' post-import wrapper passes [input_obj+0x30] as
                     // the event-list head to the event consumer. input_ctx+0x20
-                    // is a filter/state mask, not the list pointer.
+                    // is a filter/state mask, not the list pointer. Always
+                    // overwrite the head, including zero, so a one-frame press
+                    // cannot be re-consumed forever as a stale event node.
                     self.write_guest_u32(input_obj.wrapping_add(0x30), event_list);
                 }
                 if bits != 0 || event_list != 0 {
@@ -4012,47 +4021,72 @@ impl Eapp {
     }
 
     fn build_input_event_list(&mut self, state: &EappInputState) -> u32 {
-        let mut event_ids = Vec::new();
-        // Tetris' input wrapper consumes a linked list of button events at
-        // input_ctx+0x20. Event byte 0 is a button id; byte 1 is 2 for press and
-        // 1 for release. The id-to-mask table in the guest maps 1..5 to five
-        // logical buttons. These bindings are still provisional, but unlike the
-        // old return-only bitfield, they feed the structure the game actually
-        // traverses.
-        if state.menu {
-            event_ids.push(1);
+        let current = self.input_event_id_mask(state);
+        let previous = self.input_event_prev_mask;
+        self.input_event_prev_mask = current;
+
+        let pressed = current & !previous;
+        let released = previous & !current;
+        if pressed == 0 && released == 0 {
+            return 0;
         }
-        if state.action {
-            event_ids.push(2);
-        }
-        if state.left {
-            event_ids.push(3);
-        }
-        if state.right {
-            event_ids.push(4);
-        }
-        if state.up || state.down {
-            event_ids.push(5);
-        }
-        for (key, _range) in self.active_env_input_script_entries() {
-            if let Some(raw) = key.strip_prefix("event=") {
-                if let Ok(id) = raw.parse::<u8>() {
-                    if (1..=5).contains(&id) {
-                        event_ids.push(id);
-                    }
-                }
+
+        let mut events = Vec::new();
+        // Tetris' input wrapper consumes a linked list of button events. Event
+        // byte 0 is button id; byte 1 is 2 for press and 1 for release. Emit
+        // only edges, matching the firmware event-list semantics; held-state
+        // remains available through the compact bits returned by ordinal 0.
+        for id in 1..=5u8 {
+            let bit = 1u8 << id;
+            if pressed & bit != 0 {
+                events.push((id, 2u8));
+            }
+            if released & bit != 0 {
+                events.push((id, 1u8));
             }
         }
 
         let mut next = 0u32;
-        for id in event_ids.into_iter().rev() {
+        for (id, kind) in events.into_iter().rev() {
             let node = self.alloc_zeroed(0x10);
-            let _ = self.write_guest_bytes(node, &[id, 2]);
+            let _ = self.write_guest_bytes(node, &[id, kind]);
             let _ = self.write_guest_u32(node.wrapping_add(4), self.frame_counter as u32);
             let _ = self.write_guest_u32(node.wrapping_add(8), next);
             next = node;
         }
         next
+    }
+
+    fn input_event_id_mask(&self, state: &EappInputState) -> u8 {
+        let mut mask = 0u8;
+        // The id-to-mask table in the guest maps 1..5 to five logical buttons.
+        // These bindings are still provisional, but unlike a return-only
+        // bitfield they feed the structure the game actually traverses.
+        if state.menu {
+            mask |= 1 << 1;
+        }
+        if state.action {
+            mask |= 1 << 2;
+        }
+        if state.left {
+            mask |= 1 << 3;
+        }
+        if state.right {
+            mask |= 1 << 4;
+        }
+        if state.up || state.down {
+            mask |= 1 << 5;
+        }
+        for (key, _range) in self.active_env_input_script_entries() {
+            if let Some(raw) = key.strip_prefix("event=") {
+                if let Ok(id) = raw.parse::<u8>() {
+                    if (1..=5).contains(&id) {
+                        mask |= 1 << id;
+                    }
+                }
+            }
+        }
+        mask
     }
 
     fn active_env_input_script_entries(&self) -> Vec<(String, String)> {
@@ -5117,8 +5151,32 @@ impl Eapp {
             self.cpu.reg_get(mode, 2),
             self.cpu.reg_get(mode, 3),
         ];
+        let lr = self.cpu.reg_get(mode, reg::LR);
         let mut details = Vec::new();
         match pc {
+            0x1801_26d8 | 0x1801_2704 => {
+                let obj = regs[0];
+                details.push(format!(
+                    "lr={:#010x} obj={:#010x} obj[0]={:#010x} obj[8]={:#010x} obj[c]={:#010x}",
+                    lr,
+                    obj,
+                    self.read_guest_u32(obj).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(8)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x0c)).unwrap_or(0)
+                ));
+            }
+            0x1801_270c => {
+                let obj = regs[0];
+                details.push(format!(
+                    "lr={:#010x} SET obj={:#010x} ptr={:#010x} len={} old[8]={:#010x} old[c]={:#010x}",
+                    lr,
+                    obj,
+                    regs[1],
+                    regs[2],
+                    self.read_guest_u32(obj.wrapping_add(8)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x0c)).unwrap_or(0)
+                ));
+            }
             0x1801_fc68 => {
                 let req = regs[0];
                 for off in [0x08, 0x14, 0x18, 0x20, 0x24, 0x34, 0x38] {
