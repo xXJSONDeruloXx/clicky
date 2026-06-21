@@ -113,10 +113,15 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
 - [x] Decide: mechanism is PROVEN correct. The remaining issue is NOT
       char-source or consumption alignment — it's an upstream garbage time
       value. Pivoted to the time-value workstream below.
-- [ ] **Find what writes the time value at guest `0x1005f780`** (svc? struct
-      init?) and provide a valid iPod system-clock value so the formatter
-      produces real digits. Top-priority clock item (separate RTC/time-emulation
-      workstream, upstream of text decode).
+- [x] **Find what writes the time value at guest `0x1005f780`.** Iteration 5:
+      field is object `0x1005f710 + 0x70`; constructor zeroes it at
+      `0x1801c290`; update path writes it at `0x1801be6c`/`0x1801b56c` as
+      `tm_min + 60 * tm_hour` after calling `miscTBD:12` (`0x18000e98` veneer).
+      Added env-gated `CLICKY_EAPP_LOCALTIME=1` implementation for `miscTBD:12`
+      that writes C `struct tm` leading fields and proves the field becomes
+      sane (e.g. `0x90` = 144 minutes = 2:24). Not enabled by default yet
+      because it exposes a separate null-object transition at `0x1801b994`
+      before the menu.
 - [x] **Fix wrong menu-layer texture selection.** Iteration 4: all A8 uploads
       are tagged with ambiguous tex_name `0x8`; blindly choosing the latest
       upload forced menu/spinner/background strips to `f16x16menu3_a8` (Japanese
@@ -131,12 +136,19 @@ Log: `/tmp/tetris_run_20260621_002942.log`.
       strings are emitted through `0x1801616c` and no other label draw path is
       currently visible. `EAPP_STRING_SCAN=1` confirms expected labels exist
       only in raw `Strings.dta` buffer, not in parsed/draw cache.
+- [ ] **Fix newly exposed localtime downstream blocker.** With
+      `CLICKY_EAPP_LOCALTIME=1`, Tetris no longer has garbage clock input, but
+      it reaches a path that returns from the `0x1801bc90` UI update/audio
+      sequence to `0x1801b990` with `r4=0`, causing null read `[0x2c]`. Need RE
+      the caller/vtable/audio/runtime expectation before enabling localtime by
+      default.
 - [ ] Re-run headed after the time value and menu-label issuance are fixed;
       scalar clock should read a real `H:MM AM` and the menu should match the
       user oracle screenshot.
 - [ ] Cleanup: once the time value + labels are sane, deprecate
       `live_find_texgen_text_cursor` cursor scan and remove temporary RE hooks
-      (`TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`, `scan_for_strings`).
+      (`TEXT_FORMAT_TIME_ENTRY_PC`, `take_text_char_diag`, `scan_for_strings`,
+      `CLICKY_EAPP_LOCALTIME`).
 
 ## Verification
 - Headed verbose log: `/tmp/tetris_run_20260621_002942.log`
@@ -398,17 +410,84 @@ Next:
   guest callsites that should request them.
 - Separately fix clock source at `0x1005f780` so `':.0AM` becomes valid time.
 
+## Iteration 5 — clock writer/root cause found; localtime ABI proven but gated
+
+Work completed this iteration:
+
+1. **Fixed the watchpoint tool to catch overlapping word stores.** The prior
+   watch only logged writes whose *starting address* was inside the watched
+   range. `w16`/`w32` now use access-range overlap, so a watch catches stores
+   that partially overlap the target. Sanity check: watching `0x100015a4,8`
+   catches `miscTBD:9` monotonic tick writes.
+
+2. **Mapped the bad clock field to its owning object and writer PCs.**
+   Allocation trace shows `0x1005f780` is inside a 0xf0-byte object:
+   - object base: `0x1005f710`
+   - field: `+0x70`
+   - allocator LR: `0x18021b68`
+
+   Whole-object watch (`CLICKY_EAPP_WATCH=0x1005f710,0xf0`) showed:
+   - constructor initializes `+0x70` to `0` at `0x1801c290`
+   - update path writes `0xc165e819` once at `0x1801be6c` with old unhandled API
+   - steady path writes `0xa02f68f0` repeatedly at `0x1801b56c` with old
+     unhandled API
+
+   Disassembly of both write sites:
+   ```armasm
+   bl 0x1800559c      ; veneer to miscTBD:12 / 0x18000e98
+   add r1, sp, #0x28
+   ldm r1, {r0,r1}   ; r0 = tm_min, r1 = tm_hour (inferred)
+   rsb r1, r1, r1, lsl #4
+   add r0, r0, r1, lsl #2   ; tm_min + 60 * tm_hour
+   str r0, [r4,#0x70]
+   ```
+   So the scalar formatter wants **minutes since midnight**, and the upstream
+   bug is specifically unimplemented `miscTBD:12` (calendar/localtime), not the
+   renderer and not the monotonic `miscTBD:9` tick API.
+
+3. **Implemented a gated localtime ABI proof.** Added
+   `CLICKY_EAPP_LOCALTIME=1` support for `miscTBD:12`, writing the leading C
+   `struct tm` fields: `sec,min,hour,mday,mon0,year,wday,yday,isdst`.
+   Proof runs:
+   - `/tmp/tet_iter5_localtime_proof.log` (`min=24 hour=2`, wrote `0x90`)
+   - `/tmp/tet_iter5_localtime_proof2.log` (`min=27 hour=2`, wrote `0x93`)
+   In both cases the watched value equals `hour * 60 + minute`.
+
+   This proves the correct ABI/layout and would make the formatter input sane.
+   It is **not enabled by default yet**, because it reveals a separate guest
+   runtime path before the menu:
+   - fault: `pc=0x1801b994`, read `[r4+0x2c]` with `r4=0`
+   - recent path returns from the `0x1801bc90` UI update / audio-transition
+     sequence to `0x1801b990` with null `r4`
+   - making audio control imports return success and `miscTBD:6/7` nonzero did
+     **not** fix it, so those experiments were reverted.
+
+Verification this iteration:
+- default headed runs `/tmp/tet_iter5_default_headed.log` and
+  `/tmp/tet_iter5_default_headed2.log`: stable again, 0 fatal, 0 skipped, still
+  old clock string `':.0AM` because localtime is gated
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+
+Next:
+- RE the newly exposed null-object path around `0x1801b8b4..0x1801bfb0`,
+  especially how `0x1801bc90` is invoked/returned to `0x1801b990` and what
+  runtime/audio object or vtable is expected. Once that path is safe, remove the
+  `CLICKY_EAPP_LOCALTIME` gate and the clock should become real text.
+- Continue separate menu-label issuance investigation.
+
 ## Status
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
 char seq; push==consume; ASCII-order table; glyphs OCR-verified; UVs match;
 0 fatals/0 skips; splash golden intact).
 
-The scalar clock path still renders `':.'0AM`, but iteration 3 **proved this
-is not a renderer bug**: the guest's time value at `0x1005f780` is garbage
-(-1,607,505,680), so the formatter's signed-digit arithmetic underflows to
-`'`/`.`. Fixing this requires emulating the iPod system clock (separate
-RTC/time-emulation workstream, upstream of the text renderer).
+The scalar clock path still renders `':.'0AM` by default, but iterations 3+5
+**proved this is not a renderer bug**. Iteration 5 identified the exact upstream
+ABI: `miscTBD:12` must write a local-time / C `struct tm`-style record, and
+Tetris stores `tm_min + 60 * tm_hour` at `0x1005f780`. An env-gated proof
+(`CLICKY_EAPP_LOCALTIME=1`) makes that field sane, but currently exposes a
+separate null-object UI/audio transition before the menu, so it remains gated to
+avoid regressing the default Tetris golden run.
 
 User's visual oracle also proved the 9-char `89ΔΕABCDE`/`89/ABCDE` row is not
 intended menu-label text. Iteration 4 showed it is a deliberate decorative /

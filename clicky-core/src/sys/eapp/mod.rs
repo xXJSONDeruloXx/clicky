@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use armv4t_emu::{reg, Cpu, Mode as ArmMode};
+use chrono::{Datelike, Local, Timelike};
 use thiserror::Error;
 
 mod gl_decode;
@@ -3655,6 +3656,7 @@ impl Eapp {
                 // microsecond units, so expose host monotonic microseconds.
                 self.handle_misc9_time_api(args)
             }
+            12 => self.handle_misc12_local_time(args),
             _ => 0,
         }
     }
@@ -4165,6 +4167,56 @@ impl Eapp {
             return 1;
         }
         0
+    }
+
+    /// Calendar/local-time ABI used by Tetris' menu clock. The game calls
+    /// `miscTBD:12(out_tm, ...)`, then reads `out_tm[1] + 60 * out_tm[2]` as
+    /// minutes since midnight before passing that scalar to its `H:MM AM/PM`
+    /// formatter. That layout matches the leading fields of C `struct tm`:
+    /// sec, min, hour, mday, mon, year, wday, yday, isdst.
+    fn handle_misc12_local_time(&mut self, args: [u32; 4]) -> u32 {
+        // Env-gated until the newly-reachable downstream transition bug is
+        // fixed. With this enabled, Tetris writes a sane `hour * 60 + minute`
+        // to its clock object, but currently trips a separate null-object path
+        // before reaching the menu. Default stays conservative/no-regression.
+        if std::env::var_os("CLICKY_EAPP_LOCALTIME").is_none() {
+            return 0;
+        }
+        let out = args[0];
+        if out == 0 {
+            return 0;
+        }
+        let now = Local::now();
+        let fields = [
+            now.second() as u32,
+            now.minute() as u32,
+            now.hour() as u32,
+            now.day() as u32,
+            now.month0() as u32,
+            (now.year() - 1900) as u32,
+            now.weekday().num_days_from_sunday(),
+            now.ordinal0(),
+            0,
+        ];
+        for (idx, val) in fields.iter().copied().enumerate() {
+            let _ = self.write_guest_u32(out.wrapping_add((idx as u32) * 4), val);
+        }
+        if self.startup_progress.enabled {
+            info!(
+                target: "EAPP_PROGRESS",
+                "local_time module=miscTBD ordinal=12 out={:#010x} sec={} min={} hour={} mday={} mon0={} year={} wday={} yday={}",
+                out,
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                fields[6],
+                fields[7]
+            );
+        }
+        1
     }
 
     fn handle_misc9_time_api(&mut self, args: [u32; 4]) -> u32 {
@@ -4868,6 +4920,11 @@ impl Device for EappBus {
     }
 }
 
+fn ranges_overlap(access_start: u32, access_len: u32, watch_start: u32, watch_end: u32) -> bool {
+    let access_end = access_start.saturating_add(access_len);
+    access_start < watch_end && watch_start < access_end
+}
+
 impl Memory for EappBus {
     fn r32(&mut self, offset: u32) -> MemResult<u32> {
         match offset {
@@ -4883,7 +4940,7 @@ impl Memory for EappBus {
 
     fn w32(&mut self, offset: u32, val: u32) -> MemResult<()> {
         if let Some((start, end)) = self.watch {
-            if (start..end).contains(&offset) {
+            if ranges_overlap(offset, 4, start, end) {
                 self.watch_log.push(WatchHit {
                     addr: offset,
                     val,
@@ -4932,7 +4989,7 @@ impl Memory for EappBus {
 
     fn w8(&mut self, offset: u32, val: u8) -> MemResult<()> {
         if let Some((start, end)) = self.watch {
-            if (start..end).contains(&offset) {
+            if ranges_overlap(offset, 1, start, end) {
                 self.watch_log.push(WatchHit {
                     addr: offset,
                     val: val as u32,
@@ -4956,7 +5013,7 @@ impl Memory for EappBus {
 
     fn w16(&mut self, offset: u32, val: u16) -> MemResult<()> {
         if let Some((start, end)) = self.watch {
-            if (start..end).contains(&offset) {
+            if ranges_overlap(offset, 2, start, end) {
                 self.watch_log.push(WatchHit {
                     addr: offset,
                     val: val as u32,
