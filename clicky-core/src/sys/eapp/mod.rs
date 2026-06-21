@@ -80,6 +80,8 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_fb3c, // menu resource update/ensure path
     0x1801_fc68, // AsyncFileIO request completion callback
     0x1801_fc94, // completion status handoff after 0x1fc68
+    0x1801_d644, // load-manager slot registration: r0=mgr, r1=index
+    0x1801_d664, // dead-spin guard if entry[7]!=0 (duplicate reg)
 ];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
@@ -4935,6 +4937,29 @@ impl Eapp {
                 for off in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14] {
                     details.push(format!("r0+{:#04x}={:#010x}", off, self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)));
                 }
+            }
+            0x1801_d644 => {
+                // entry: r0=mgr, r1=index. Compute the entry pointer the
+                // same way the guest does: mgr + index*388, then read
+                // entry[7] (the spin guard) and entry[0x180] (linked-next).
+                let mgr = regs[0];
+                let idx = regs[1];
+                let entry = mgr.wrapping_add(idx.wrapping_mul(388));
+                details.push(format!(
+                    "mgr={:#010x} idx={} entry={:#010x} e[7]={:#04x} e[180]={:#010x} e[124]={:#04x} e[120]={:#04x}",
+                    mgr,
+                    idx,
+                    entry,
+                    self.read_guest_u8(entry.wrapping_add(7)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x180)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(0x124)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(0x120)).unwrap_or(0)
+                ));
+            }
+            0x1801_d664 => {
+                // dead-spin: logged only if entry[7]!=0 on registration.
+                // If this PC fires, the guest loops here forever.
+                details.push(format!("SPIN r0={:#010x} r1={:#010x}", regs[0], regs[1]));
             }
             _ => {}
         }

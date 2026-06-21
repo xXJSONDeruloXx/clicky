@@ -1044,7 +1044,97 @@ field). The reverted default keeps the recognizable menu-ish state for now.
 - Keep status writes OFF (proven irrelevant); focus only on byte_count + the
   legal-screen advance gate when re-enabling.
 
-## Status
+## Iteration 13 — load-manager slot-index RE; ruled out dead-spin / dup-reg stall
+
+Goal: act on iteration-12's next step — determine whether the
+`0x1801d664` dead-spin (duplicate-registration guard) or a slot-index
+collision on entry[0] is the legal→menu stall cause. Pure RE; default path
+unchanged.
+
+### Probes added (env-gated, off by default; reused the existing
+`EAPP_STRING_TRACE` machinery with a higher per-PC cap)
+
+- `0x1801_d644` (load-manager slot registration: `mgr=r0, idx=r1`).
+  Logs `mgr`, `idx`, computed `entry=mgr+idx*388`, and the bytes/words
+  `entry[7]` (spin guard), `entry[0x180]` (linked-list next),
+  `entry[0x124]`, `entry[0x120]`.
+- `0x1801_d664` (dead-spin guard: spins forever if `entry[7]!=0`).
+
+### Findings
+
+1. **The `0x1801d664` dead-spin is NEVER hit.** Duplicate-registration is
+   NOT the legal→menu stall cause.
+
+2. **Slot index distribution (run with `CLICKY_EAPP_ASYNC3_COMPLETE=1`, 10s
+   headless, ~30 frames):**
+   ```
+   8421 idx=0
+   7769 idx=1
+     44 idx=2
+     42 idx=21704   (out of range — some non-load path, irrelevant)
+     40 idx=61441
+      2 each for idx in {3..39 \ {39}} (one-time startup registrations)
+      1 idx=39
+   ```
+   - The 2-per `idx` values (3..39) correspond to one-entry/one-exit of each
+     initial resource registration at startup; the >9 ones return out of
+     bounds via `cmp r1,#10; bxcs lr` (harmless).
+   - The dominant `idx=0` (8421) and `idx=1` (7769) are PER-FRAME polling of
+     the first two linked-list entries during the legal/load-bar steady
+     state. So the loader dispatcher iterates entry[0] and entry[1] every
+     frame; it is NOT a collision on entry[0]; it is steady-state polling.
+
+3. **Legal screen per-frame trace** (`EAPP_PROGRESS`, `EAPP_GL lifecycle`):
+   - `frame=37 draws=191`, repeating an identical draw sequence every frame,
+     maxframe ~39 in the 10s window. The legal/loading text (`F,165(h0x180254c8),169,...,37#191`)
+     is built once and re-rendered every frame. No state transition occurs.
+   - `app_time_delta` ≈ 260ms/frame (host time, slow but advancing), and
+     `frame_state=1` is held throughout. So the loader is making progress on
+     per-frame work (spinners / load bar) but never tripping the
+     legal→menu transition.
+
+4. **Field `+0x11c` is set by `0x15300`** (`str r0, [r4, #0x11c]` —
+   the tail store of the load-queue "assign slot index" routine, which
+   runs BEFORE `0x18015308` reads then clears it). Other writers*
+   `0x1534c, 0x153ac, 0x1540c, 0x15440, 0x15494, 0x1d51c, 0x19748`* and
+   read sites at `0x15310, 0x1d54c, 0x1d570, 0x154e8`. So `+0x11c` is a
+   generic "pending slot index" state field, not a statically-initialized
+   table. By itself NOT a bug (the booking setter at `0x15300` does run on
+   the path — confirmed by `idx=3..9` each registering once).
+
+### Reassessment
+
+- Both iteration-12 candidates for the stall (`0x1d664` spin, slot-0
+  collision) are **disproved**. The legal/load-bar state polls entry[0]
+  and entry[1] every frame, suggesting two resources/loadables are
+  perpetually "in flight".
+- The legal→menu advance gate is therefore NOT about a duplicate slot:
+  it is about WHY entries 0 and 1 never get removed from the pending list /
+  marked fully complete. Likely candidates:
+  - a status word other than `byte_count` that `0x18015308` should set/
+    preserve and that the loader dispatcher re-checks before unlinking the
+    entry (we currently only propagate `byte_count`);
+  - or an explicit `[entry+0x124]`/`[entry+0x120]`/`[entry+0x128]` "done"
+    flag that the dispatcher polls and that we never set on entry[0]/[1].
+
+### Verification
+- `cargo test -p clicky-core --lib eapp` -> 16 passed.
+- default (no env) headed smoke: 0 fatal, 0 skip, maxframe 218 (golden).
+- RE runs: `/tmp/tet_iter13_d644.log`, `/tmp/tet_iter13_idx_dist.log`.
+
+### Next
+- Watch `[entry+0x180]` (or its surrounding fields `0x124/0x128`/
+  `0x140/0x164/0x168`) on entry[0] (`0x10013620`) and entry[1]
+  (`0x1001378c`... wait — entry[1] is mgr+1*388 = `0x10013620+388=`
+  `0x10013620+0x184 = 0x100137a4`). The goal: find a field that, when set,
+  the per-frame loader unlinks the entry and the legal screen advances.
+- Specifically: trace `0x1d644` writes to `[entry+0x124]/[entry+0x128]`
+  from the *texture* processor `0x18019770` (not yet disassembled), which
+  may set a different completion shape than the Strings.dta processor
+  `0x18015308`.
+- Keep `CLICKY_EAPP_ASYNC3_COMPLETE=1` for RE; default remains reverted/
+  golden.
+
 
 **Text-rendering mechanism is CORRECT and COMPLETE** (PC hook + recorded
 char seq; push==consume; ASCII-order table; glyphs OCR-verified; UVs match;
