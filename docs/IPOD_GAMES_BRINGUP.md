@@ -414,7 +414,7 @@ Cross-game north-star priorities from this matrix:
 
 1. ~~implement `GL_LUMINANCE_ALPHA` / `src_fmt=0x190a pix_type=0x1401` texture uploads; this is a discrete GL ES 1.1 format gap and should help Cubis 2 and LOST immediately~~ **Done after this matrix:** see validation note below.
 2. ~~model or safely map the shared PopCap write target at `0x1080000c`; this blocks both Bejeweled and Zuma after they already reach real uploads/draws~~ **Resolved as a RAM-aperture issue:** see 64 MiB validation note below.
-3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is UV/upload matching.**
+3. ~~implement/identify `OpenGLES:37 mode=5` for Texas Hold'em instead of treating it as an unknown draw token~~ **Implemented as `GL_TRIANGLE_STRIP`; remaining Texas blocker is zero-UV triangle strips (UV decode), not tex-name association — see Holdem trace investigation.**
 4. improve UV/upload matching for zero/degenerate UV cases; Mahjong's ordinal-45 resource-upload path is now decoded enough to render its main handles; PAC-MAN, Ms. PAC-MAN, Mini Golf, Texas Hold'em, and remaining Tetris pointer-text misses still need work
 5. ~~investigate titles that pump frames but produce no completed GL frames (Sims Bowling/Pool, Sudoku, Solitaire, iQuiz, Vortex) as runtime/lifecycle coverage rather than renderer-only work~~ **Partially resolved for the Sims/Sudoku/Solitaire engine family:** `OpenGLES:38` is indexed triangle-strip draw; iQuiz/Vortex remain early fatal object-layout cases.
 
@@ -654,11 +654,29 @@ Follow-up fix: associate ordinal-99 uploads with GL texture names (Tetris family
   - `cargo test -p clicky-core --lib`: 14 passed (incl. new
     `select_upload_prefers_tex_name_then_falls_back_to_dims`).
   - `cargo test -p clicky-core --test eapp_gl_decode`: 15 passed.
-- remaining: Texas Hold'em's ord45 fires only once for many `glTexImage2D`
-  uploads to distinct textures, so per-upload tex-name tagging needs the
-  Holdem-specific bind ordinal (still open). For Tetris-family engines the
-  association is now exact, enabling future removal of lossy dimension
-  matching for tagged uploads.
+- remaining (Texas Hold'em tex-name tagging — investigated, will NOT patch):
+  GL trace root `/tmp/clicky_holdem_trace_20260620_220951/holdem.log` and
+  pointer-snapshot JSON `/tmp/clicky_holdem_json_20260620_221135/holdem_gl.json`.
+  Correcting the earlier "ord45 fires once" note: in Holdem ord45 actually fires
+  **per upload** (10 calls for 9 `glTexImage2D`s), immediately followed by
+  `ord4`+`ord99`. But its `r1` points at **zeroed** work-RAM scratch
+  (`0x180b6f2c..0x180b6f40`, incrementing by 4), not a Tetris-style descriptor;
+  so it carries no texture name. There is **no dedicated bind-before-upload
+  ordinal** in Holdem: the only texture-name bind is `ord159` at *draw* time,
+  which binds exactly two handles across the whole run — `0x23` and `0x6`, one
+  per frame, alternating. The 9 uploads have 9 distinct widths
+  (`0x140,0x70,0x64,0x4c,0x30,0x2c` in frame 0; three `0x200` in frames 8/11/14)
+  and cannot be 1:1 mapped to `{0x23, 0x6}` from register evidence alone.
+  Critically, Holdem's 31 skips are `no live upload matched UV span None
+  (handle=0x6)` — a **zero-UV decode gap, not a tex-name gap**. Tex-name tagging
+  would not reduce skip count, and because 6 uploads map to a single handle,
+  `select_upload_by_tex_name`'s "most recent wins" rule would mis-associate and
+  **regress** the 4568 currently-correct dim-matched draws. The existing
+  per-draw dimension/UV heuristic is therefore the correct Holdem path; tex_name
+  stays `<none>` for Holdem uploads by design. The real Holdem blocker is the
+  zero-UV triangle strips, to be addressed in the UV-matching workstream. For
+  Tetris-family engines the tex-name association is now exact, enabling future
+  removal of lossy dimension matching for tagged uploads.
 
 Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
 
