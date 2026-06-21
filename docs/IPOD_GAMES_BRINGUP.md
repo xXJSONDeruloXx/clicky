@@ -545,6 +545,7 @@ Additional lifecycle/no-draw evidence from the no-capture titles:
   - likely shares the Sims/Solitaire-style draw-state path rather than being a
     file or timer stall; Sudoku produced one indexed strip in a short bounded
     validation run
+  - **Sudoku idle root-caused** (trace `/tmp/clicky_sudoku_trace_20260620_222919/sudoku.log`, 0-20 frames, 25M cycles): in 25M cycles Sudoku emits **15,378 `OpenGLES:157` (present) calls and ZERO `OpenGLES:158` (begin) calls**, so every present is discarded (`candidate_present without active frame`). It draws exactly one indexed strip (frame 1: `159(0x12),149,38` then `159(0x3),149`), then loops `159(0x3),149,157` per frame with no further `38`. `EAPP_PROGRESS` shows the game is parked in `splash_phase=15 splash_flags=0x1080c102` with `async=req:1 queued:1 callbacks:1 pending:0 staged:1` and `app_event_head=0x00000000 app_events=[]` — i.e. **one `AsyncFileIO` request is queued with a callback that never stages/completes**, and the title is waiting on that callback before issuing more draws. Two stacked blockers, in dependency order: (1) the incomplete `AsyncFileIO` callback (primary — the game won't advance past splash without it), (2) the GL frame lifecycle for this family emits no `ord158` begin, so even the single `38` draw's frame is discarded. `ord157` regs `r2=0xbf800000 r3=0x3f800000` (floats -1.0/1.0) and `r0=0x0` match the surface-handle bind interpretation, not a present (also logged as `GL:157 surface handle r0=0x0`). Royal Solitaire (`50514`) likely shares this async-idle path; needs its own trace to confirm.
 - `1B200` LOST:
   - after `GL_LUMINANCE_ALPHA` support, the previous unsupported upload is gone
   - still no completed draws; steady lifecycle is mostly `13,12,159(h0xe),157`
@@ -677,6 +678,37 @@ Follow-up fix: associate ordinal-99 uploads with GL texture names (Tetris family
   zero-UV triangle strips, to be addressed in the UV-matching workstream. For
   Tetris-family engines the tex-name association is now exact, enabling future
   removal of lossy dimension matching for tagged uploads.
+
+Follow-up investigation: UV/upload matching for PAC-MAN / Ms. PAC-MAN / Mini Golf
+
+- motivation: classify whether these titles use the Tetris ord45 tex-name
+  path, the Mahjong ord45 descriptor path, or neither.
+- `AAAAA` PAC-MAN trace `/tmp/clicky_pacman_trace_20260620_221704/pacman.log`
+  (0-40 frames, 120M cycles): **no `ord45` at all**; 1 `ord99` upload/frame
+  (`src_fmt=0x1908 GL_RGBA`, `r3=0x200`=512 wide); `ord37` draws (2166 trace
+  lines); `ord159` binds handles `0x19` and `0x02`; 105,696 rasterized, 124
+  skipped. Skip reasons are `no live upload matched UV span None` (zero-UV) —
+  i.e. a UV-decode gap, not a tex-name gap. Matching is purely via the existing
+  ord99 dimension heuristic and works for the vast majority of draws.
+- `14004` Ms. PAC-MAN trace `/tmp/clicky_mspacman_trace_20260620_222557/mspacman.log`
+  (0-8 frames, 25M cycles): same engine — **no `ord45`**; 1 `ord99` upload/frame
+  (`src_fmt=0x1908`, 512 wide); `ord37` draws; `ord159` binds `0x02`/`0x03`/`0x19`;
+  35,325 rasterized, 122 skipped, all `UV span None`. Same zero-UV family.
+- `88888` Mini Golf trace `/tmp/clicky_minigolf_trace_20260620_222730/minigolf.log`
+  (0-8 frames, 25M cycles): **zero `ord99` uploads and zero `ord45`** — its
+  textures come from the offline file-backed path (no live uploads at all);
+  28 `ord37` draws, 16,887 rasterized, 2 distinct skip reasons =
+  `no live upload matched UV span Some` for handle `0x27` (the draw HAS valid UVs
+  but there is no live upload of matching dims to select, because nothing was
+  uploaded live). `ord159` binds `0x27` and `0x03`.
+- conclusion: **none of the three uses `ord45`**, so neither the Tetris
+  tex-name path nor the Mahjong descriptor path applies. Remaining gaps:
+  (a) PAC-MAN & Ms. PAC-MAN: zero-UV draws (`UV span None`) → general UV-decode
+  workstream (same family as Texas Hold'em's remaining strips);
+  (b) Mini Golf handle `0x27`: valid UVs but no live upload — the draw-time
+  selector finds nothing because Mini Golf uploads nothing live; a correct fix
+  would route such handles to their file-backed texture rather than skipping.
+  No code patched this round; evidence recorded for the UV-matching workstream.
 
 Follow-up investigation: iQuiz / Vortex early fatal object-layout writes
 
