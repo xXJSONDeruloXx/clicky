@@ -3238,3 +3238,1520 @@ Headed smoke test of all 16 clickwheel games in sister directories:
    ten times, `0x18005480` advances state 4→5, and `prefs.sav`/`game.sav` load.
 3. Only after the proper path reaches post-save object construction, resume the
    search for the true main-menu label constructor/getter path.
+
+## Iteration 28 — Vortex shim progressed; iQuiz/Texas signatures captured
+
+Worked the cross-game crasher priority after the 13/16 smoke-test result.
+
+### Item 1 — documented why Vortex preallocation alone failed
+
+The original Vortex crash (`pc=0x18014d58`, `r0=0x8`) is not solved by merely
+writing `[0x18063ebc+4]` or preallocating a work-RAM container. The crashing
+helper at `0x18014d38` does:
+
+```armasm
+0x18014d44: ldr   r0, [r0, #4]
+0x18014d48: ldmia r10!, {r0,r1,r2,r3,r7,r8,r9,r10}
+0x18014d54: stmia r0!, {...}
+0x18014d58: stmia r0!, {...}
+```
+
+So `ldmia r10!` clobbers the just-loaded `r0` from a literal-pool/register-block
+source, leaving `r0=0x8`. The file-mapped container is only part of the story;
+the actual missing model is the Vortex GL surface/register-block setup.
+
+Detailed doc update: `docs/VORTEX_FIX_GAMEPLAN.md` (Iteration 28 section).
+
+### Item 2 — attempted a conservative Vortex-only compatibility shim
+
+Implemented bundle-gated (`path contains /12345`) exact-PC redirects that reuse a
+bootstrap-allocated work-RAM surface/object:
+
+- `0x18014d54` — original struct-fill destination;
+- `0x18011290` — sibling struct-fill destination exposed after the first hook;
+- `0x18018ae8/0x18018aec` — null `r4` object write path;
+- `0x18013e00/0x18013e04/0x18013e08` — null `r4` object read path.
+
+Result: not fixed yet, but meaningful progress. Vortex now passes the original
+`0x18014d58` fault and reaches `OpenGLES:37` draw submission. Latest exposed
+fault:
+
+```text
+/tmp/vortex_iter28_hook7.log
+pc=0x1800ab14 fault_addr=0x00000024 kind=Write
+r0=0x00010000 r4=0x180bdd90 r5=0x180654b4 r6=0x18063e6c
+```
+
+This suggests Vortex has a chain of early GL/register-block assumptions; avoid
+turning this into unbounded whack-a-mole unless the hooks remain exact-PC and
+bundle-gated.
+
+### Item 3 — captured the other two crashers with current build
+
+- iQuiz (`11002`):
+  - log: `/tmp/11002_iter28_crash.log`
+  - reaches `OpenGLES:165`, Audio/Metadata setup, then fatal
+    `pc=0x18001b08 fault_addr=0x0000000c kind=Write`, `r4=0`.
+  - likely separate null-object/provider gap, not the Vortex r10 block-copy case.
+
+- Texas Hold'em (`33333`):
+  - log: `/tmp/33333_iter28_crash.log`
+  - reaches frame 1, `OpenGLES:37`, `OpenGLES:157`, and AsyncFileIO callback
+    activity, then fatal `pc=0x1802fd00 fault_addr=0x00000008 kind=Write`, `r0=0`.
+  - likely async completion / callback-owner ABI issue, not the Vortex surface
+    block-copy issue.
+
+### Verification this iteration
+
+- `cargo build -p clicky-desktop --bin eapp` passes.
+- Vortex latest run still fatal, but original fatal is bypassed and draw
+  submission is reached.
+- iQuiz/Texas crash signatures captured for separate targeted follow-up.
+
+### Next priorities
+
+1. For Vortex, prefer a principled register-block/surface-object producer over
+   adding many more exact-PC hooks. If continuing hooks, keep them `12345` + PC
+   gated and retest Tetris plus the 13 working games.
+2. For Texas Hold'em, reverse `0x1802fcc4..0x1802fd00` callback path; it follows
+   an `AsyncFileIO:3` completion and likely needs a correct owner/callback state.
+3. For iQuiz, disassemble `0x18001af4..0x18001b08` and identify which provider
+   object should populate the null base register (`r4=0`).
+
+## Iteration 29 — Vortex fatal fixed in smoke; iQuiz/Texas classified
+
+Worked the next cross-game crasher items from iteration 28.
+
+### Item 1 — decoded and fixed the new Vortex `0x1800ab14` / `0x18013f00` chain
+
+After iteration 28's Vortex exact-PC hooks, the next exposed fatal was:
+
+```text
+/tmp/vortex_iter28_hook7.log
+pc=0x1800ab14 fault_addr=0x00000024 kind=Write
+r4=0x180bdd90
+```
+
+Disassembly showed this was not a framebuffer write. Function
+`0x1800aa40..0x1800ac48` expects `[r4+4]` to point to a mutable ~0xa0-byte
+GL/state block and initializes fields like `+0x24`, `+0x4c`, `+0x74`, `+0x9c`.
+With `[r4+4]==0`, the first write faults at `[0+0x24]`.
+
+A second same-shape initializer was exposed after fixing that one:
+
+```armasm
+0x18013ef4: ldr r1, [0x180bdda8 + 4]
+0x18013efc: str r0, [r1, #0x10]
+0x18013f00: str r0, [r1, #0x0c]
+0x18013f14: str r2, [r1, #0x60]
+```
+
+Implemented a Vortex-only, PC-range-gated bootstrap state-block shim:
+
+- `vortex_preallocate_surfaces()` now allocates a 0x200-byte `state_block` and
+  stores it at `WORK_RAM_BASE+0xffc`.
+- Exact Vortex PC ranges `0x1800ab08..0x1800ab3c` and
+  `0x18013ef4..0x18013f1c` wire `[global+4]` to that state block when null and
+  repair the current destination register if needed.
+- This is more principled than redirecting those writes to the framebuffer:
+  the decoded code is clearly initializing a mutable state struct.
+
+Result:
+
+```text
+/tmp/vortex_iter29_stateblock2.log
+fatal=0
+OpenGLES:37=1
+OpenGLES:157=1
+frame returns logged through frame 18000 in the timeout window
+```
+
+So Vortex is no longer one of the immediate fatal crashers in the smoke window,
+though the fix remains a Vortex compatibility shim rather than a generic runtime
+model.
+
+### Item 2 — classified iQuiz crash site
+
+iQuiz binary is `11002/Executables/TWA_1_1_2864394.bin` (not `iQuiz_...`). The
+fatal site disassembles as a generic memcpy/block-copy routine:
+
+```armasm
+0x18001af4: subs r2, r2, #32
+0x18001b00: ldmcs r1!, {r3,r4,ip,lr}
+0x18001b04: stmiacs r0!, {r3,r4,ip,lr}
+0x18001b08: ldmcs r1!, {r3,r4,ip,lr}
+0x18001b0c: stmiacs r0!, {r3,r4,ip,lr}
+```
+
+Crash signature remains:
+
+```text
+/tmp/11002_iter28_crash.log
+pc=0x18001b08 fault_addr=0x0000000c kind=Write
+r0=0x00000010 r4=0
+```
+
+This is a null/near-null destination passed to memcpy, not the Vortex GL
+state-block pattern. Next iQuiz work should identify the caller and provider
+object that should populate memcpy destination `r0`.
+
+### Item 3 — classified Texas Hold'em crash site
+
+Texas binary is `33333/Executables/HoldEm_1_1_2563291.bin`. Its fatal is inside
+an AsyncFileIO:3-style completion trampoline:
+
+```armasm
+0x1802fcc4: push {r4,r5,r6,lr}
+0x1802fcc8: add  r6, r0, #0x20
+0x1802fccc: ldm  r6, {r5,r6}       ; status/byte_count
+0x1802fcd0: ldr  r4, [r0,#8]       ; owner
+...
+0x1802fce4: mov  r0, r4
+0x1802fcf0: push {r4,lr}
+0x1802fcfc: str  -1, [r0,#8]
+0x1802fd00: strb 0,  [r0,#4]       ; fatal when owner/r0 is null
+```
+
+Crash signature:
+
+```text
+/tmp/33333_iter28_crash.log
+pc=0x1802fd00 fault_addr=0x00000008 kind=Write
+r0=0
+```
+
+Most logged Texas request objects had nonzero `req+0x08` owners, so the next
+Texas RE step is to capture the exact final request/callback that reaches
+`0x1802fcc4` with owner zero or with an owner cleared before completion. This
+looks like an AsyncFileIO owner/callback ABI issue, not a renderer or Vortex
+state-block issue.
+
+### Verification this iteration
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed (16/16).
+- Vortex smoke: `/tmp/vortex_iter29_stateblock2.log`, `fatal=0`.
+- Tetris headed regression: `/tmp/tetris_iter29_regression.log`, `fatal=0`,
+  `skipped_nonzero=0`.
+
+### Next priorities
+
+1. Run the full 16-game smoke again. Expected improvement: 14/16 pass if Vortex
+   remains stable; remaining crashers should be iQuiz and Texas Hold'em.
+2. Texas: add a concise AsyncFileIO:3 callback trace around `0x1802fcc4` to log
+   the exact final `req`, `[req+8]`, status, byte_count, and owner fields before
+   the fatal.
+3. iQuiz: disassemble/log callers of `0x18001af4` to find who passes the null
+   memcpy destination.
+
+## Iteration 30 — all 16 games smoke without fatal
+
+Worked the three iteration-29 follow-ups: rerun the full smoke, trace Texas's
+AsyncFileIO callback crash, and finish the iQuiz memcpy/allocation root cause.
+
+### Item 1 — full 16-game smoke after Vortex state-block shim
+
+Initial iteration-30 smoke after the Vortex fix:
+
+```text
+/tmp/games_iter30_smoke_20260621_235212/summary.txt
+Vortex (12345): fatal=0, OpenGLES:37=1, OpenGLES:157=1
+Texas (33333): still fatal
+ iQuiz (11002): still fatal
+others: fatal=0
+```
+
+So Vortex was confirmed removed from the crasher list. The only remaining
+fatal crashers at that point were iQuiz and Texas Hold'em.
+
+### Item 2 — Texas Hold'em root cause and fix
+
+Added an env-gated diagnostic (`EAPP_TEXAS_TRACE=1`) for Texas (`33333`) at
+its AsyncFileIO completion trampoline PCs:
+
+- `0x1802fcc4` — request callback entry (`r0=req`)
+- `0x1802fcf0` / `0x1802fd00` — owner-done helper (`r0=owner`)
+
+Trace log before the fix:
+
+```text
+/tmp/texas_iter30_trace.log
+```
+
+The final crashing request was `Fonts/Euro/ArialBold15.txt`:
+
+```text
+request @ 0x100b75c0 before file copy:
+  [0x08] owner  = 0x100b75a0
+  [0x14] dest   = 0x100aada0
+  [0x18] want   = 0x00050000
+  [0x34] cb_pc  = 0x1802fcc4
+```
+
+But by callback entry, the request had been wiped:
+
+```text
+pc=0x1802fcc4 frame=9 r0=0x100b75c0
+req_owner=0x00000000 req_cb=0x00000000
+```
+
+The destination range `0x100aada0..0x100fada0` overlaps the request object at
+`0x100b75c0`. Our request-object `AsyncFileIO:3` handler copied the actual
+3708-byte file and then zero-filled the full requested capacity (`0x50000`),
+which memset over the still-live request object before queuing the completion.
+That made the guest callback fall through to `0x1802fd00` with `r0=0`.
+
+Fix: request-object `AsyncFileIO:3` now copies only the bytes actually read
+(up to the requested cap) and reports/stages the actual byte count. It no longer
+zero-fills the entire capacity. This is the correct file-read ABI and avoids
+clobbering adjacent heap/request metadata. Direct-handle read paths can still
+zero-fill when explicitly appropriate; the request-object path must not.
+
+Validation after fix:
+
+```text
+/tmp/texas_iter30_nozerofill.log
+status=timeout (expected smoke timeout)
+fatal=0
+```
+
+Texas continued through many later resource loads (`Arial11`, `FuturaConMed30`,
+`aiavatars.txt`, `names.strings`, etc.) with no fatal in the smoke window.
+
+### Item 3 — iQuiz root cause and fix
+
+iQuiz (`11002`) crash signature remained:
+
+```text
+/tmp/iquiz_iter30_crash.log
+pc=0x18001b08 fault_addr=0x0000000c kind=Write
+r0=0x00000010
+```
+
+The recent PC trace showed the caller chain:
+
+```text
+0x18039ef8 ...
+0x18039f3c: add r0, r4, #0x4c
+0x18039f44: bl  0x180064b4   ; allocate [r4+0x50]
+0x18039f48: ldr r0, [r4,#0x50]
+0x18039f50: mov r1, r8
+0x18039f54: bl  0x1800198c   ; memcpy(dst=[r4+0x50], src=r8, len=0xa0)
+```
+
+`0x180064b4` is a tiny allocator wrapper:
+
+```armasm
+0x180064bc: mov r0, #160
+0x180064c0: bl  0x18005fb0
+0x180064c4: str r0, [r4,#4]
+```
+
+Allocator trace before the fix:
+
+```text
+/tmp/iquiz_iter30_alloc.log
+miscTBD:0 alloc lr=0x180064c4 ret=0x00000000 len=160
+```
+
+The failure was caused by our `miscTBD:0` ABI: it allocated
+`max(r0, r1, 0x10)`. iQuiz's wrapper `0x18005fb0` only rounds `r0` and jumps to
+the import trampoline; it leaves `r1` as caller scratch. At the failing call,
+`r0=0xa0` but `r1` contained a stale stack-ish value (`0x13ffea88`), so our
+handler attempted an impossible huge allocation and returned zero.
+
+Fix: `miscTBD:0` now treats `r0` as the allocation size (minimum 0x10) and
+ignores scratch arg registers. Allocation trace after the fix:
+
+```text
+/tmp/iquiz_iter30_malloc_r0.log
+miscTBD:0 alloc lr=0x180064c4 ret=0x10053220 len=160 r1=0x13ffea88
+fatal=0
+frames=6 in 10s smoke
+```
+
+### Final iteration-30 verification
+
+Final full smoke:
+
+```text
+/tmp/games_iter30_smoke_allgreen_20260622_000206/summary.txt
+```
+
+All 16 game bundles now smoke without fatal in the 8s window:
+
+| Game | fatal | Notes |
+|---|---:|---|
+| 11002 iQuiz | 0 | fixed by `miscTBD:0` r0-only allocation ABI |
+| 12345 Vortex | 0 | fixed by Vortex state-block/surface compatibility shim |
+| 33333 Texas Hold'em | 0 | fixed by removing request-object AsyncFileIO:3 capacity zero-fill |
+| all other 13 | 0 | unchanged non-fatal |
+
+Regression checks:
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed (16/16).
+- Tetris headed/default regression `/tmp/tetris_iter30_regression.log`:
+  `fatal=0`, `skipped_nonzero=0`.
+
+### Notes / follow-ups
+
+- `EAPP_TEXAS_TRACE=1` is env-gated and can stay temporarily for Texas RE; it
+  is off by default.
+- The Vortex fix remains bundle/PC-gated and should eventually be replaced by a
+  cleaner model of its mutable GL state objects if more titles show the pattern.
+- Next Tetris-specific priority remains the proper parsed-resource boot path:
+  implement/reverse `AsyncFileIO:0` wav streaming completion so the
+  `CLICKY_EAPP_ASYNC3_COMPLETE=1` path advances through state 4→5 and reaches
+  post-save object construction without using the fallback zero-byte path.
+
+## Iteration 31 reflection checkpoint — all-16 smoke green; return to proper Tetris boot
+
+1. **What has been accomplished so far?**
+   - Tetris pointer-backed text rendering is fixed and remains golden: real
+     chars are recorded at the `0x1801616c(text_obj,char)` push helper, scalar
+     clock text uses real `miscTBD:12` localtime, texture selection handles
+     ambiguous A8 tex names, and placeholder refcounted resources are
+     release-safe.
+   - General runtime ABI fixes now cover more than Tetris: direct
+     `AsyncFileIO:12/14/16`, transition-based `InputEvents:0`, request-object
+     `AsyncFileIO:3` copy semantics, and `miscTBD:0` allocator size semantics.
+   - Cross-game hardening made a major jump: after iteration 30, all 16 shipped
+     clickwheel game bundles smoke without fatal in the 8s window. The last
+     crashers were fixed/classified as:
+       - iQuiz: `miscTBD:0` must allocate from r0 only; r1 is scratch.
+       - Texas: request-object `AsyncFileIO:3` must not zero-fill the entire
+         requested capacity because the destination capacity can overlap live
+         heap/request metadata.
+       - Vortex: still uses bundle/PC-gated compatibility shims, but no longer
+         fatals in the smoke window.
+
+2. **What's working well?**
+   - The workflow of static disassembly + narrowly env-gated runtime probes is
+     working. It prevented confusing iQuiz/Texas/Vortex as one bug class and
+     found their distinct ABI gaps.
+   - Keeping Tetris as the golden regression is useful: every broad ABI fix is
+     validated by `cargo test`, a Tetris headed/default run, and now the all-16
+     smoke.
+   - The task file has become reliable canonical memory after compaction.
+
+3. **What's not working or blocking progress?**
+   - The proper Tetris parsed-resource boot remains blocked when
+     `CLICKY_EAPP_ASYNC3_COMPLETE=1` is enabled. `Strings.dta` parses and legal
+     text renders, but boot state 4 stalls on the first `.wav` because
+     `AsyncFileIO:0` (the wav/audio streaming initiator-B path) is still a stub.
+   - Vortex still relies on temporary bundle+PC range shims instead of a clean
+     shared model of its GL state/register-block producer.
+   - Some RE diagnostics have accumulated and need cleanup after the Tetris menu
+     path is solved.
+
+4. **Should the approach be adjusted?**
+   - Yes: stop chasing menu labels until the proper boot path reaches post-save
+     object construction. Iteration 25 proved the menu/object search is too early
+     while wav streaming stalls at state 4. The next work should be a
+     correct-enough, env-gated `AsyncFileIO:0` completion model so the ten wav
+     descriptors drain and boot advances 4→5→6→7.
+   - Keep cross-game fixes general and default-on, but keep incomplete Tetris
+     parsed-resource completion behind `CLICKY_EAPP_ASYNC3_COMPLETE` until it
+     reaches the menu without regressing the default golden path.
+
+5. **Next priorities.**
+   - Implement/reverse `AsyncFileIO:0` completion for the wav/audio streaming
+     path (`0x1801fcc8` initiator-B, owner callback `0x1801fbfc`).
+   - Re-run `CLICKY_EAPP_ASYNC3_COMPLETE=1` and verify whether `0x18005400`
+     fires ten times and `0x18005480` advances state 4→5.
+   - If state 5/6 saves load and object construction resumes, then search again
+     for the true main-menu label constructor/read path.
+
+## Iteration 31 — reflection + first `AsyncFileIO:0` completion model
+
+This was the Ralph reflection checkpoint plus a return to the proper Tetris
+parsed-resource boot blocker from iteration 25.
+
+### Item 1 — reflection captured
+
+See the reflection section above. Summary: cross-game smoke is now all green,
+so the next Tetris-specific priority is no longer generic crash hardening but
+advancing the `CLICKY_EAPP_ASYNC3_COMPLETE=1` parsed-resource path past state 4.
+The concrete blocker remains the `.wav` streaming path opened by
+`AsyncFileIO:0` after the first real `Drop.wav` header completes.
+
+### Item 2 — implemented env-gated `AsyncFileIO:0` owner completion
+
+Decoded the relevant Tetris path:
+
+```armasm
+0x1801fcc8  initiator-B for wav/audio stream
+  alloc 0x3c-byte owner
+  init owner with callback 0x1801fbfc
+  link owner <-> request with 0x180200ac
+  call AsyncFileIO:0(..., r3=owner)
+  if return nonzero: strb 1, [request+4]  ; in-flight
+
+0x1801fbfc(owner)
+  r5 = [owner+0x20]      ; status
+  r6 = [owner+0x24]      ; byte_count
+  r4 = [owner+0x08]      ; linked request
+  [request+0] = [owner+0x2c]
+  free owner
+  fall through to 0x1801fc30(request, status, byte_count)
+
+0x1801fc30(request, status, byte_count)
+  if status == 0: [request+4] = 2
+  else:           [request+4] = 0
+  tail-call [request+0x0c](request, status, byte_count, [request+0x10])
+```
+
+Implemented `AsyncFileIO:0` handling inside `handle_async_file_io_import`:
+
+- resolves the path just like ordinal 3/12,
+- reads the host file for byte-count reporting,
+- when `CLICKY_EAPP_ASYNC3_COMPLETE=1` and `owner != 0`:
+  - writes `[owner+0x20] = 0` (success for this path),
+  - writes `[owner+0x24] = file_bytes`,
+  - queues pending guest callback `0x1801fbfc(owner)`.
+- when the env is off, old default behavior remains effectively a success stub
+  with no completion callback, preserving the current golden/default path.
+
+First run:
+
+```text
+/tmp/tet_iter31_async0_first.log
+AsyncFileIO:0 stream path=.../Drop.wav owner=0x10108020 bytes=91968 complete=1
+fatal=0
+```
+
+This exposed an ordering issue: `AsyncFileIO:0` is called from inside the
+boot/resource callback chain. The guest writes `[request+4]=1` after the import
+returns and may stay in the current boot/render loop before the outer scheduler
+can dispatch the queued owner callback. So a queued-only completion was not
+enough.
+
+### Item 3 — added a narrow post-start completion mark and narrowed the next blocker
+
+Added a temporary, env-gated, Tetris-only hook at `pc=0x1801fd50`, immediately
+after the guest's `strb 1, [request+4]` in initiator-B:
+
+- only active when `CLICKY_EAPP_ASYNC3_COMPLETE=1`,
+- only for bundle `66666`,
+- checks `[request+4] == 1` and `[request+0x0c] != 0`,
+- writes byte `2` to `[request+4]` so the just-started ordinal-0 request is no
+  longer stuck in-flight while the queued `0x1801fbfc(owner)` remains
+  responsible for the real callback cascade.
+
+Validation run:
+
+```text
+/tmp/tet_iter31_async0_mark.log
+AsyncFileIO:0 stream path=.../Drop.wav owner=0x10108020 bytes=91968 complete=1
+async0_callback_queued frame=2 queued=41 owner=0x10108020 req=0x10013910 bytes=91968
+AsyncFileIO:0 post-start complete mark req=0x10013910 cb=0x1801d1b4
+callback_dispatch frame=2 count=41 pc=0x1801fbfc arg0=0x10108020
+fatal=0
+```
+
+So the scheduler deadlock/order problem is solved: the owner callback now
+actually dispatches and the run continues for many frames.
+
+However, state 4 still does **not** drain:
+
+```text
+trace after callback:
+0x18003bd0=4
+0x18003c74=1
+0x18015c30=1
+0x1801fcc8=1
+0x18005400=0
+0x18005480=0
+frame_state remains 1
+statemach_count remains 4
+```
+
+The callback reached by `0x1801fc30` is `[request+0x0c] = 0x1801d1b4`, not the
+wav descriptor callback `0x18005400` directly. Disassembly of `0x1801d1b4` shows
+it owns/initializes a second 10-slot manager and calls `0x1801d500(request,
+status, byte_count, ctx)`. `0x1d500` copies `[entry+0x174] -> [entry+0x11c]`,
+marks `[entry+7]=1`, and either calls the entry processor or starts another
+async path. The new narrowed blocker is therefore inside the
+`0x1801d1b4 -> 0x1801d500` audio-stream completion manager, not the raw ordinal-0
+owner callback anymore.
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed (16/16).
+- Default Tetris regression `/tmp/tetris_iter31_default_regression.log`:
+  `fatal=0`, `skipped_nonzero=0`.
+- Parsed-resource RE run `/tmp/tet_iter31_async0_mark.log`: `fatal=0`, owner
+  callback dispatches, but state 4 still stalls before `0x18005400`.
+
+### Next priorities
+
+1. Trace/decode `0x1801d1b4` and `0x1801d500` with the ordinal-0 completion mark
+   enabled. Determine which entry/manager fields prevent the per-entry processor
+   from reaching the wav descriptor callback `0x18005400`.
+2. Add direct trace PCs for `0x1801d1b4`, `0x1801d500`, `0x1801d548`,
+   `0x1801d5bc`, and the alternate async path around `0x1801fd74`, then rerun
+   `CLICKY_EAPP_ASYNC3_COMPLETE=1`.
+3. Once `0x18005400` fires ten times and `0x18005480` advances state 4→5,
+   resume post-save object construction / true main-menu label constructor
+   tracing.
+
+## Iteration 32 — decoded `0x1801d1b4 -> 0x1801d500`, added ordinal-2/1 completions
+
+Focus: continue the env-gated Tetris parsed-resource path after iteration 31's
+`AsyncFileIO:0` owner completion. The new question was why the wav descriptor
+callback `0x18005400` still did not fire after `0x1801fbfc(owner)` dispatched.
+
+### Item 1 — traced and decoded the `0x1801d1b4 -> 0x1801d500` blocker
+
+Added trace PCs/details for the audio manager path:
+
+- `0x1801d1b4` (audio-stream owner callback from `0x1801fc30`),
+- `0x1801d500`, `0x1801d548`, `0x1801d5bc`, `0x1801d5cc`,
+- `0x1801fd74`, `0x1801fddc`,
+- expanded trace register capture from `r0..r3` to `r0..r7` so `r4` entry
+  guesses are visible.
+
+Run: `/tmp/tet_iter32_d1b4_d500.log` (`CLICKY_EAPP_ASYNC3_COMPLETE=1`, timeout
+124, `fatal=0`). It showed:
+
+```text
+0x1801d1b4(req=0x10013910,status=0,bc=91968,ctx=0x100137a4)
+0x1801d5cc entry=0x100137a4 e[114]=0x2c e[174]=0xffffffff e[11c]=0xffffffff
+AsyncFileIO:2 pc=0x1f0016a0 lr=0x1801d248 r0=0x100138cc r2=0x100138cc r3=0x10013900
+```
+
+Disassembly proved `0x1d5cc` is **not dead**: it initializes the secondary owner
+at `entry+0x128`, links it to `entry+0x16c`, and jumps via `0x1801fe08` to a
+no-path `AsyncFileIO:2` import. The old stub returned 0 for this no-path ordinal,
+so the actual next blocker was missing ordinal-2 completion, not d500's range
+check itself.
+
+### Item 2 — implemented env-gated no-path `AsyncFileIO:2` completion
+
+Decoded the owner/control-object shape:
+
+```armasm
+0x1801fe08(owner=entry+0x128, request=entry+0x16c)
+  0x180200ac(owner, request)      ; [owner+8]=request, [owner+1c]=2
+  AsyncFileIO:2(owner, 2, owner, owner+0x34)
+
+owner+0x34 = completion callback PC
+owner+0x38 = completion callback context (entry)
+```
+
+Implemented ordinal 2 handling only when both bundle `66666` and
+`CLICKY_EAPP_ASYNC3_COMPLETE=1` are active:
+
+- read `[owner+0x34]` and `[owner+0x38]`,
+- clear `[owner+0x1c]` like completion helper `0x18020070`,
+- queue `PendingGuestCall { pc: [owner+0x34], arg0: owner, arg1: [owner+0x38] }`,
+- return success (`1`).
+
+First validation (`/tmp/tet_iter32_async2.log`) advanced through:
+
+```text
+async2_callback_queued ... cb_pc=0x1801d258 cb_ctx=entry
+callback_dispatch ... pc=0x1801d258
+async2_callback_queued ... cb_pc=0x1801d68c cb_ctx=entry
+callback_dispatch ... pc=0x1801d68c
+pc=0x1801fd74 ... req=entry+0x16c
+AsyncFileIO:1 ...
+```
+
+This exposed the next no-path gap: initiator C (`0x1801fd74`) calls
+`AsyncFileIO:1`. The same run also exposed a debug-only panic in startup-progress
+diagnostics: fixed-address clock fields contained garbage under the parsed path,
+so `clock_idx * 16` overflowed in debug mode. The diagnostic now uses wrapping
+address arithmetic so bad diagnostic pointers cannot crash RE runs.
+
+### Item 3 — implemented env-gated no-path `AsyncFileIO:1` owner completion
+
+Disassembly of `0x1801fd74` showed ordinal 1 is another owner-completion path:
+
+```armasm
+0x1801fd74(entry+0x16c, cb=0x1801d424, ctx=entry)
+  alloc 0x3c owner
+  init owner with callback 0x1801fc68
+  link owner to request (entry+0x16c)
+  AsyncFileIO:1(owner, 2, 0, owner+0x34)
+  if return nonzero: [request+4] = 3
+```
+
+Implemented ordinal 1 handling, again only for bundle `66666` and
+`CLICKY_EAPP_ASYNC3_COMPLETE=1`:
+
+- read linked request from `[owner+0x08]`,
+- write `[owner+0x20]=0`, `[owner+0x24]=0`,
+- queue the real owner trampoline `0x1801fbfc(owner)`,
+- return success so `0x1801fd74` marks `[request+4]=3` before the queued
+  callback dispatches.
+
+Validation run: `/tmp/tet_iter32_async1_async2.log` (timeout 124, `fatal=0`, no
+panic). This is the first parsed-resource run to reach the wav descriptor
+callback:
+
+```text
+async1_callback_queued frame=2 queued=44 owner=0x10153060 req=0x1005e910 req_cb=0x1801d424
+pc=0x1801d424 hit=1 ... r3=entry
+pc=0x18005400 hit=1 ... r0=0x18029a8c  ; Drop.wav descriptor
+pc=0x18005468 hit=1 ... next desc=0x18029ba0
+pc=0x18005400 hit=2 ... r0=0x18029ba0  ; Move.wav descriptor
+pc=0x18005468 hit=2 ... next desc=0x18029cb4
+pc=0x18015c30 hit=3 ... desc=0x18029cb4 ; MoveFail.wav registrar
+```
+
+Current status: progress is real (`0x18005400` fires twice now), but the path is
+not complete. The third descriptor (`MoveFail.wav`) reaches the generic registrar
+`0x18015c30`, then returns through `0x18015c74` with `r0=0` and no subsequent
+`AsyncFileIO:3`/`AsyncFileIO:0`/`AsyncFileIO:1/2` completion. `0x18005480` still
+has not fired and boot remains at state 4.
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed after the ordinal-1/2 and
+  diagnostic-overflow fixes.
+- Parsed-resource RE run `/tmp/tet_iter32_async1_async2.log`:
+  - timeout exit `124`, `fatal/panic=0`,
+  - `async2_callback_queued=2`, `async1_callback_queued=1`,
+  - `pc=0x18005400` count = 2,
+  - `pc=0x18005480` count = 0.
+- Default/non-env Tetris regression `/tmp/tetris_iter32_default_regression.log`:
+  `fatal/panic=0`, `skipped_nonzero=0`.
+
+### Next priorities
+
+1. Decode why `0x18015c30/0x18015c74` returns `r0=0` for the third wav descriptor
+   (`0x18029cb4`, `MoveFail.wav`) after two successful `0x18005400` callbacks.
+2. Add a focused trace around the registrar's call path (`0x18015c10..0x18015c90`,
+   caller `0x1801d81c`, and descriptor fields near `0x18029cb4`) to identify the
+   exact missing state bit/field.
+3. Continue until `0x18005400` fires for all wav descriptors and `0x18005480`
+   advances boot state 4→5; only then resume true menu-label constructor tracing.
+
+## Iteration 33 — fixed ordinal-1 control completion; wav state 4 now drains 10/10
+
+Focus: continue from iteration 32's new blocker. The parsed-resource path
+(`CLICKY_EAPP_ASYNC3_COMPLETE=1`) reached `0x18005400` twice, then stalled on
+third wav descriptor `MoveFail.wav`: `0x18015c30 -> 0x1801e0fc` returned 0 and
+no new `AsyncFileIO:3` request was started.
+
+### Item 1 — decoded the `MoveFail.wav` stall
+
+A focused rerun with `CLICKY_AUDIO_TRACE=1` and higher trace cap:
+
+```text
+/tmp/tet_iter33_trace80.log
+```
+
+showed the real stall sequence:
+
+```text
+Drop.wav:
+  0x18015c30 hit=1
+  0x1801d76c hit=40 head=0x10013620 e[170]=0
+  0x1801fe28 starts AsyncFileIO:3 Drop.wav
+  ... AsyncFileIO:0 / :2 / :1 cascade ...
+  0x18005400 hit=1
+
+Move.wav:
+  0x18015c30 hit=2
+  0x1801d76c hit=42 head=0x10013620 e[170]=0
+  0x1801fe28 starts AsyncFileIO:3 Move.wav
+  ... cascade ...
+  0x18005400 hit=2
+
+MoveFail.wav:
+  0x18015c30 hit=3
+  0x1801d76c hit=44 head=0x100137a4 e[170]=0x02
+  0x1801fe28 hit=42 req=0x10013910 entry=0x100137a4 [e+170]=0x02 [r+4]=0x02
+  0x18015c74 returns with r0=0, no AsyncFileIO:3 path
+```
+
+So `MoveFail.wav` did not fail because the descriptor or audio type was bad.
+It failed because the load-manager free list reused the secondary audio-stream
+entry `0x100137a4` while its embedded request state byte (`entry+0x170`, also
+`request+4`) still held `2` from the previous ordinal-1 completion. Initiator A
+`0x1801fe28` treats any nonzero `[request+4]` as busy and returns 0.
+
+Disassembly of the relevant helper confirmed the cause:
+
+```armasm
+0x1801fc30(owner-completion forwarder):
+  cmp r1,#0
+  strbeq #2, [request+4]   ; status == 0 -> leave request state 2
+  strbne #0, [request+4]   ; status != 0 -> clear request state
+  bx [request+0x0c]
+```
+
+The ordinal-1 no-path/control completion should clear the reusable request byte.
+Our iteration-32 implementation had copied ordinal-0's `status=0` shape, which
+left `[request+4]=2` and poisoned the next reuse.
+
+### Item 2 — changed env-gated `AsyncFileIO:1` to use control status = 1
+
+Updated the env-gated Tetris ordinal-1 completion in
+`clicky-core/src/sys/eapp/mod.rs`:
+
+- still queues the real owner callback `0x1801fbfc(owner)`,
+- still leaves byte count as 0,
+- but now writes `[owner+0x20] = 1` instead of 0.
+
+That makes `0x1801fc30` clear `[request+4]` before invoking the downstream
+`0x1801d424` callback. Static RE says `0x1801d424` ignores the forwarded
+`status`/`byte_count` args and uses its entry/context fields, so this is a
+narrow control-completion fix rather than a data-read status change. Ordinal 0
+(the real wav stream owner completion) remains `status=0` because its callback
+path expects request state 2 during the stream-manager cascade.
+
+### Item 3 — validation: all ten wav descriptors drain and boot advances 4→5→6→7
+
+Validation run after rebuild:
+
+```text
+/tmp/tet_iter33_async1_status_clear.log
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+```
+
+Results:
+
+```text
+fatal/panic=0
+pc=0x18005400 count = 10
+pc=0x18005480 count = 1
+async1_callback_queued = 10
+async2_callback_queued = 20
+0x18003d60 hit = 1   ; prefs.sav state 5
+0x18003da8 hit = 1   ; game.sav state 6
+statemach_count = 7  ; boot-resource progress complete
+```
+
+All ten wavs now take the full parsed-resource path:
+
+```text
+Drop.wav, Move.wav, MoveFail.wav, Hold.wav, Clear.wav,
+Tetris.wav, Level.wav, GameOver.wav, Lock.wav, Menu.wav
+```
+
+Each wav shows the expected cascade:
+
+```text
+AsyncFileIO:3 header read -> Audio setup -> AsyncFileIO:0 stream read ->
+AsyncFileIO:2 owner/control callbacks -> AsyncFileIO:1 control completion ->
+0x18005400 descriptor callback
+```
+
+After `Menu.wav`, `0x18005480` writes boot state 5, then the boot dispatcher
+loads `prefs.sav` and `game.sav` and reaches state/progress count 7. This
+satisfies the iteration-31/32 concrete goal of getting state 4 fully unstuck.
+
+Current remaining behavior: even with parsed resources complete, `frame_state`
+stays 1 and `statemach_byte` stays 0 unless a real/diagnostic host event sets
+the mailbox byte. The run constructs the same fallback/options object cluster
+(`0x1801c940`, `0x1801f794`, `0x1801f6ec` etc.) after state 7, so the next label
+work can finally resume from a fully drained boot path instead of a wav-state
+stall.
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed (16/16).
+- Default/non-env Tetris regression:
+  `/tmp/tetris_iter33_default_regression.log`
+  - timeout exit expected,
+  - `fatal/panic=0`,
+  - `skipped_nonzero=0`.
+
+### Next priorities
+
+1. With parsed boot now reaching state/progress count 7, rerun the true menu
+   label tracing under `CLICKY_EAPP_ASYNC3_COMPLETE=1` plus a legitimate
+   mailbox/input event (`menu` or `CLICKY_EAPP_HOST_EVENT_FLAGS`) to see whether
+   expected labels are ever read after the full boot path.
+2. Compare parsed-complete path vs default fallback after state 7: both now hit
+   `0x1801c940`/options cluster, so identify what still chooses options/legal
+   text instead of the main-menu label object graph.
+3. Decide whether the ordinal-1 `status=1` control-completion model is general
+   enough to leave as env-gated Tetris RE behavior or whether more no-path
+   AsyncFileIO owner/control states need separate status conventions.
+
+## Iteration 34 — parsed boot reaches state 7; active text is legal/name/EXIT, not main-menu labels
+
+Focus: use iteration 33's completed wav path (`0x18005400` 10/10 and
+`0x18005480` once) to resume the real menu-label investigation under
+`CLICKY_EAPP_ASYNC3_COMPLETE=1`.
+
+### Item 1 — reran parsed-complete path with real mailbox/state advance
+
+Diagnostic run:
+
+```text
+/tmp/tet_iter34_async3_hostevent_trace.log
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+EAPP_STRING_TRACE=1
+EAPP_STRING_SCAN=1
+```
+
+Results:
+
+```text
+fatal/panic = 0
+pc=0x18005400 count = 10
+pc=0x18005480 count = 1
+0x18003d60 hit = 1   ; prefs.sav state 5
+0x18003da8 hit = 1   ; game.sav state 6
+statemach_count = 7  ; boot-resource progress complete
+frame_state advances to 6 after the host/menu mailbox flag
+0x1801c940 / 0x1801f794 / 0x1801f6ec hit once
+```
+
+So the iteration-33 ordinal-1 control-status fix holds up: the proper parsed
+path now drains all wav descriptors, loads both saves, constructs the downstream
+object cluster, and can be advanced with the real upstream mailbox path. The old
+state-4 wav stall is no longer the blocker.
+
+### Item 2 — string-reader evidence after full parsed boot
+
+The expected main-menu label strings are still parsed/selected by the
+`Strings.dta` parser, but they are not the strings read by the active text draw
+path after state 7 / state 6.
+
+Expected label setter mentions exist (at frame 2 via `0x1801270c`), but getter
+reads for those pointers are zero:
+
+```text
+expected label setter mentions: 7
+getter reads of expected pointers: 0
+```
+
+Actual getter pointer distribution (`0x180126d8` / `0x18012704`) in the parsed
+run:
+
+```text
+32x 0x1000f668 len 31  TET_STRING_LOADING_LEGAL chunk
+32x 0x1000f6a8 len 34  TET_STRING_LOADING_LEGAL chunk
+32x 0x1000f6ee len 31  TET_STRING_LOADING_LEGAL chunk
+32x 0x1000f72e len 10  TET_STRING_LOADING_LEGAL chunk
+28x 0x1000e0e4 len 11  TET_STRING_PLAYER_NAME  -> "Player Name"
+28x 0x1000e238 len 16  TET_STRING_ENTER_NAME   -> "Enter your name:"
+27x 0x10281000 len 9   decorative/sample text buffer
+```
+
+Decoded selected strings directly from `Strings.dta`:
+
+```text
+0x1000e0e4 = TET_STRING_PLAYER_NAME = "Player Name"
+0x1000e238 = TET_STRING_ENTER_NAME  = "Enter your name:"
+0x10003e6c = TET_STRING_PLAY        = "Play"
+0x10010044 = TET_STRING_VOLUME      = "Volume"
+0x10004116 = TET_STRING_OPTIONS     = "Options"
+0x10003fb0 = TET_STRING_RECORDS     = "Records"
+0x10004078 = TET_STRING_HELP        = "Help"
+0x10004206 = TET_STRING_EXIT        = "Exit"
+0x1000b9b2 = TET_STRING_MAIN_MENU   = "Menu"
+```
+
+Conclusion: after a real parsed boot, localization is working and the active
+renderer is no longer limited to raw/legal-only strings. But it chooses the
+legal/name-entry/EXIT path, not the oracle main-menu object graph. The label
+blocker has moved from async wav completion to **state/save/profile/menu-object
+selection**.
+
+### Item 3 — compared default fallback and produced headed artifact
+
+Default/no-`ASYNC3_COMPLETE` comparison with the same host-event flag:
+
+```text
+/tmp/tet_iter34_default_hostevent_compare.log
+fatal/panic = 0
+pc=0x18005400 count = 10
+pc=0x18005480 count = 1
+0x1801c940 = 1
+0x1801f794 = 1
+0x180126d8 / 0x18012704 getter hits = 0
+expected label setter mentions = 0
+```
+
+This confirms the default path still reaches the fallback/options constructor
+without parsing/using selected localization string objects. The parsed path is
+strictly farther along: it parses all strings and renders localized
+`Player Name` / `Enter your name:` string objects, but still not the main-menu
+labels.
+
+Headed validation with parsed completion + host event:
+
+```text
+/tmp/tetris_run_20260622_052557.log
+/tmp/tetris_capture_20260622_052557/
+/tmp/tetris_iter34_async3_hostevent_latest.png
+```
+
+Results:
+
+```text
+fatal/panic = 0
+skipped_nonzero = 0
+captures = 6
+```
+
+The latest capture is stable and visibly past the old all-legal screen, but it
+is still not the expected full oracle menu. It shows the Tetris logo and an
+`EXIT` label, with the rest of the expected labels absent/hidden. User visual
+confirmation is still useful, but the log evidence already says the active text
+objects are not reading `PLAY`/`VOLUME`/`OPTIONS`/`RECORDS`/`HELP`/`MENU`.
+
+### Current conclusion / next priorities
+
+- `AsyncFileIO:0/1/2/3` parsed-resource boot is now good enough to reach
+  state/progress count 7 behind `CLICKY_EAPP_ASYNC3_COMPLETE=1`.
+- Ordinal-1 `status=1` for the no-path control completion is validated by the
+  full 10-wav drain and remains appropriately env-gated for Tetris RE.
+- The remaining menu-label blocker is now likely save/profile/menu-state:
+  zero-byte `prefs.sav` / `game.sav` or first-run state may be selecting the
+  name-entry/EXIT path instead of the normal main menu.
+
+Next:
+
+1. Trace `prefs.sav` / `game.sav` parsed fields and the object/state branch that
+   selects `TET_STRING_PLAYER_NAME` / `TET_STRING_ENTER_NAME` vs
+   `TET_STRING_PLAY` / `TET_STRING_VOLUME` / etc.
+2. Watch/trace the string-object getter callsites around `0x18009518` with the
+   object bases for `Player Name` / `Enter your name` to find their owning UI
+   object constructor.
+3. Experiment with save/profile state in a temporary bundle or env-gated save
+   shim (not the real bundle files) to determine whether a non-first-run player
+   profile advances to the oracle menu labels.
+
+## Iteration 35 — active UTF-16 draw objects traced; saves are not the simple selector
+
+Focus: follow the iteration-34 conclusion that the fully parsed path renders
+legal/name-entry/EXIT text instead of the oracle main-menu labels. This
+iteration added a narrower renderer-entry trace, validated it, and tested the
+save/default-state hypothesis in an isolated bundle.
+
+### Item 1 — added UTF-16 renderer-entry object tracing
+
+Added two env-gated `EAPP_STRING_TRACE=1` PCs to
+`clicky-core/src/sys/eapp/mod.rs`:
+
+```text
+0x18009464  UTF-16 text draw helper entry: r0=text/glyph object, r3=string object
+0x18009514  same helper just before string-object getter calls; r4=text object, r7=string object
+```
+
+The trace now logs the text object (`text_obj`, vtable, font/texgen fields) and
+the selected string object (`str_obj`, `[+8]` pointer, `[+0xc]` length). This is
+important because `0x180126d8` / `0x18012704` only showed which string object was
+read, not the text object that chose it.
+
+Validation run:
+
+```text
+/tmp/tet_iter35_renderentry_async3_hostevent.log
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+EAPP_STRING_TRACE=1
+```
+
+Results:
+
+```text
+fatal/panic = 0
+pc=0x18009464 count = 253
+pc=0x18009514 count = 253
+```
+
+### Item 2 — active text objects after full parsed boot
+
+The renderer-entry trace ties the selected strings to concrete UI text objects.
+After `Strings.dta` parse, full wav drain, save loads, and the host/menu mailbox
+transition, the active UTF-16 text objects are:
+
+```text
+Player Name:
+  text_obj=0x102c6d40
+  str_obj=0x10139b50
+  str[8]=0x100590e4  ; TET_STRING_PLAYER_NAME
+  str[c]=11
+
+Enter your name:
+  text_obj=0x102c8130
+  str_obj=0x10139b70
+  str[8]=0x10059238  ; TET_STRING_ENTER_NAME
+  str[c]=16
+
+Decorative/sample buffer:
+  text_obj=0x102c7fb0 / 0x102c8130
+  str[8]=0x102cc000 / 0x102cc014
+
+Exit (one transient read):
+  text_obj=0x102c6d40
+  str[8]=0x1004f206  ; TET_STRING_EXIT
+  str[c]=4
+```
+
+Pointer distribution from `0x18009514` in that run:
+
+```text
+36x Player Name       -> text_obj 0x102c6d40
+36x Enter your name   -> text_obj 0x102c8130
+36x decorative empty/buffer text on 0x102c8130
+36x decorative/sample text on 0x102c7fb0
+26x each legal-text chunk on legal text objects 0x10130c00 / 0x10130a80
+ 1x Exit on text_obj 0x102c6d40
+ 0x expected PLAY / VOLUME / OPTIONS / RECORDS / HELP / MENU reads
+```
+
+This confirms the iteration-34 observation with better provenance: the active
+renderer is not missing glyphs. It is faithfully drawing a first-run/name-entry
+UI text object graph plus legal text. The expected main-menu string objects are
+still parsed by `0x1801270c`, but none are selected by any active UTF-16 text
+draw helper invocation.
+
+### Item 3 — isolated no-save experiment
+
+Tested whether the real zero-byte save files are the reason the parsed path
+chooses the name-entry state. To avoid touching the real bundle saves, copied the
+bundle to a temp path that still ends in `/66666` (so the Tetris-only parsed
+completion gates remain active), excluding `.clicky-saves`:
+
+```text
+/tmp/tetris_iter35_nosaves_root/Games_RO/66666
+/tmp/tet_iter35_nosaves2_async3_hostevent.log
+```
+
+Run config:
+
+```text
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+EAPP_STRING_TRACE=1
+```
+
+Results:
+
+```text
+fatal/panic = 0
+statemach_count=7 observed
+0x18003d60 prefs.sav path hit = 1
+0x18003da8 game.sav path hit = 1
+pc=0x18005400 count = 10
+pc=0x18005480 count = 1
+expected PLAY/VOLUME/OPTIONS/RECORDS/HELP/MENU getter reads = 0
+```
+
+The selected strings in the no-save temp bundle shift addresses because the raw
+`Strings.dta` buffer is allocated at a different base, but the pattern is the
+same: legal text chunks plus `Player Name` / `Enter your name`, no main-menu
+labels. So the label blocker is **not simply the presence of zero-byte
+`.clicky-saves` files**. Missing saves and zero-byte saves both select the same
+first-run/name-entry object graph under the current runtime model.
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed.
+- Default headed Tetris regression after the diagnostic trace addition:
+  `/tmp/tetris_iter35_default_headed.log`
+  - timeout exit expected,
+  - `fatal/panic=0`,
+  - `skipped_nonzero=0`.
+
+### Current conclusion / next priorities
+
+- The proper parsed boot path is still healthy: all 10 wav descriptors drain and
+  state reaches count 7 behind `CLICKY_EAPP_ASYNC3_COMPLETE=1`.
+- The active text draw helper now proves the selected UI state is first-run/name
+  entry (`Player Name`, `Enter your name`, transient `Exit`) rather than normal
+  main menu.
+- Deleting saves in a temp bundle does not reach the oracle menu labels, so the
+  next lead is not just save-file existence. It is likely the **profile/name
+  entry state machine**: some input, persistence writeback, or host text-entry
+  ABI must complete before the normal main-menu object graph is selected.
+
+Next:
+
+1. Trace the constructors/callers that create `text_obj=0x102c6d40` /
+   `0x102c8130` and bind them to string objects `0x10139b50` /
+   `0x10139b70`, then identify the branch that would instead bind
+   `TET_STRING_PLAY` / `TET_STRING_VOLUME` / etc.
+2. Exercise name-entry related inputs (`action`, wheel directions, possibly
+   text-entry callbacks) after the parsed boot reaches the `Player Name` /
+   `Enter your name` state, checking whether it writes `prefs.sav` or advances
+   to the main menu.
+3. Decode the prefs/profile state fields around the state-5/6 save callbacks
+   and the first-run/name-entry object graph, rather than treating save file
+   absence as sufficient.
+
+## Iteration 36 — reflection + scene graph provenance for name-entry text
+
+### Reflection checkpoint
+
+1. **What has been accomplished so far?**
+   - The original Tetris pointer-backed text renderer bug is solved: the scalar
+     and UTF-16 paths consume real guest characters from `0x1801616c`, the
+     clock uses the recovered six-word `miscTBD:12` localtime ABI, ambiguous A8
+     texture selection is fixed, and default Tetris remains a 0-fatal/0-skip
+     regression.
+   - The proper parsed-resource path is now much farther than the old fallback:
+     behind `CLICKY_EAPP_ASYNC3_COMPLETE=1`, all ten wav descriptors drain,
+     `prefs.sav` and `game.sav` are requested, boot progress reaches 7, and the
+     localized string table is parsed/selected.
+   - Cross-game runtime hardening is also improved: the final iteration-30
+     all-16 smoke was green after the general `miscTBD:0`, request-object
+     `AsyncFileIO:3`, direct `AsyncFileIO:12/14/16`, and InputEvents fixes.
+
+2. **What's working well?**
+   - The combination of exact-PC static RE and env-gated runtime traces is still
+     the best workflow. It keeps default execution stable while making each
+     missing ABI/state transition observable.
+   - Tracing at progressively higher abstraction levels is paying off: previous
+     iterations traced string objects; this iteration tied those strings to the
+     scene/list nodes that own and draw them.
+
+3. **What's not working or blocking progress?**
+   - The expected oracle main-menu labels (`PLAY`, `VOLUME`, `OPTIONS`,
+     `RECORDS`, `HELP`, `MENU`) are parsed but still never selected by the
+     active draw tree. The active tree selects first-run/name-entry text
+     (`Player Name`, `Enter your name:`) and a transient `Exit` instead.
+   - Removing zero-byte saves and sending ordinary clickwheel events does not
+     advance from the name-entry graph to the normal main-menu graph. The likely
+     blocker is now a profile/name-entry completion or text-entry ABI, not
+     glyph decode, wav async boot, or simple save-file existence.
+   - Vortex still has a PC-gated compatibility shim to clean up later.
+
+4. **Should the approach be adjusted?**
+   - Yes: stop searching around the old `0x1801f000` fallback/options cluster
+     for the main menu. The active parsed path now proves the selected content
+     comes from a generic scene/list tree rooted in the post-boot UI graph. The
+     next useful target is the constructor/state machine that builds the
+     name-entry scene nodes and decides whether to create the normal main-menu
+     scene nodes instead.
+   - Continue keeping parsed-resource completion gated by
+     `CLICKY_EAPP_ASYNC3_COMPLETE=1` until the path reaches a correct menu.
+
+5. **Next priorities.**
+   - Trace the constructor/update path for the active scene nodes that bind
+     `obj+0x10=string_obj` and `obj+0x14=text_obj`, especially the root
+     `0x180237b4` scene/list tree built after state 7.
+   - Identify the ABI or state transition that completes name entry / profile
+     setup and causes the normal main-menu scene graph to replace the
+     `Player Name` / `Enter your name:` graph.
+   - Keep exercising candidate inputs and save/profile shims in temp bundles or
+     env-gated code only; do not mutate the real bundle save files.
+
+### Item 1 — added scene/list draw provenance tracing
+
+Added three more `EAPP_STRING_TRACE=1` diagnostics in
+`clicky-core/src/sys/eapp/mod.rs`:
+
+```text
+0x1800c938  generic scene/list node draw recursion entry
+0x180162e4  generic text-object draw wrapper entry before vtable dispatch
+0x18016320  generic text-object draw wrapper bx ip to concrete draw helper
+```
+
+`0x18009464`'s LR is always `0x18016324`, so it only proved which concrete
+UTF-16 helper was called. The new wrapper trace gives the caller one level up,
+and the scene trace gives the scene/list node that owns the string and text
+object.
+
+Validation run:
+
+```text
+/tmp/tet_iter36_wrapper_trace.log
+/tmp/tet_iter36_scene_tree_trace.log
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+EAPP_STRING_TRACE=1
+```
+
+Results:
+
+```text
+fatal/panic = 0
+pc=0x180162e4 wrapper hits = 320 (limit-throttled)
+pc=0x18016320 bx hits      = 320 (limit-throttled)
+pc=0x1800c938 scene hits   = 900 / then 230 in focused rerun (limit-throttled)
+```
+
+### Item 2 — active name-entry text is owned by generic `0x180237b4` scene nodes
+
+The parsed path's active draw stack is now tied to concrete scene/list nodes:
+
+```text
+root scene:
+  scene_obj=0x102cc040
+  vtable=0x180237b4
+  count=16
+  lr=0x1801c014
+  child10=0x10308680
+  child11=0x103086f0
+
+Player Name leaf:
+  scene_obj=0x10308680
+  vtable=0x180237b4
+  obj[0x10]=0x10139b50    ; string object
+  obj[0x14]=0x102c6d40    ; text/glyph object
+  obj[0x18]=0x00000100
+  string ptr=0x100590e4   ; TET_STRING_PLAYER_NAME
+
+Enter your name leaf:
+  scene_obj=0x10308800
+  vtable=0x180237b4
+  obj[0x10]=0x10139b70    ; string object
+  obj[0x14]=0x102c8130    ; text/glyph object
+  obj[0x18]=0x00000100
+  string ptr=0x10059238   ; TET_STRING_ENTER_NAME
+```
+
+Draw call chain for both leaves:
+
+```text
+0x1801c014
+  -> vtable[0x44] on [clock_obj+0x2c]
+  -> 0x1800c938(scene/list recursion)
+  -> 0x1800c9d0
+  -> 0x180162e4(text wrapper)
+  -> 0x18016320 bx vtable[0x38]
+  -> 0x18009464(UTF-16 helper)
+  -> 0x180126d8 / 0x18012704(string getter)
+```
+
+This is an important shift in the investigation: the name-entry strings are not
+floating string objects accidentally read by the renderer. They are deliberately
+bound into the active UI scene graph as `scene_node+0x10` / `scene_node+0x14`.
+The missing oracle menu labels therefore require finding the state/constructor
+that builds a different scene graph, not another renderer-side string lookup.
+
+### Item 3 — post-name-entry input sweep did not select main-menu labels
+
+Exercised candidate inputs after parsed boot and the host/menu mailbox advance:
+
+```text
+/tmp/tet_iter36_input_sweep/action.log
+/tmp/tet_iter36_input_sweep/up.log
+/tmp/tet_iter36_input_sweep/down.log
+/tmp/tet_iter36_input_sweep/menu.log
+
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+CLICKY_EAPP_INPUT_SCRIPT='<key>:90-100'
+EAPP_STRING_TRACE=1
+```
+
+All four runs were stable and reached state 6, but none selected the expected
+main-menu labels:
+
+```text
+action: fatal=0, expected_getters=0, state6 observed
+up:     fatal=0, expected_getters=0, state6 observed
+down:   fatal=0, expected_getters=0, state6 observed
+menu:   fatal=0, expected_getters=0, state6 observed
+```
+
+The same runs continued to emit `Player Name` / `Enter your name:` trace lines,
+and no new `prefs.sav` / `game.sav` writeback path was observed beyond the
+initial request-object reads. This suggests ordinary wheel/button transitions
+alone are insufficient; the game may need a text-entry/profile service callback
+or a valid non-first-run profile record before constructing the oracle menu.
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed.
+- Default headed Tetris regression after the new diagnostics:
+  `/tmp/tetris_iter36_default_headed.log`
+  - timeout exit expected,
+  - `fatal/panic=0`,
+  - `skipped_nonzero=0`.
+
+### Next
+
+1. Trace construction/update of `0x180237b4` scene/list nodes, especially where
+   `scene_node+0x10` and `scene_node+0x14` are assigned for the name-entry
+   leaves. The allocator LR is too generic (`0x18021b68`), so use write watches
+   or targeted PCs around the vtable/scene helper constructors instead.
+2. Decode the first-run/profile/name-entry state machine: find what decides to
+   build `Player Name` / `Enter your name:` nodes and what condition switches to
+   normal main-menu labels.
+3. Investigate possible text-entry/profile ABI imports rather than only
+   clickwheel events; ordinary action/up/down/menu transitions after state 6 did
+   not alter the selected scene graph.
+
+## Iteration 37 — scene constructors traced; main-menu labels are built but not rooted
+
+Focus: continue from iteration 36's scene/list provenance. The key question was
+whether the oracle main-menu labels are never created, or are created but not
+selected by the active scene graph.
+
+### Item 1 — added constructor/leaf-factory tracing for `0x180237b4` scene nodes
+
+Added more `EAPP_STRING_TRACE=1` diagnostics in
+`clicky-core/src/sys/eapp/mod.rs`:
+
+```text
+0x1800c7a0  generic scene/list initializer; stores string payload at node+0x10
+            and assigns drawable/text object at node+0x14
+0x1800cb84  scene/list allocator/constructor variant A
+0x1800cbf8  scene/list allocator/constructor variant B
+0x18007b0c  scene leaf factory: chooses text slot + string object
+0x18007b6c  related scene leaf factory variant
+```
+
+Static RE of the scene initializer:
+
+```armasm
+0x1800c7a0: shared initializer for vtable 0x180237b4 nodes
+  [node+0x08] = child_count
+  [node+0x30] = child_array (if child_count > 0)
+  [node+0x10] = string object / payload argument
+  [node+0x14] = assigned drawable/text object via 0x1802063c
+  [node+0x18] = small mode/flag byte
+```
+
+Static RE of the active leaf factory:
+
+```armasm
+0x18007b0c(parent, text_slot_index, string_obj, flag, ...geometry...)
+  alloc 0x34-byte node
+  text_obj = parent[0x10][text_slot_index]
+  call 0x1800cbf8 / 0x1800c7a0 to bind:
+    node+0x10 = string_obj
+    node+0x14 = text_obj
+```
+
+So the `scene_node+0x10` / `scene_node+0x14` fields decoded in iteration 36 are
+not incidental: this is the generic localized-text leaf construction path.
+
+### Item 2 — name-entry leaves now have exact constructor callsites
+
+Run:
+
+```text
+/tmp/tet_iter37_leaf_factory.log
+CLICKY_EAPP_ASYNC3_COMPLETE=1
+CLICKY_EAPP_HOST_EVENT_FLAGS=0x10
+CLICKY_EAPP_HOST_EVENT_DELAY=50
+EAPP_STRING_TRACE=1
+```
+
+The active name-entry leaves are built in frame 3 by `0x18007b0c`, through
+constructor variant `0x1800cbf8` and initializer `0x1800c7a0`:
+
+```text
+Player Name active leaf:
+  0x18007b0c lr=0x1800d24c
+  node=0x10308680
+  string_obj=0x10139b50  ; ptr=0x100590e4 = TET_STRING_PLAYER_NAME
+  text_obj=0x102c6d40
+  slot/index=0x2c
+  geometry stack: x-ish=0x12e, y-ish=0xcc, font/style=0x42
+
+Enter your name active leaf:
+  0x18007b0c lr=0x180190b0
+  node=0x10308800
+  string_obj=0x10139b70  ; ptr=0x10059238 = TET_STRING_ENTER_NAME
+  text_obj=0x102c8130
+  slot/index=0x3b
+  geometry stack: x-ish=0xa0, y-ish=0x82, font/style=0x21
+```
+
+Relevant static callers:
+
+```text
+0x1800d1c0..0x1800d270
+  generic/screen label builder; at 0x1800d248 calls 0x18007b0c.
+  It is used for Player Name and also some other localized labels.
+
+0x18018f40..0x180190cc
+  name-entry screen constructor. It first builds the decorative/sample text,
+  then calls 0x1800d1c0 for the top prompt and calls 0x18007b0c at
+  0x180190ac for the `Enter your name:` leaf.
+```
+
+### Item 3 — expected main-menu label leaves are constructed, but never drawn
+
+This is the important new result. The oracle labels are **not merely parsed**;
+they are also constructed into scene/list leaf nodes by the same generic factory
+path. In the same run, `0x1800c7a0` built nodes for:
+
+```text
+Menu     node=0x102dc9f0  string_obj=0x101397d0  text_obj=0x102c6d40
+Play     node=0x102dcb80  string_obj=0x10139230  text_obj=0x102c8430
+Play     node=0x102dcbf0  string_obj=0x10139230  text_obj=0x102c82b0
+Volume   node=0x102dcd60  string_obj=0x10139c90  text_obj=0x102c8430
+Volume   node=0x102dcdd0  string_obj=0x10139c90  text_obj=0x102c82b0
+Options  node=0x102dcf40  string_obj=0x101392b0  text_obj=0x102c8430
+Options  node=0x102dcfb0  string_obj=0x101392b0  text_obj=0x102c82b0
+Records  node=0x102dd120  string_obj=0x10139270  text_obj=0x102c8430
+Records  node=0x102dd190  string_obj=0x10139270  text_obj=0x102c82b0
+Help     node=0x102dd300  string_obj=0x10139290  text_obj=0x102c8430
+Help     node=0x102dd370  string_obj=0x10139290  text_obj=0x102c82b0
+Exit     node=0x102dd4e0  string_obj=0x101392d0  text_obj=0x102c8430
+Exit     node=0x102dd550  string_obj=0x101392d0  text_obj=0x102c82b0
+```
+
+The selected-language string objects in this run were:
+
+```text
+0x10139230 -> Play
+0x10139c90 -> Volume
+0x101392b0 -> Options
+0x10139270 -> Records
+0x10139290 -> Help
+0x101392d0 -> Exit
+0x101397d0 -> Menu
+0x10139b50 -> Player Name
+0x10139b70 -> Enter your name:
+```
+
+However, cross-checking all `0x1800c938` draw-recursion entries showed:
+
+```text
+Drawn among those constructed label nodes:
+  Player Name: 37 draw-recursion hits
+  Enter your name: 37 draw-recursion hits
+  Play/Volume/Options/Records/Help/Menu/normal Exit: 0 draw-recursion hits
+```
+
+And direct grep of scene-recursion logs found zero references to the expected
+label node addresses under the active root. So the current blocker is now more
+precise:
+
+> The normal main-menu label leaves are constructed, but they are not rooted in
+> the active scene graph selected for drawing. The active root switches to the
+> first-run/name-entry graph (`0x102cc040 -> child10/11 -> 0x10308680/0x10308800`),
+> while the earlier main-menu label leaves around `0x102dcb80..0x102dd550` are
+> abandoned/inactive.
+
+This changes the next lead from “find where labels are constructed” to “find
+which root/scene selector chooses name-entry over the already-built main-menu
+label graph.”
+
+### Verification
+
+- `cargo build -p clicky-desktop --bin eapp` passed.
+- `cargo test -p clicky-core --lib eapp` passed.
+- Default headed Tetris regression after the new diagnostics:
+  `/tmp/tetris_iter37_default_headed.log`
+  - `fatal/panic=0`,
+  - `skipped_nonzero=0`.
+
+### Next
+
+1. Trace the root/scene selector that installs or swaps the active
+   `0x180237b4` root (`0x102cc040`) under `[clock_obj+0x2c]` / `0x1801c014`.
+   The labels are built; the wrong root graph is active.
+2. Decode how the name-entry constructor `0x18018f40..0x180190cc` is selected
+   and what condition would skip it or replace it with the already-constructed
+   main-menu label graph.
+3. Continue testing profile/name-entry completion ABI (text entry or save
+   writeback), but treat ordinary wheel/action events as already negative.

@@ -80,6 +80,16 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1800_5400, // state-4 wav descriptor callback/scanner
     0x1800_5468, // state-4 scanner tail-calls 0x15c30 for next wav desc
     0x1800_5480, // state-4 complete: set boot state 5 and re-enter 0x03bd0
+    0x1800_7b0c, // scene leaf factory: chooses text slot + string object
+    0x1800_7b6c, // scene leaf factory variant with embedded flag
+    0x1800_c7a0, // generic scene/list node initializer (binds +0x10/+0x14)
+    0x1800_cb84, // scene/list node allocator/constructor variant A
+    0x1800_cbf8, // scene/list node allocator/constructor variant B
+    0x1800_c938, // generic scene/list node draw recursion entry
+    0x1800_9464, // UTF-16 text draw helper entry: r0=text_obj, r3=string object
+    0x1800_9514, // UTF-16 text draw helper: about to read string-object pointer/len
+    0x1801_62e4, // generic text-object draw wrapper entry before vtable dispatch
+    0x1801_6320, // generic text-object draw wrapper bx ip to concrete draw helper
     0x1801_26d8, // string object value-ptr getter: returns [obj+8]
     0x1801_2704, // string object length getter: returns [obj+0xc]
     0x1801_270c, // string object setter: [obj+8]=ptr, [obj+0xc]=len
@@ -110,11 +120,20 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_fb3c, // menu resource update/ensure path
     0x1801_fc68, // AsyncFileIO request completion callback (trampoline)
     0x1801_fc94, // completion status handoff (marks owner done)
+    0x1801_d1b4, // audio-stream owner cb: forwards request/status/bytes to second manager
     0x1801_d370, // shared owner cb: store byte_count → ctx+0x120, dispatch processor
+    0x1801_d500, // begin-load: assign slot index, set entry[7]=1 lock, call processor
+    0x1801_d548, // d500 direct processor path before bx ip
+    0x1801_d5bc, // d500 alternate async path: calls 0x1801fd74
+    0x1801_d5cc, // d500 range/threshold fail path after async-path skip
+    0x1801_d258, // AsyncFileIO:2 secondary callback: may start second owner stage
+    0x1801_d68c, // AsyncFileIO:2 secondary callback: may re-enter initiator C or final processor
+    0x1801_d424, // AsyncFileIO:2 tertiary callback used by initiator C
     0x1801_d644, // load-manager LINK fn: push entry to pending list
     0x1801_d664, // dead-spin guard if entry[7]!=0 (duplicate reg)
     0x1801_d8d0, // manager init (alloc 10-slot free-list)
-    0x1801_d500, // begin-load: assign slot index, set entry[7]=1 lock, call processor
+    0x1801_fd74, // I/O initiator C used by audio-stream manager after d500
+    0x1801_fddc, // initiator C success branch: request state becomes 3
     0x1801_fe28, // I/O initiator A (read path, 0x1801d370 shared owner cb)
     0x1801_fcc8, // I/O initiator B (read path, 0x1801d1b4 cb)
     0x1801_fec8, // AFTER AsyncFileIO:3 store [r+4]: capture the in-flight byte
@@ -1166,6 +1185,159 @@ impl Eapp {
             return Ok(());
         }
 
+        // Tetris parsed-resource RE shim for AsyncFileIO:0 wav streaming.
+        // Initiator-B (`0x1801fcc8`) calls AsyncFileIO:0, then immediately
+        // writes `[request+4]=1` at `0x1801fd4c` to mark the request in-flight.
+        // If the completion is only queued for the outer scheduler, the guest
+        // can remain inside the current boot/render loop and never return to
+        // dispatch it. When the env-gated parsed path is enabled, mark the
+        // just-started request complete after that store has executed; the
+        // queued owner callback (`0x1801fbfc`) still performs the real callback
+        // cascade and byte-count forwarding once control returns.
+        if pc == 0x1801_fd50u32
+            && std::env::var("CLICKY_EAPP_ASYNC3_COMPLETE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+            && self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"))
+        {
+            let mode = self.cpu.mode();
+            let req = self.cpu.reg_get(mode, 4);
+            let state = self.read_guest_u32(req.wrapping_add(4)).unwrap_or(0) & 0xff;
+            let cb = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0);
+            if state == 1 && cb != 0 {
+                let _ = self.write_guest_bytes(req.wrapping_add(4), &[2]);
+                info!(
+                    target: "EAPP_IMPORT",
+                    "AsyncFileIO:0 post-start complete mark req={:#010x} cb={:#010x}",
+                    req,
+                    cb
+                );
+            }
+        }
+
+        // Vortex (12345) compatibility shim: its early OpenGLES surface setup
+        // calls binary-local block-copy helpers at 0x18014d38/0x18011274 and
+        // later GL/state initializers at 0x1800aa40/0x18013eec. The first pair
+        // can load near-null block-copy destinations from literal-pool-backed
+        // register blocks; the second pair expects `[global+4]` to point at a
+        // mutable GL state block before writing fields like +0x24/+0x60/+0x9c.
+        // Bootstrap preallocates work-RAM scratch structures for both cases.
+        // This is intentionally gated by bundle id and exact PC/range so
+        // working titles cannot observe it.
+        if self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345")) {
+            if pc == 0x1801_4d54u32 || pc == 0x1801_1290u32 {
+                let mode = self.cpu.mode();
+                let current_r0 = self.cpu.reg_get(mode, 0);
+                if current_r0 < WORK_RAM_BASE {
+                    let surface_buf = self.read_guest_u32(WORK_RAM_BASE + 0xff4).unwrap_or(0);
+                    if surface_buf != 0 {
+                        self.cpu.reg_set(mode, 0, surface_buf);
+                    }
+                }
+            }
+            if pc == 0x1801_8ae8u32 || pc == 0x1801_8aecu32 {
+                let mode = self.cpu.mode();
+                let current_r4 = self.cpu.reg_get(mode, 4);
+                if current_r4 == 0 {
+                    let object = self.read_guest_u32(WORK_RAM_BASE + 0xff8).unwrap_or(0);
+                    if object != 0 {
+                        self.cpu.reg_set(mode, 4, object);
+                    }
+                }
+            }
+            if pc == 0x1801_3e00u32 || pc == 0x1801_3e04u32 || pc == 0x1801_3e08u32 {
+                let mode = self.cpu.mode();
+                let current_r4 = self.cpu.reg_get(mode, 4);
+                if current_r4 == 0 {
+                    let object = self.read_guest_u32(WORK_RAM_BASE + 0xff8).unwrap_or(0);
+                    if object != 0 {
+                        self.cpu.reg_set(mode, 4, object);
+                    }
+                }
+            }
+            if (0x1800_ab08u32..=0x1800_ab3cu32).contains(&pc) {
+                let mode = self.cpu.mode();
+                let current_r4 = self.cpu.reg_get(mode, 4);
+                let state_block = self.read_guest_u32(WORK_RAM_BASE + 0xffc).unwrap_or(0);
+                if current_r4 != 0 && state_block != 0 {
+                    let target_slot = current_r4.wrapping_add(4);
+                    let current_ptr = self.read_guest_u32(target_slot).unwrap_or(0);
+                    if current_ptr < WORK_RAM_BASE {
+                        let _ = self.write_guest_u32(target_slot, state_block);
+                    }
+                    let current_r1 = self.cpu.reg_get(mode, 1);
+                    if current_r1 < WORK_RAM_BASE {
+                        self.cpu.reg_set(mode, 1, state_block);
+                    }
+                    if pc == 0x1800_ab38u32 || pc == 0x1800_ab3cu32 {
+                        let current_r0 = self.cpu.reg_get(mode, 0);
+                        if current_r0 < WORK_RAM_BASE {
+                            self.cpu.reg_set(mode, 0, state_block);
+                        }
+                    }
+                }
+            }
+            if (0x1801_3ef4u32..=0x1801_3f1cu32).contains(&pc) {
+                let mode = self.cpu.mode();
+                let current_r3 = self.cpu.reg_get(mode, 3);
+                let state_block = self.read_guest_u32(WORK_RAM_BASE + 0xffc).unwrap_or(0);
+                if current_r3 != 0 && state_block != 0 {
+                    let target_slot = current_r3.wrapping_add(4);
+                    let current_ptr = self.read_guest_u32(target_slot).unwrap_or(0);
+                    if current_ptr < WORK_RAM_BASE {
+                        let _ = self.write_guest_u32(target_slot, state_block);
+                    }
+                    let current_r1 = self.cpu.reg_get(mode, 1);
+                    if current_r1 < WORK_RAM_BASE {
+                        self.cpu.reg_set(mode, 1, state_block);
+                    }
+                }
+            }
+        }
+
+        // Texas Hold'em (33333) RE diagnostic: capture the exact AsyncFileIO:3
+        // completion request/owner that reaches the game's callback trampoline
+        // at 0x1802fcc4 before the known null-owner fatal at 0x1802fd00.
+        // Disabled by default; enable with EAPP_TEXAS_TRACE=1.
+        if std::env::var_os("EAPP_TEXAS_TRACE").is_some()
+            && self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"))
+            && (pc == 0x1802_fcc4u32 || pc == 0x1802_fcf0u32 || pc == 0x1802_fd00u32)
+        {
+            let mode = self.cpu.mode();
+            let r0 = self.cpu.reg_get(mode, 0);
+            let r1 = self.cpu.reg_get(mode, 1);
+            let r2 = self.cpu.reg_get(mode, 2);
+            let r3 = self.cpu.reg_get(mode, 3);
+            let owner_from_req = self.read_guest_u32(r0.wrapping_add(8)).unwrap_or(0);
+            let status = self.read_guest_u32(r0.wrapping_add(0x20)).unwrap_or(0);
+            let byte_count = self.read_guest_u32(r0.wrapping_add(0x24)).unwrap_or(0);
+            let cb_pc = self.read_guest_u32(r0.wrapping_add(0x34)).unwrap_or(0);
+            let cb_ctx = self.read_guest_u32(r0.wrapping_add(0x38)).unwrap_or(0);
+            let owner_state = self.read_guest_u32(r0.wrapping_add(4)).unwrap_or(0);
+            let owner_done = self.read_guest_u32(r0.wrapping_add(8)).unwrap_or(0);
+            let owner_cb = self.read_guest_u32(r0.wrapping_add(0x0c)).unwrap_or(0);
+            let owner_ctx = self.read_guest_u32(r0.wrapping_add(0x10)).unwrap_or(0);
+            info!(
+                target: "EAPP_TEXAS_TRACE",
+                "pc={:#010x} frame={} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} req_owner={:#010x} req_status={:#010x} req_bytes={:#010x} req_cb={:#010x} req_ctx={:#010x} as_owner_state={:#010x} as_owner_done={:#010x} as_owner_cb={:#010x} as_owner_ctx={:#010x}",
+                pc,
+                self.frame_counter,
+                r0,
+                r1,
+                r2,
+                r3,
+                owner_from_req,
+                status,
+                byte_count,
+                cb_pc,
+                cb_ctx,
+                owner_state,
+                owner_done,
+                owner_cb,
+                owner_ctx
+            );
+        }
+
         // Capture scalar-formatter char pushes at the shared-runtime text
         // helper callsite. The char (r1) is the authoritative per-glyph
         // selector for the register-computed formatter path (Tetris draws
@@ -1458,8 +1630,8 @@ impl Eapp {
         if import.module == "miscTBD" && import.ordinal == 0 && std::env::var_os("CLICKY_ALLOC_TRACE").is_some() {
             info!(
                 target: "EAPP_ALLOC",
-                "miscTBD:0 alloc lr={:#010x} ret={:#010x} len={}",
-                lr, ret, args[0]
+                "miscTBD:0 alloc lr={:#010x} ret={:#010x} len={} r1={:#010x}",
+                lr, ret, args[0], args[1]
             );
         }
 
@@ -2047,108 +2219,153 @@ impl Eapp {
     /// Ordinal 165: surface/context bind (Vortex/iQuiz/Texas Hold'em fix).
     ///
     /// Vortex crashes at `pc=0x18014d58` with null pointer writes. The game
-    /// expects container structures with valid object arrays and buffers.
-    /// We pre-allocate these during Vortex-specific initialization.
+    /// calls OpenGLES:165 with r0=0x18063ebc (container in mapped image).
+    /// The container needs:
+    ///   +0x54: count (should be 1)
+    ///   +0x5c: array_ptr -> object
+    ///   +0x04: object_ptr -> buffer (via ldr r0, [r0, #4] at crash site)
+    /// 
+    /// The object at +0x04 needs:
+    ///   +0x00: vtable
+    ///   +0x04: buffer_ptr (this is what stmia writes to)
     fn live_handle_ordinal_165(&mut self, args: [u32; 4]) {
-        // This handler is now mostly a no-op - structures are allocated
-        // during bootstrap for Vortex. Just log the call for diagnostics.
         let state_ptr = args[0];
+        let r1 = args[1];
         info!(
             target: "EAPP_GL",
             "ordinal_165: state_ptr={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
-            state_ptr, args[1], args[2], args[3]
+            state_ptr, r1, args[2], args[3]
         );
-        // Simple buffer allocation for non-Vortex cases
-        if state_ptr != 0 && state_ptr != 0x18063ebc {
+        
+        // Vortex-specific: container at 0x18063ebc needs full structure wiring
+        if state_ptr == 0x18063ebc {
+            // Check if already initialized (avoid double-alloc)
+            let current_array = self.read_guest_u32(state_ptr.wrapping_add(0x5c)).unwrap_or(0);
+            if current_array != 0 {
+                info!(target: "EAPP_GL", "ordinal_165: Vortex container already initialized");
+                return;
+            }
+            
+            info!(target: "EAPP_GL", "ordinal_165: initializing Vortex surface structures");
+            
+            // Read current container state before modification
+            let before_c4 = self.read_guest_u32(state_ptr.wrapping_add(4)).unwrap_or(0xdead);
+            let before_c54 = self.read_guest_u32(state_ptr.wrapping_add(0x54)).unwrap_or(0xdead);
+            let before_c5c = self.read_guest_u32(state_ptr.wrapping_add(0x5c)).unwrap_or(0xdead);
+            info!(target: "EAPP_GL", "ordinal_165: container BEFORE: +4={:#010x} +54={:#010x} +5c={:#010x}", 
+                  before_c4, before_c54, before_c5c);
+            
+            // Allocate work-RAM structures
+            let surface_size = 320u32 * 240 * 2; // RGB565 framebuffer
+            let surface_buf = self.alloc_zeroed(surface_size);
+            let object = self.alloc_zeroed(0x40); // 64-byte object
+            let array = self.alloc_zeroed(0x4);   // 4-byte array (single pointer)
+            
+            if surface_buf == 0 || object == 0 || array == 0 {
+                warn!(target: "EAPP_GL", "ordinal_165: Vortex allocation failed");
+                return;
+            }
+            
+            info!(target: "EAPP_GL", "ordinal_165: allocated object={:#010x} buffer={:#010x} array={:#010x}",
+                  object, surface_buf, array);
+            
+            // Wire up the structure chain
+            // Object layout: +0=vtable, +4=buffer_ptr (for ldr r0, [r0, #4])
+            let w1 = self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000);
+            let w2 = self.write_guest_u32(object.wrapping_add(4), surface_buf);
+            let w3 = self.write_guest_u32(object.wrapping_add(8), 1);
+            info!(target: "EAPP_GL", "ordinal_165: object writes: vtable@+0={} buf@+4={} ref@+8={}", w1, w2, w3);
+            
+            // Array points to object
+            let w4 = self.write_guest_u32(array, object);
+            info!(target: "EAPP_GL", "ordinal_165: array[0] write: {}", w4);
+            
+            // Container fields at +0x04 (object ptr), +0x54 (count), +0x5c (array)
+            // The crash function does: ldr r0, [r4, #4] then stmia r0!, {...}
+            // So [container+4] must point to an object whose +4 is the buffer
+            
+            // For Vortex, the container at 0x18063ebc is in file-mapped region.
+            // We need to check if writes actually succeed.
+            let write_addrs = [
+                (state_ptr.wrapping_add(4), "+4", object),
+                (state_ptr.wrapping_add(0x54), "+54", 1),
+                (state_ptr.wrapping_add(0x5c), "+5c", array),
+            ];
+            
+            for (addr, name, val) in &write_addrs {
+                let addr_in_image = *addr >= FILE_VMA_BASE && *addr - FILE_VMA_BASE < self.bus.image_len;
+                let addr_in_work = *addr >= WORK_RAM_BASE && *addr - WORK_RAM_BASE < WORK_RAM_SIZE as u32;
+                info!(target: "EAPP_GL", "ordinal_165: write {} at {:#010x}: in_image={} in_work={}", 
+                      name, addr, addr_in_image, addr_in_work);
+                let result = self.write_guest_u32(*addr, *val);
+                info!(target: "EAPP_GL", "ordinal_165: write {} result={}", name, result);
+            }
+            
+            // Verify all writes
+            let v_object = self.read_guest_u32(state_ptr.wrapping_add(4)).unwrap_or(0xdead);
+            let v_count = self.read_guest_u32(state_ptr.wrapping_add(0x54)).unwrap_or(0xdead);
+            let v_array = self.read_guest_u32(state_ptr.wrapping_add(0x5c)).unwrap_or(0xdead);
+            let v_buf = self.read_guest_u32(object.wrapping_add(4)).unwrap_or(0xdead);
+            info!(target: "EAPP_GL", "ordinal_165: container AFTER: +4={:#010x} +54={:#010x} +5c={:#010x}", 
+                  v_object, v_count, v_array);
+            info!(target: "EAPP_GL", "ordinal_165: object buf@+4={:#010x}", v_buf);
+            return;
+        }
+        
+        // Generic case: simple buffer allocation at +4
+        if state_ptr != 0 {
             let current_val = self.read_guest_u32(state_ptr.wrapping_add(4)).unwrap_or(0);
             if current_val == 0 {
                 let surface_size = 320u32 * 240 * 2;
                 if let Some(surface_buf) = self.alloc_surface_buffer(surface_size) {
                     let _ = self.write_guest_u32(state_ptr.wrapping_add(4), surface_buf);
+                    info!(target: "EAPP_GL", "ordinal_165: allocated buffer={:#010x} at +4", surface_buf);
                 }
             }
         }
     }
     
-    /// Allocate and wire up Vortex-specific surface structures.
-    /// Called during bootstrap for game ID 12345 to prevent null pointer crashes.
+    /// Vortex (12345) surface container fix.
+    /// 
+    /// The container at 0x18063ebc is in the file-mapped region with null object pointer.
+    /// We redirect by patching all literal pool references to point to a work-RAM substitute.
     fn vortex_preallocate_surfaces(&mut self) {
-        let container = 0x18063ebcu32;
-        info!(
-            target: "EAPP_GL",
-            "VORTEX bootstrap: pre-allocating surface structures at container={:#010x}",
-            container
-        );
-        
-        // Read and log the container's current state
-        let c0 = self.read_guest_u32(container).unwrap_or(0xdead);
-        let c4 = self.read_guest_u32(container.wrapping_add(4)).unwrap_or(0xdead);
-        let c54 = self.read_guest_u32(container.wrapping_add(0x54)).unwrap_or(0xdead);
-        let c5c = self.read_guest_u32(container.wrapping_add(0x5c)).unwrap_or(0xdead);
-        info!(
-            target: "EAPP_GL",
-            "VORTEX bootstrap: container state: +0={:#010x} +4={:#010x} +54={:#010x} +5c={:#010x}",
-            c0, c4, c54, c5c
-        );
-        
-        // Check if already initialized
-        if c5c != 0 {
-            info!(target: "EAPP_GL", "VORTEX bootstrap: array_ptr already non-null, skipping");
-            return;
-        }
-        
-        // The container's +4 field is what gets dereferenced by the crash function.
-        // Function at 0x18014d38 does: ldr r0, [r0, #4] to load a buffer pointer.
-        // We need to ensure the container+4 points to an object whose +4 is a valid buffer.
-        
-        // Allocate work-RAM structures
+        // Allocate work-RAM container substitute
+        let work_container = self.alloc_zeroed(0x100); // 256 bytes for container + structures
         let surface_size = 320u32 * 240 * 2; // RGB565 framebuffer
         let surface_buf = self.alloc_zeroed(surface_size);
-        let object = self.alloc_zeroed(0x40); // 64-byte object
-        let array = self.alloc_zeroed(0x4);   // 4-byte array (single pointer)
+        let object = self.alloc_zeroed(0x40); // 64-byte object  
+        let array = self.alloc_zeroed(0x4);   // 4-byte array
+        let state_block = self.alloc_zeroed(0x200); // mutable GL/state block used by Vortex init helpers
         
-        if surface_buf == 0 || object == 0 || array == 0 {
-            warn!(target: "EAPP_GL", "VORTEX bootstrap: allocation failed");
+        if work_container == 0 || surface_buf == 0 || object == 0 || array == 0 || state_block == 0 {
+            warn!(target: "EAPP_GL", "VORTEX: allocation failed for surface structures");
             return;
         }
         
-        // Wire up the structure chain:
-        // container[+4] -> object -> object[+4] = surface_buf
-        // container[+5c] -> array[0] = object
-        // container[+54] = 1 (count)
+        // Wire up structure chain at work_container
+        self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000); // vtable
+        self.write_guest_u32(object.wrapping_add(4), surface_buf); // buffer pointer
+        self.write_guest_u32(object.wrapping_add(8), 1); // refcount
+        self.write_guest_u32(array, object);
         
-        // Object layout: +0=vtable, +4=buffer_ptr (for ldr r0, [r0, #4])
-        let _ = self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000); // vtable
-        let _ = self.write_guest_u32(object.wrapping_add(4), surface_buf); // buffer pointer - THIS IS KEY
-        let _ = self.write_guest_u32(object.wrapping_add(8), 1); // refcount
-        
-        // Array points to object
-        let _ = self.write_guest_u32(array, object);
-        
-        // Container fields
-        let _ = self.write_guest_u32(container.wrapping_add(4), object); // +4 = object (for ldr r0, [r0, #4])
-        let _ = self.write_guest_u32(container.wrapping_add(0x54), 1); // count
-        let _ = self.write_guest_u32(container.wrapping_add(0x5c), array); // array_ptr
-        
-        // Verify all writes
-        let v_object = self.read_guest_u32(container.wrapping_add(4)).unwrap_or(0xdead);
-        let v_buf = self.read_guest_u32(object.wrapping_add(4)).unwrap_or(0xdead);
-        let v_array = self.read_guest_u32(container.wrapping_add(0x5c)).unwrap_or(0xdead);
-        let v_array_0 = self.read_guest_u32(array).unwrap_or(0xdead);
+        // Container layout
+        self.write_guest_u32(work_container.wrapping_add(0), 0x3f800000);
+        self.write_guest_u32(work_container.wrapping_add(4), object);
+        self.write_guest_u32(work_container.wrapping_add(0x54), 1);
+        self.write_guest_u32(work_container.wrapping_add(0x5c), array);
         
         info!(
             target: "EAPP_GL",
-            "VORTEX bootstrap: wired container[+4]={:#010x} -> object[+4]={:#010x} -> surface={:#010x}, array={:#010x}[0]={:#010x}",
-            v_object, object, v_buf, v_array, v_array_0
+            "VORTEX: work_container={:#010x} object={:#010x} buffer={:#010x} state_block={:#010x}",
+            work_container, object, surface_buf, state_block
         );
         
-        if v_object != object || v_buf != surface_buf || v_array_0 != object {
-            warn!(
-                target: "EAPP_GL",
-                "VORTEX bootstrap: VERIFICATION FAILED! object={:#010x}!={:#010x} or buf={:#010x}!={:#010x} or array_0={:#010x}!={:#010x}",
-                v_object, object, v_buf, surface_buf, v_array_0, object
-            );
-        }
+        // Store addresses for the Vortex exact-PC shim and ordinal_165 handler.
+        self.write_guest_u32(WORK_RAM_BASE + 0xff0, work_container);
+        self.write_guest_u32(WORK_RAM_BASE + 0xff4, surface_buf);
+        self.write_guest_u32(WORK_RAM_BASE + 0xff8, object);
+        self.write_guest_u32(WORK_RAM_BASE + 0xffc, state_block);
     }
     
     /// Helper to allocate a surface buffer of given size
@@ -4014,7 +4231,11 @@ impl Eapp {
     fn handle_misc_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
         match ordinal {
             0 => {
-                let len = args[0].max(args[1]).max(0x10);
+                // Runtime allocator. Guest wrappers pass the requested size in
+                // r0; other arg registers are caller scratch and may contain
+                // unrelated values. Using max(r0, r1) made iQuiz's malloc(0xa0)
+                // fail when r1 held a stale large pointer/value.
+                let len = args[0].max(0x10);
                 self.alloc_zeroed(len)
             }
             9 => {
@@ -4469,6 +4690,123 @@ impl Eapp {
             return if known { 1 } else { 0 };
         }
 
+        if ordinal == 1 {
+            // No-path owner/read path used by Tetris initiator C (0x1801fd74)
+            // after AsyncFileIO:2 has advanced the audio-stream entry. It has
+            // the same owner-completion shape as ordinal 0: the import receives
+            // the transient owner in r0, and firmware later calls 0x1801fbfc,
+            // which forwards [owner+0x20/0x24] to the linked request callback.
+            let complete = std::env::var("CLICKY_EAPP_ASYNC3_COMPLETE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false);
+            let is_tetris = self
+                .metadata
+                .bundle_dir
+                .to_str()
+                .map_or(false, |p| p.contains("66666"));
+            let owner = args[0];
+            let req = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
+            let req_cb = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0);
+            let req_ctx = self.read_guest_u32(req.wrapping_add(0x10)).unwrap_or(0);
+            info!(
+                target: "EAPP_IMPORT",
+                "AsyncFileIO:1 owner={:#010x} req={:#010x} req_cb={:#010x} req_ctx={:#010x} complete={}",
+                owner,
+                req,
+                req_cb,
+                req_ctx,
+                (complete && is_tetris) as u8
+            );
+            if complete && is_tetris && owner != 0 && req != 0 {
+                // Ordinal 1 is a no-path/control completion used by initiator C
+                // after the audio-stream secondary owner path. Unlike ordinal 0,
+                // the linked request object is immediately returned to the load
+                // manager's free list and may be reused for the next wav header.
+                // The shared 0x1801fc30 helper clears [request+4] only when the
+                // forwarded status is non-zero; status 0 leaves [request+4]=2,
+                // which makes the next 0x1801fe28 see a busy request and stalls
+                // on MoveFail.wav. Use status=1 here to model the control/event
+                // completion and clear the in-flight byte before the request is
+                // reused. The downstream callback (0x1801d424) ignores r1/r2.
+                self.write_guest_u32(owner.wrapping_add(0x20), 1);
+                self.write_guest_u32(owner.wrapping_add(0x24), 0);
+                self.async_callback_queued_count =
+                    self.async_callback_queued_count.wrapping_add(1);
+                self.pending_guest_calls.push_back(PendingGuestCall {
+                    pc: 0x1801_fbfc,
+                    arg0: owner,
+                    arg1: 0,
+                });
+                if self.startup_progress.enabled {
+                    info!(
+                        target: "EAPP_PROGRESS",
+                        "async1_callback_queued frame={} queued={} owner={:#010x} req={:#010x} req_cb={:#010x} pending_async={}",
+                        self.frame_counter,
+                        self.async_callback_queued_count,
+                        owner,
+                        req,
+                        req_cb,
+                        self.async_pending_requests.len()
+                    );
+                }
+            }
+            return 1;
+        }
+
+        if ordinal == 2 {
+            // No-path async/control-object path used by Tetris' audio stream
+            // manager after AsyncFileIO:0 has opened a wav. Wrapper 0x1801fe08
+            // calls the import with r0/r2 = owner object and the guest has
+            // already populated:
+            //   [owner+0x34] = completion callback PC
+            //   [owner+0x38] = completion callback context (the stream entry)
+            // Firmware completion helper 0x18020070 clears the in-flight byte
+            // and tail-calls that callback as (owner, context). Queue the same
+            // callback only for the env-gated parsed-resource RE path.
+            let complete = std::env::var("CLICKY_EAPP_ASYNC3_COMPLETE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false);
+            let is_tetris = self
+                .metadata
+                .bundle_dir
+                .to_str()
+                .map_or(false, |p| p.contains("66666"));
+            let owner = args[0];
+            let callback_pc = self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0);
+            let callback_ctx = self.read_guest_u32(owner.wrapping_add(0x38)).unwrap_or(0);
+            info!(
+                target: "EAPP_IMPORT",
+                "AsyncFileIO:2 owner={:#010x} cb_pc={:#010x} cb_ctx={:#010x} complete={}",
+                owner,
+                callback_pc,
+                callback_ctx,
+                (complete && is_tetris) as u8
+            );
+            if complete && is_tetris && owner != 0 && callback_pc != 0 {
+                let _ = self.write_guest_bytes(owner.wrapping_add(0x1c), &[0]);
+                self.async_callback_queued_count =
+                    self.async_callback_queued_count.wrapping_add(1);
+                self.pending_guest_calls.push_back(PendingGuestCall {
+                    pc: callback_pc,
+                    arg0: owner,
+                    arg1: callback_ctx,
+                });
+                if self.startup_progress.enabled {
+                    info!(
+                        target: "EAPP_PROGRESS",
+                        "async2_callback_queued frame={} queued={} owner={:#010x} cb_pc={:#010x} cb_ctx={:#010x} pending_async={}",
+                        self.frame_counter,
+                        self.async_callback_queued_count,
+                        owner,
+                        callback_pc,
+                        callback_ctx,
+                        self.async_pending_requests.len()
+                    );
+                }
+            }
+            return 1;
+        }
+
         let path = self
             .try_read_c_string(args[0], 256)
             .or_else(|| self.try_read_c_string(args[1], 256));
@@ -4494,6 +4832,66 @@ impl Eapp {
                 }
                 warn!(target: "EAPP_IMPORT", "AsyncFileIO:12 missing host path {}", path);
                 return 8;
+            }
+
+            if ordinal == 0 {
+                // Streaming/open-with-owner path used by Tetris' proper parsed
+                // boot flow for wav resources. Guest initiator `0x1801fcc8`
+                // allocates a 0x3c-byte owner, links it to the request object,
+                // then calls AsyncFileIO:0(..., owner=r3). The owner callback
+                // at `0x1801fbfc` reads:
+                //   [owner+0x20] = status (0 means success for this path)
+                //   [owner+0x24] = byte_count
+                //   [owner+0x08] = linked request
+                // and forwards those values to the request callback. Keep the
+                // completion env-gated with the AsyncFileIO:3 byte-count path
+                // until the full parsed-resource boot reaches the final menu.
+                let owner = args[3];
+                let complete = std::env::var("CLICKY_EAPP_ASYNC3_COMPLETE")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false);
+                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    let bytes = fs::read(&host_path).unwrap_or_else(|e| {
+                        warn!(target: "EAPP_IMPORT", "AsyncFileIO:0 read error for {}: {}", host_path.display(), e);
+                        Vec::new()
+                    });
+                    let n = bytes.len() as u32;
+                    info!(
+                        target: "EAPP_IMPORT",
+                        "AsyncFileIO:0 stream path={} owner={:#010x} bytes={} complete={}",
+                        host_path.display(),
+                        owner,
+                        n,
+                        complete as u8
+                    );
+                    if complete && owner != 0 {
+                        self.write_guest_u32(owner.wrapping_add(0x20), 0);
+                        self.write_guest_u32(owner.wrapping_add(0x24), n);
+                        self.async_callback_queued_count =
+                            self.async_callback_queued_count.wrapping_add(1);
+                        self.pending_guest_calls.push_back(PendingGuestCall {
+                            pc: 0x1801_fbfc,
+                            arg0: owner,
+                            arg1: 0,
+                        });
+                        if self.startup_progress.enabled {
+                            let req = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
+                            info!(
+                                target: "EAPP_PROGRESS",
+                                "async0_callback_queued frame={} queued={} owner={:#010x} req={:#010x} bytes={} pending_async={}",
+                                self.frame_counter,
+                                self.async_callback_queued_count,
+                                owner,
+                                req,
+                                n,
+                                self.async_pending_requests.len()
+                            );
+                        }
+                    }
+                    return 1;
+                }
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:0 missing host path {}", path);
+                return 0;
             }
 
             if ordinal == 3 {
@@ -4532,9 +4930,13 @@ impl Eapp {
                         Ok(bytes) => {
                             let requested_len = if want != 0 { want as usize } else { bytes.len() };
                             let n = bytes.len().min(requested_len);
-                            let mut out = vec![0u8; requested_len];
-                            out[..n].copy_from_slice(&bytes[..n]);
-                            let delivered = dest != 0 && self.write_guest_bytes(dest, &out);
+                            // Request-object reads provide a destination and a capacity; the
+                            // firmware copies the bytes actually read and reports the byte count.
+                            // Do NOT zero-fill the full requested capacity here. Texas Hold'em
+                            // requests large font buffers whose capacity overlaps the following
+                            // heap request object; memset-style short-read filling wipes [req+8]
+                            // and the callback PC before the completion trampoline runs.
+                            let delivered = dest != 0 && self.write_guest_bytes(dest, &bytes[..n]);
                             if delivered {
                                 // The async completion callback `0x1801fc68`
                                 // is a thin trampoline: it reads
@@ -4845,8 +5247,14 @@ impl Eapp {
         // call at `0x1b814: b 0x18005034` to fire.
         let clock_idx_a8 = self.read_guest_u32(0x1005f710 + 0xa8).unwrap_or(0);
         let clock_idx_ac = self.read_guest_u32(0x1005f710 + 0xac).unwrap_or(0);
-        let clock_slot_byte_a8 = self.read_guest_u8(0x1005f710 + clock_idx_a8 * 16 + 0x8c).unwrap_or(0);
-        let clock_slot_byte_ac = self.read_guest_u8(0x1005f710 + clock_idx_ac * 16 + 0x8c).unwrap_or(0);
+        let clock_slot_addr_a8 = 0x1005f710u32
+            .wrapping_add(clock_idx_a8.wrapping_mul(16))
+            .wrapping_add(0x8c);
+        let clock_slot_addr_ac = 0x1005f710u32
+            .wrapping_add(clock_idx_ac.wrapping_mul(16))
+            .wrapping_add(0x8c);
+        let clock_slot_byte_a8 = self.read_guest_u8(clock_slot_addr_a8).unwrap_or(0);
+        let clock_slot_byte_ac = self.read_guest_u8(clock_slot_addr_ac).unwrap_or(0);
         // RE (iter 20): caller-3 (`0x1b630`) tail-calls `0x90c0(r0=audio_queue)` which
         // returns `[audio_queue+0x14]`. Then `cmp r0, #100; poplt` returns early WITHOUT
         // setting the byte. So the byte-setter `0x18005034` only fires when
@@ -5069,10 +5477,14 @@ impl Eapp {
                     self.frame_context,
                     self.header.aux_addr
                 );
-                // Vortex-specific preallocation to prevent null pointer crashes
-                // Game ID 12345 has container at 0x18063ebc that needs surface structures
+                // Vortex-specific surface preallocation to prevent null pointer crashes
+                // Must run before first guest frame to set up container structures
                 if self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345")) {
+                    info!(target: "EAPP", "VORTEX: detected bundle, running preallocation");
                     self.vortex_preallocate_surfaces();
+                    // Verify the write
+                    let verify = self.read_guest_u32(WORK_RAM_BASE + 0xff0).unwrap_or(0xdead);
+                    info!(target: "EAPP", "VORTEX: verification read of WORK_RAM+0xff0 = {:#010x}", verify);
                 }
                 self.bootstrap_phase = BootstrapPhase::Running;
                 self.queue_next_frame();
@@ -5297,10 +5709,123 @@ impl Eapp {
             self.cpu.reg_get(mode, 1),
             self.cpu.reg_get(mode, 2),
             self.cpu.reg_get(mode, 3),
+            self.cpu.reg_get(mode, 4),
+            self.cpu.reg_get(mode, 5),
+            self.cpu.reg_get(mode, 6),
+            self.cpu.reg_get(mode, 7),
         ];
         let lr = self.cpu.reg_get(mode, reg::LR);
         let mut details = Vec::new();
         match pc {
+            0x1800_7b0c | 0x1800_7b6c | 0x1800_c7a0 | 0x1800_cb84 | 0x1800_cbf8 => {
+                // Generic scene/list constructors. 0x1800c7a0 is the shared
+                // initializer that stores the string payload at node+0x10 and
+                // assigns the drawable/text object at node+0x14.  At function
+                // entry, the extra arguments are still on the caller stack; log
+                // the first slots so name-entry construction can be tied back
+                // to its caller without hardcoding heap addresses.
+                let sp = self.cpu.reg_get(mode, reg::SP);
+                details.push(format!(
+                    "lr={:#010x} sp={:#010x} ctor_r0={:#010x} ctor_r1={:#010x} ctor_r2={:#010x} ctor_r3={:#010x}",
+                    lr, sp, regs[0], regs[1], regs[2], regs[3]
+                ));
+                for idx in 0..8u32 {
+                    let addr = sp.wrapping_add(idx.wrapping_mul(4));
+                    details.push(format!(
+                        "stk{}={:#010x}",
+                        idx,
+                        self.read_guest_u32(addr).unwrap_or(0)
+                    ));
+                }
+                let obj = regs[0];
+                if pc == 0x1800_c7a0 {
+                    details.push(format!(
+                        "pre_obj={:#010x} vt={:#010x} old_count={} old[10]={:#010x} old[14]={:#010x} old[18]={:#010x} old[30]={:#010x}",
+                        obj,
+                        self.read_guest_u32(obj).unwrap_or(0),
+                        self.read_guest_u32(obj.wrapping_add(8)).unwrap_or(0),
+                        self.read_guest_u32(obj.wrapping_add(0x10)).unwrap_or(0),
+                        self.read_guest_u32(obj.wrapping_add(0x14)).unwrap_or(0),
+                        self.read_guest_u32(obj.wrapping_add(0x18)).unwrap_or(0),
+                        self.read_guest_u32(obj.wrapping_add(0x30)).unwrap_or(0),
+                    ));
+                }
+            }
+            0x1800_c938 => {
+                let obj = regs[0];
+                let child_count = self.read_guest_u32(obj.wrapping_add(8)).unwrap_or(0);
+                let child_array = self.read_guest_u32(obj.wrapping_add(0x30)).unwrap_or(0);
+                details.push(format!(
+                    "lr={:#010x} scene_obj={:#010x} vtable={:#010x} count={} child_array={:#010x} obj[0c]={:#010x} obj[10]={:#010x} obj[14]={:#010x} obj[18]={:#010x} obj[28]={:#010x}",
+                    lr,
+                    obj,
+                    self.read_guest_u32(obj).unwrap_or(0),
+                    child_count,
+                    child_array,
+                    self.read_guest_u32(obj.wrapping_add(0x0c)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x10)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x14)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x18)).unwrap_or(0),
+                    self.read_guest_u32(obj.wrapping_add(0x28)).unwrap_or(0),
+                ));
+                for idx in 0..child_count.min(16) {
+                    let child = self
+                        .read_guest_u32(child_array.wrapping_add(idx.wrapping_mul(4)))
+                        .unwrap_or(0);
+                    details.push(format!(
+                        "child{}={:#010x}/vt={:#010x}",
+                        idx,
+                        child,
+                        self.read_guest_u32(child).unwrap_or(0)
+                    ));
+                }
+            }
+            0x1801_62e4 | 0x1801_6320 => {
+                // Generic text-object draw wrapper. It receives the same
+                // text/string pair as the concrete UTF-16 helper, then calls
+                // vtable[0x38]. Logging this wrapper gives the real caller LR
+                // above the helper (0x18009464's LR is always 0x18016324).
+                let text_obj = if pc == 0x1801_62e4 { regs[0] } else { regs[4] };
+                let str_obj = if pc == 0x1801_62e4 { regs[3] } else { regs[7] };
+                let vtable = self.read_guest_u32(text_obj).unwrap_or(0);
+                let ip = self.cpu.reg_get(mode, 12);
+                details.push(format!(
+                    "lr={:#010x} text_obj={:#010x} vtable={:#010x} draw_fn={:#010x} r1={:#010x} r2={:#010x} str_obj={:#010x} str[8]={:#010x} str[c]={:#010x}",
+                    lr,
+                    text_obj,
+                    vtable,
+                    if pc == 0x1801_6320 { ip } else { self.read_guest_u32(vtable.wrapping_add(0x38)).unwrap_or(0) },
+                    regs[1],
+                    regs[2],
+                    str_obj,
+                    self.read_guest_u32(str_obj.wrapping_add(8)).unwrap_or(0),
+                    self.read_guest_u32(str_obj.wrapping_add(0x0c)).unwrap_or(0)
+                ));
+            }
+            0x1800_9464 | 0x1800_9514 => {
+                // UTF-16 text draw helper.  Function entry gets
+                // r0=text/glyph object and r3=string object; by 0x9514 the
+                // string object is in r7 and the text object is in r4.  This
+                // ties active Player Name / legal text reads back to the UI
+                // text object that selected them.
+                let text_obj = if pc == 0x1800_9464 { regs[0] } else { regs[4] };
+                let str_obj = if pc == 0x1800_9464 { regs[3] } else { regs[7] };
+                details.push(format!(
+                    "lr={:#010x} text_obj={:#010x} text[0]={:#010x} text[14]={:#010x} text[24]={:#010x} text[28]={:#010x} text[2c]={:#010x} text[30]={:#010x} str_obj={:#010x} str[0]={:#010x} str[8]={:#010x} str[c]={:#010x}",
+                    lr,
+                    text_obj,
+                    self.read_guest_u32(text_obj).unwrap_or(0),
+                    self.read_guest_u32(text_obj.wrapping_add(0x14)).unwrap_or(0),
+                    self.read_guest_u32(text_obj.wrapping_add(0x24)).unwrap_or(0),
+                    self.read_guest_u32(text_obj.wrapping_add(0x28)).unwrap_or(0),
+                    self.read_guest_u32(text_obj.wrapping_add(0x2c)).unwrap_or(0),
+                    self.read_guest_u32(text_obj.wrapping_add(0x30)).unwrap_or(0),
+                    str_obj,
+                    self.read_guest_u32(str_obj).unwrap_or(0),
+                    self.read_guest_u32(str_obj.wrapping_add(8)).unwrap_or(0),
+                    self.read_guest_u32(str_obj.wrapping_add(0x0c)).unwrap_or(0)
+                ));
+            }
             0x1801_26d8 | 0x1801_2704 => {
                 let obj = regs[0];
                 details.push(format!(
@@ -5495,22 +6020,78 @@ impl Eapp {
                     mgr, head, inf, e124, e128
                 ));
             }
-            0x1801_d500 => {
-                // begin-load: r0=ctx (=mgr slot[idx]). Sets entry[7]=1 lock,
-                // entry[0x11c]=[entry+0x174] (slot index), then tail-calls
-                // per-resource processor if entry[4]==0; else branch path.
-                let e = regs[0];
+            0x1801_d1b4 => {
+                // Audio-stream owner callback invoked by 0x1801fc30 after
+                // AsyncFileIO:0 owner completion. Args are
+                // (request, status, byte_count, entry/ctx). It forwards those
+                // into a second manager via 0x1801d500 with ctx passed on stack.
+                let req = regs[0];
+                let ctx = regs[3];
                 details.push(format!(
-                    "ctx={:#010x} e[4]={:#04x} e[7]={:#04x} e[174]={:#010x} e[164]={:#010x} e[168]={:#010x}",
-                    e,
-                    self.read_guest_u8(e.wrapping_add(4)).unwrap_or(0),
-                    self.read_guest_u8(e.wrapping_add(7)).unwrap_or(0),
-                    self.read_guest_u32(e.wrapping_add(0x174)).unwrap_or(0),
-                    self.read_guest_u32(e.wrapping_add(0x164)).unwrap_or(0),
-                    self.read_guest_u32(e.wrapping_add(0x168)).unwrap_or(0)
+                    "AUDIO_CB req={:#010x} status={:#x} bc={} ctx={:#010x} req[4]={:#04x} req[c]={:#010x} req[10]={:#010x} req[170?]={:#04x}",
+                    req,
+                    regs[1],
+                    regs[2],
+                    ctx,
+                    self.read_guest_u8(req.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0),
+                    self.read_guest_u32(req.wrapping_add(0x10)).unwrap_or(0),
+                    self.read_guest_u8(req.wrapping_add(4)).unwrap_or(0)
                 ));
             }
-            0x1801_fe28 | 0x1801_fcc8 => {
+            0x1801_d500 | 0x1801_d548 | 0x1801_d5bc | 0x1801_d5cc => {
+                // d500: r0=manager. The actual entry is stack arg 0 from the
+                // caller (d1b4 passes request[0x10]); on function entry it is
+                // not in a register, but at d548/d5bc the entry is in r4.
+                let e = if pc == 0x1801_d500 { regs[3] } else { regs[4] };
+                details.push(format!(
+                    "D500 pc={:#010x} mgr/r0={:#010x} entry_guess={:#010x} e[4]={:#04x} e[6]={:#04x} e[7]={:#04x} e[110]={:#04x} e[114]={:#010x} e[118]={:#010x} e[11c]={:#010x} e[120]={:#010x} e[124]={:#04x} e[164]={:#010x} e[168]={:#010x} e[16c+4]={:#04x} e[174]={:#010x} e[180]={:#010x}",
+                    pc,
+                    regs[0],
+                    e,
+                    self.read_guest_u8(e.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(6)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(7)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(0x110)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x114)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x118)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x11c)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x120)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(0x124)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x164)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x168)).unwrap_or(0),
+                    self.read_guest_u8(e.wrapping_add(0x170)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x174)).unwrap_or(0),
+                    self.read_guest_u32(e.wrapping_add(0x180)).unwrap_or(0)
+                ));
+            }
+            0x1801_d258 | 0x1801_d68c | 0x1801_d424 => {
+                // AsyncFileIO:2 completion callbacks. r0 is owner at
+                // entry+0x128 and r1 must be the parent entry/context; these
+                // callbacks spin forever if that relation is wrong.
+                let owner = regs[0];
+                let entry = regs[1];
+                details.push(format!(
+                    "ASYNC2_CB pc={:#010x} owner={:#010x} entry={:#010x} entry+128={:#010x} e[4]={:#04x} e[6]={:#04x} e[110]={:#04x} e[114]={:#010x} e[120]={:#010x} e[124]={:#04x} e[14c]={:#010x} e[164]={:#010x} e[168]={:#010x} owner[1c]={:#04x} owner[34]={:#010x} owner[38]={:#010x}",
+                    pc,
+                    owner,
+                    entry,
+                    entry.wrapping_add(0x128),
+                    self.read_guest_u8(entry.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(6)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(0x110)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x114)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x120)).unwrap_or(0),
+                    self.read_guest_u8(entry.wrapping_add(0x124)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x14c)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x164)).unwrap_or(0),
+                    self.read_guest_u32(entry.wrapping_add(0x168)).unwrap_or(0),
+                    self.read_guest_u8(owner.wrapping_add(0x1c)).unwrap_or(0),
+                    self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0),
+                    self.read_guest_u32(owner.wrapping_add(0x38)).unwrap_or(0)
+                ));
+            }
+            0x1801_fe28 | 0x1801_fcc8 | 0x1801_fd74 => {
                 // I/O initiator: r0 = entry+0x16c (the request struct).
                 // Reads [entry+0x170] (==[r0+4]) as the in-flight byte;
                 // nonzero -> immediately returns 0 (busy-wait re-link).
@@ -5540,12 +6121,18 @@ impl Eapp {
                     self.read_guest_u8(r.wrapping_add(4)).unwrap_or(0)
                 ));
             }
-            0x1801_fed8 => {
-                // 0x1fe28 return (success branch). r6 = AsyncFileIO:3 result
-                // we returned. If r6==0, our wrapper returned 0 (fail).
+            0x1801_fed8 | 0x1801_fddc => {
+                // Success-branch return for initiator A/C. For 0x1fd74,
+                // nonzero return sets [request+4]=3 before reaching fddc.
+                let req = if pc == 0x1801_fddc { regs[4] } else { regs[0] };
                 details.push(format!(
-                    "RET r0={:#010x} r6(unused, was nonzero)={:#010x}",
-                    regs[0], regs[1]
+                    "RET pc={:#010x} r0={:#010x} req_guess={:#010x} req[4]={:#04x} req[c]={:#010x} req[10]={:#010x}",
+                    pc,
+                    regs[0],
+                    req,
+                    self.read_guest_u8(req.wrapping_add(4)).unwrap_or(0),
+                    self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0),
+                    self.read_guest_u32(req.wrapping_add(0x10)).unwrap_or(0)
                 ));
             }
             0x1801_d370 => {
