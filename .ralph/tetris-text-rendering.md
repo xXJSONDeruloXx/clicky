@@ -2873,3 +2873,368 @@ never activates on the path that parses strings.
    host-event flags should be turned into a non-diagnostic scheduler and remove
    the older downstream `CLICKY_EAPP_AUDIO_SLOT_BIT` hook.
 
+
+## Iteration 24 — traced `0x1801f000` cluster; it is fallback-only and points at Options strings
+
+Goal this iteration: work the iter-23 next items: add direct tracing for the
+`0x1801f000..0x1801f7ff` menu/resource cluster, compare default fallback vs
+`CLICKY_EAPP_ASYNC3_COMPLETE=1`, and identify what state/resource path chooses
+legal-text objects versus menu/resource string objects.
+
+### Item 1 — added direct cluster traces
+
+Extended the env-gated `EAPP_STRING_TRACE=1` PC list with the suspected
+menu/resource cluster:
+
+- constructor / setup: `0x1801eed8`, `0x1801f250`, `0x1801f394`,
+  `0x1801f794`
+- runtime/update helpers: `0x1801ef1c`, `0x1801f000`, `0x1801f1b4`,
+  `0x1801f4a8`, `0x1801f558`, `0x1801f5a8`, `0x1801f69c`, `0x1801f72c`
+- getter callsites: `0x1801f068`, `0x1801f474`, `0x1801f6ec`
+
+The trace now dumps compact object fields for `r0` and `r4`, including
+`obj+0x50` as a string object (`ptr/len`) when present. This is diagnostic-only
+and disabled unless `EAPP_STRING_TRACE=1`.
+
+### Item 2 — default fallback vs proper parsed-resource path
+
+Ran direct binary `--cycles 8000000` traces so trace totals drain cleanly:
+
+- default fallback: `/tmp/tet_iter24_default_menucluster.log`
+- proper parsed path: `/tmp/tet_iter24_async3_menucluster.log`
+
+Key totals:
+
+```text
+default:
+  0x1801f794=1  0x1801f5a8=1  0x1801f4a8=1
+  0x1801f900=1  0x1801fb3c=1  0x1801e708=1
+  0x1801f6ec=1  (lr=0x18017c18)  0x18012704 lr=0x1801f6f0=1
+  async req/queued/callbacks/staged = 51
+
+ASYNC3_COMPLETE=1:
+  NO hits in the 0x1801f000 menu/resource cluster
+  string getters only from lr=0x18009518/0x18009524 legal-text renderer
+  async req/queued/callbacks/staged = 40
+```
+
+This is a major correction: the `0x1801f000..0x1801f7ff` cluster is **not** the
+missing main-menu-label renderer on the proper parsed path. It only activates in
+the old/default fallback path. When `Strings.dta` parses correctly, this entire
+cluster is absent and only legal-text string objects are read.
+
+### Item 3 — decoded what the fallback-only cluster points at
+
+Default fallback creates a `0x18023ea4` vtable object at `0x101a7830` via the
+vtable function `0x1801c940` (vtable pointer appears at `0x18023e00`). Its
+`0x1801f794` constructor is called from `lr=0x1801c95c`; then `0x1801f5a8`,
+`0x1801f4a8`, and `0x1801f900` run.
+
+Important object fields after `0x1801f5a8` / `0x1801f4a8`:
+
+```text
+obj=0x101a7830
+obj+0x50 = 0x101a99f0  (string object used by the cluster)
+obj+0x58 = 0x100ee830
+obj+0x5c = 0x100ee850
+obj+0x60 = 0x100ee870
+obj+0x64 = 0x100ee890
+obj+0x68 = 0x100ee8b0
+obj+0x6c = 0x100ee8d0
+obj+0x70 = 0x100ee8f0
+obj+0x74 = 0x100eecf0
+```
+
+Decoding those selected-language string objects against `Strings.dta` shows they
+are **Options submenu strings**, not the oracle main-menu labels:
+
+```text
+0x100ee830 -> TET_STRING_MUSIC_AUTO   -> "Game Music: Auto"
+0x100ee850 -> TET_STRING_MUSIC_ON     -> "Game Music: On"
+0x100ee870 -> TET_STRING_MUSIC_OFF    -> "Game Music: Off"
+0x100ee890 -> TET_STRING_EFFECTS_ON   -> "Effects: On"
+0x100ee8b0 -> TET_STRING_EFFECTS_OFF  -> "Effects: Off"
+0x100ee8d0 -> TET_STRING_GHOST_ON     -> "Ghost: On"
+0x100ee8f0 -> TET_STRING_GHOST_OFF    -> "Ghost: Off"
+0x100eecf0 -> TET_STRING_BACKLIGHT    -> "Brightness"
+```
+
+So the fallback cluster is an Options/settings object, explaining why the old
+fallback screen was menu-ish but not expected `MENU` / `PLAY` / `VOLUME` /
+`OPTIONS` / `RECORDS` / `HELP` / `EXIT`.
+
+### Item 4 — likely branch point moved earlier to resource completion/progress
+
+The default fallback path makes **51** async requests and hits the file/resource
+callbacks around `0x1801e0fc/0x1801e45c/0x1801e484` ten times, with zero byte
+counts and names that decode as `.wav` resources (e.g. `Menu.wav`, `GameOver.wav`,
+`Hold.wav`, etc.). It also hits `0x18015308` three times with
+`byte_count_in=0`.
+
+The proper `ASYNC3_COMPLETE=1` path makes **40** async requests, hits those
+file/resource callbacks only once, parses all 97 strings, and then renders only
+legal-text objects (`0x100f0b00` chunks). No `0x1fxxx` menu/resource object is
+constructed.
+
+Disassembly of the `Strings.dta` second-stage callback `0x18004fac` shows it is
+key state/progress plumbing:
+
+```armasm
+0x18004fac: r3 = 0x18025674
+0x18004fb4: r1 = [r3+0x2c] + 1
+0x18004fb8: r2 = [r3+0x04]       ; [0x18025678] loader/progress count
+...
+case r2==1: copy [desc+0x124] -> [r3+0x24], set [r3+4]=2
+case r2==5: copy [desc+0x124] -> [r3+0x10], set [r3+4]=6
+case r2==6: copy [desc+0x124] -> [r3+0x14], set [r3+4]=7
+then branch to 0x18003bd0
+```
+
+This suggests the decision between fallback options-object construction and the
+proper legal-text path is **earlier than the `0x1fxxx` cluster**, in the
+resource/progress state machine around `0x18004fac`, `0x18003bd0`, and the
+`0x18025674/0x18025678` state struct. The `0x1fxxx` cluster is downstream of
+the fallback branch and should not be treated as the missing main-menu renderer.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo build -p clicky-desktop --bin eapp` → passed
+- Default headed smoke after diagnostic-only code changes:
+  `/tmp/tet_iter24_default_headed.log`
+  - 0 fatal lines
+  - 0 frames with nonzero `skipped=`
+  - maxframe 190
+
+### Next priorities for iteration 25
+
+1. Trace the earlier resource/progress branch around `0x18004fac` and
+   `0x18003bd0`, plus vtable/object init entry `0x1801c940`, to identify why
+   `ASYNC3_COMPLETE=1` chooses the legal-text-only path and never constructs
+   the menu/options object graph.
+2. Decode `0x18003bd0` and the writers/readers of `0x18025674..0x180256a4`
+   beyond the already-known byte-setter/progress counter.
+3. Search for the true main-menu object constructor separately; the
+   `0x1801f000` cluster is now identified as fallback Options/settings content,
+   not `PLAY`/`RECORDS`/`HELP` labels.
+
+## Iteration 25 — boot-progress branch traced; proper path now blocked at `AsyncFileIO:0` wav streaming
+
+Goal this iteration: follow the iter-24 next leads around `0x18004fac`,
+`0x18003bd0`, `0x18025674..0x180256a4`, and `0x1801c940`, then search for the
+true main-menu object constructor separately.
+
+### Item 1 — added focused boot-progress/state-4 traces
+
+Extended `EAPP_STRING_TRACE=1` with diagnostic-only PCs:
+
+- boot dispatcher/state cases: `0x18003bd0`, `0x18003c08`, `0x18003c68`,
+  `0x18003c74`, `0x18003d40`, `0x18003d60`, `0x18003da8`
+- Strings second-stage callback: `0x18004fac`
+- wav descriptor scanner/advance: `0x18005400`, `0x18005468`, `0x18005480`
+- generic descriptor registrar: `0x18015c30`, `0x18015c74`
+- fallback options/settings constructor: `0x1801c940`
+
+The trace dumps the boot-progress struct at `0x18025674`, selected
+`Strings.dta` descriptor fields, and parent object fields for `0x1801c940`.
+
+### Item 2 — decoded `0x18003bd0` and the state-4 scanner
+
+Static disassembly artifacts:
+
+- `/tmp/tet_iter25_03bd0_04088.dis`
+- `/tmp/tet_iter25_05020_05420.dis`
+- `/tmp/tet_iter25_05400_055a0.dis`
+- `/tmp/tet_iter25_15280_15d20.dis`
+- `/tmp/tet_iter25_1fcc8.dis`
+- `/tmp/tet_iter25_1fbfc.dis`
+
+`0x18003bd0` is the boot resource-progress dispatcher over base
+`0x18025674`; it dispatches on `[base+4]`:
+
+```text
+state 0/1 -> 0x18003c08: allocate buffer and request Strings.dta
+state 2/3 -> 0x18003c68: branch through 0x18004228
+state 4   -> 0x18003c74: build ten .wav descriptors, then register 0x18005400
+state 5   -> 0x18003d60: request prefs.sav
+state 6   -> 0x18003da8: request game.sav
+state >=7 -> done/no-op
+```
+
+`0x18004fac` is the `Strings.dta` second-stage callback/progress updater. It
+reads `[0x18025678]` (`[base+4]`) and, for specific states, copies
+`[desc+0x124]` byte_count into boot fields and advances `[base+4]`:
+
+```text
+when count==1: [base+0x24] = Strings.dta byte_count; [base+4] = 2
+when count==5: [base+0x10] = prefs.sav byte_count;  [base+4] = 6
+when count==6: [base+0x14] = game.sav byte_count;   [base+4] = 7
+```
+
+`0x18005400` is the state-4 wav-descriptor scanner. It increments:
+
+- `[base+0x2c]` = total state-4 callback count
+- `[base+0x28]` = current wav descriptor index
+
+It calls `0x18015c30(next_desc, 0x18005400, 0)` until ten descriptors have
+reported done, then `0x18005480` stores `[base+4]=5` and re-enters
+`0x18003bd0` so the boot flow loads `prefs.sav` and `game.sav`.
+
+The ten descriptors are:
+
+```text
+Drop.wav, Move.wav, MoveFail.wav, Hold.wav, Clear.wav,
+Tetris.wav, Level.wav, GameOver.wav, Lock.wav, Menu.wav
+```
+
+### Item 3 — paired dynamic trace: exact fork between fallback and proper path
+
+Ran paired traces:
+
+- default fallback: `/tmp/tet_iter25_default_state4.log`
+- parsed-resource path: `/tmp/tet_iter25_async3_state4.log`
+
+Default/fallback path:
+
+```text
+AsyncFileIO:3 requests = 51
+0x18003bd0=7, 0x18004fac=3
+0x18005400=10, 0x18005468=9, 0x18005480=1
+0x18003d60=1, 0x18003da8=1
+0x1801c940=1, 0x1801f794=1
+requested resources include all 10 wavs + prefs.sav + game.sav
+```
+
+Default keeps byte_count zero for the wav header loads. Example `Drop.wav`:
+
+```text
+req+0x20=0, req+0x24=0
+0x1801d370 -> proc=0x1801e45c bc=0
+0x1801e484 -> 0x18015c10 -> callback 0x18005400
+```
+
+That zero-byte fallback path calls `0x18005400` immediately for each wav
+header, reaches `0x18005480`, advances to states 5/6, loads saves, and then
+constructs the fallback Options/settings object (`0x1801c940` -> `0x1801f794`).
+
+Proper parsed path (`CLICKY_EAPP_ASYNC3_COMPLETE=1`):
+
+```text
+AsyncFileIO:3 requests = 40
+0x18003bd0=4, 0x18004fac=1
+0x18015c30=1, 0x18015c74=1
+0x18005400=0, 0x18005480=0
+0x18003d60=0, 0x18003da8=0
+0x1801c940=0, 0x1801f794=0
+requested wavs: Drop.wav only
+```
+
+The first `Drop.wav` header now reports real completion metadata:
+
+```text
+req+0x20=1, req+0x24=44
+0x1801d370 -> proc=0x1801e45c status=1 bc=44
+0x1801e484 stores header byte_count=44 and enters the audio decode/setup path
+Audio:10/12/11/8/9/18/17/7/23 run
+then 0x1801fcc8 calls AsyncFileIO:0 path=Drop.wav
+```
+
+This is the new blocker. `AsyncFileIO:0` currently only logs the path and falls
+through to generic `return 1`; it does **not** copy data, set completion fields,
+or queue the owner callback. Therefore the `0x1801fcc8` initiator-B request
+never completes, `0x18005400` is never called, state 4 never reaches
+`0x18005480`, and the proper parsed path never reaches prefs/game loading or
+object construction.
+
+### Item 4 — decoded the missing `AsyncFileIO:0` completion shape enough for next step
+
+`0x1801fcc8` is initiator-B for the wav/audio streaming path:
+
+```text
+r0 = request/entry+0x16c
+if [r0+4] == 0:
+  allocate 0x3c-byte owner
+  initialize owner with callback 0x1801fbfc
+  link owner <-> request via 0x180200ac
+  call import 0x18000638 => AsyncFileIO:0(mode, path, flag, owner)
+  if import returns nonzero: [request+4] = 1
+```
+
+`0x1801fbfc(owner)` is the expected completion callback. It reads owner fields,
+frees the owner, then falls through to `0x1801fc30(request, status, byte_count)`.
+`0x1801fc30` sets `[request+4]=2` when `status==0`, or clears it on nonzero
+status, and invokes `[request+0x0c]` if present. So a real `AsyncFileIO:0`
+emulation probably needs to store status/byte_count in the owner and queue
+`0x1801fbfc(owner)` (analogous to ordinal 3's queued `0x1801fc68(req, ctx)`).
+
+This explains why the old default path reached the fallback options object: it
+never exercised the real wav/audio streaming branch because all wav byte counts
+were zero. The correct path is not stuck on legal text anymore in an abstract
+way; it is concretely stuck because ordinal 0's audio-file completion ABI is
+unimplemented.
+
+### Item 5 — true main-menu constructor search updated
+
+`0x1801c940` is confirmed as the **fallback Options/settings** object
+constructor and only appears on the default zero-byte wav path. It is not the
+main-menu label constructor. In the proper path the boot flow never gets far
+enough to search meaningful menu constructors because state 4 stalls before
+saves and before any object graph beyond the legal-screen resources. The next
+useful search for the true main-menu constructor should happen after
+`AsyncFileIO:0` completion is emulated enough to let state 4 drain naturally.
+
+### Verification
+
+- `cargo test -p clicky-core --lib eapp` → 16 passed
+- `cargo build -p clicky-desktop --bin eapp` → passed
+- Default headed smoke after diagnostic-only changes:
+  `/tmp/tet_iter25_default_headed.log`
+  - 0 fatal lines
+  - 0 frames with nonzero `skipped=`
+  - maxframe 183
+
+### Cross-Game Smoke Test Results (Iteration 26)
+
+Headed smoke test of all 16 clickwheel games in sister directories:
+
+| Game ID | Name | Status | Draws Rendered | Notes |
+|---------|------|--------|----------------|-------|
+| 11002 | iQuiz | ❌ CRASHED | 0 | FatalMemException - needs investigation |
+| 12345 | Vortex | ❌ CRASHED | 0 | FatalMemException - needs investigation |
+| 14004 | Ms. PAC-MAN | ✅ OK | 2430 | High draw count, all skips (zero-UV path) |
+| 1500C | The Sims Bowling | ✅ OK | 230 | Moderate draws, all skips |
+| 1500E | The Sims Pool | ✅ OK | 237 | Moderate draws, all skips |
+| 1B200 | LOST | ✅ OK | 0 | Zero draws rendered (blank/black screen) |
+| 33333 | Texas Hold'em | ❌ CRASHED | 0 | FatalMemException - needs investigation |
+| 44444 | Zuma | ✅ OK | 42 | Low draw count, all skips |
+| 50513 | Sudoku | ✅ OK | 2 | Very low draw count |
+| 50514 | Royal Solitaire | ✅ OK | 3 | Very low draw count |
+| 55555 | Bejeweled | ✅ OK | 180 | Moderate draws, all skips |
+| 66666 | Tetris | ✅ OK | 987 | Good draw count, our golden regression |
+| 77777 | Mahjong | ✅ OK | 1951 | High draw count, all skips |
+| 88888 | Mini Golf | ✅ OK | 1107 | Good draw count, all skips |
+| 99999 | Cubis 2 | ✅ OK | 719 | Moderate draws, all skips |
+| AAAAA | PAC-MAN | ✅ OK | 4620 | Very high draw count, all skips |
+
+**Summary:**
+- 13/16 games run without crashes (81% success rate)
+- 3 games crash with FatalMemException: iQuiz (11002), Vortex (12345), Texas Hold'em (33333)
+- All non-crashed games show 0 fatals, 0 skipped draws in the smoke test
+- Tetris remains the golden regression with good draw count and visual output
+- Most games show "all skips" pattern - they use the zero-UV fallback path rather than texgen text
+- The three crashes likely need runtime/ABI fixes similar to what Tetris required
+
+**Log location:** `/tmp/games_headed_test_20260621_213155/`
+
+## Next priorities for iteration 26
+
+1. Implement/env-gate a correct-enough `AsyncFileIO:0` completion path for the
+   wav/audio streaming initiator-B:
+   - resolve path from args 0/1,
+   - copy/read as needed for the owner/request shape,
+   - set owner completion fields (`status=0`, `byte_count` likely file bytes),
+   - queue `0x1801fbfc(owner)`.
+2. Re-run `CLICKY_EAPP_ASYNC3_COMPLETE=1` and check whether `0x18005400` fires
+   ten times, `0x18005480` advances state 4→5, and `prefs.sav`/`game.sav` load.
+3. Only after the proper path reaches post-save object construction, resume the
+   search for the true main-menu label constructor/getter path.

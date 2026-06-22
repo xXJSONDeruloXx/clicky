@@ -69,14 +69,41 @@ const TEXT_FORMAT_TIME_ENTRY_PC: u32 = 0x1800_83b4;
 /// path. These are reverse-engineering diagnostics only; default execution is
 /// unchanged unless `EAPP_STRING_TRACE=1` is set.
 const STRING_TRACE_PCS: &[u32] = &[
+    0x1800_3bd0, // boot resource-progress dispatcher over 0x18025674 state
+    0x1800_3c08, // state 0/1: allocate/load Strings.dta
+    0x1800_3c68, // state 2/3: transition through 0x4228
+    0x1800_3c74, // state 4: build wav resource descriptors
+    0x1800_3d40, // state 4 tail: register wav descriptor callback
+    0x1800_3d60, // state 5: request prefs.sav
+    0x1800_3da8, // state 6: request game.sav
+    0x1800_4fac, // Strings.dta second-stage callback / progress updater
+    0x1800_5400, // state-4 wav descriptor callback/scanner
+    0x1800_5468, // state-4 scanner tail-calls 0x15c30 for next wav desc
+    0x1800_5480, // state-4 complete: set boot state 5 and re-enter 0x03bd0
     0x1801_26d8, // string object value-ptr getter: returns [obj+8]
     0x1801_2704, // string object length getter: returns [obj+0xc]
     0x1801_270c, // string object setter: [obj+8]=ptr, [obj+0xc]=len
+    0x1801_c940, // options/settings object constructor from vtable 0x18023e00
     0x1801_d76c, // dispatcher: pop head of pending list, link/unlink entry
     0x1801_e0fc, // file-table parse step
     0x1801_e45c, // file-table async completion trampoline
     0x1801_e484, // file-table completion/update body
     0x1801_e708, // resource/menu object activation
+    0x1801_eed8, // menu/resource ctor helper: build display/list object
+    0x1801_ef1c, // menu/resource state selector: chooses [0x60/0x58/0x5c]
+    0x1801_f000, // menu/resource layout builder (uses string object at +0x50)
+    0x1801_f068, // menu/resource layout: string length getter callsite
+    0x1801_f1b4, // menu/resource dimension update; calls 0x1f000 on change
+    0x1801_f250, // menu/resource deserialize/update from PRCT stream
+    0x1801_f394, // menu/resource serialize/writeback to PRCT stream
+    0x1801_f474, // menu/resource serialize: string length getter callsite
+    0x1801_f4a8, // menu/resource runtime refresh from prefs/save globals
+    0x1801_f558, // menu/resource runtime state branch on [obj+0xc]
+    0x1801_f5a8, // menu/resource reset/default-state helper
+    0x1801_f69c, // menu/resource x/offset query helper
+    0x1801_f6ec, // menu/resource non-empty string predicate
+    0x1801_f72c, // menu/resource activation/render handoff
+    0x1801_f794, // menu/resource constructor with six string fields
     0x1801_f900, // menu resource array construction
     0x1801_fa90, // menu resource lookup/dispatch entry
     0x1801_faa8, // menu resource lookup loaded table entry
@@ -93,6 +120,8 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_fec8, // AFTER AsyncFileIO:3 store [r+4]: capture the in-flight byte
     0x1801_fed8, // 0x1fe28 success-branch return; capture r6 (AsyncFileIO:3 result)
     0x1801_5308, // Strings.dta processor (offset base path)
+    0x1801_5c30, // generic descriptor async registrar used by state-4 wav list
+    0x1801_5c74, // descriptor registrar return from 0x1dff8 (r0=success)
     0x1801_9770, // texture processor (mirror path, +0xc offset)
 ];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
@@ -5177,6 +5206,56 @@ impl Eapp {
                     self.read_guest_u32(obj.wrapping_add(0x0c)).unwrap_or(0)
                 ));
             }
+            0x1800_3bd0
+            | 0x1800_3c08
+            | 0x1800_3c68
+            | 0x1800_3c74
+            | 0x1800_3d40
+            | 0x1800_3d60
+            | 0x1800_3da8
+            | 0x1800_4fac
+            | 0x1800_5400
+            | 0x1800_5468
+            | 0x1800_5480 => {
+                // Boot/resource-progress state struct. 0x18003bd0 dispatches
+                // on [base+4]; 0x18004fac is the Strings.dta 2nd-stage cb
+                // that writes selected byte-counts into this struct and bumps
+                // the progress state.
+                let base = 0x1802_5674;
+                for off in [
+                    0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x20, 0x24, 0x28, 0x2c,
+                ] {
+                    details.push(format!(
+                        "boot+{:#04x}={:#010x}",
+                        off,
+                        self.read_guest_u32(base + off).unwrap_or(0)
+                    ));
+                }
+                let desc = 0x1802_995c;
+                for off in [0x11c, 0x120, 0x124, 0x128, 0x12c] {
+                    details.push(format!(
+                        "strdesc+{:#04x}={:#010x}",
+                        off,
+                        self.read_guest_u32(desc + off).unwrap_or(0)
+                    ));
+                }
+                details.push(format!("lr={:#010x}", lr));
+            }
+            0x1801_c940 => {
+                let obj = regs[0];
+                details.push(format!("lr={:#010x} parent={:#010x}", lr, obj));
+                for off in [
+                    0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24,
+                    0x28, 0x2c, 0x30, 0x38, 0x40, 0x44, 0x48, 0x4c, 0xbc, 0xc4,
+                    0xd4, 0xd8, 0xe4,
+                ] {
+                    details.push(format!(
+                        "parent+{:#04x}={:#010x}",
+                        off,
+                        self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)
+                    ));
+                }
+            }
             0x1801_fc68 => {
                 let req = regs[0];
                 for off in [0x08, 0x14, 0x18, 0x20, 0x24, 0x34, 0x38] {
@@ -5189,14 +5268,65 @@ impl Eapp {
                     details.push(format!("obj+{:#04x}={:#010x}", off, self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)));
                 }
             }
-            0x1801_f900 | 0x1801_fa90 | 0x1801_faa8 | 0x1801_fb3c => {
+            0x1801_eed8
+            | 0x1801_ef1c
+            | 0x1801_f000
+            | 0x1801_f068
+            | 0x1801_f1b4
+            | 0x1801_f250
+            | 0x1801_f394
+            | 0x1801_f474
+            | 0x1801_f4a8
+            | 0x1801_f558
+            | 0x1801_f5a8
+            | 0x1801_f69c
+            | 0x1801_f6ec
+            | 0x1801_f72c
+            | 0x1801_f794
+            | 0x1801_f900
+            | 0x1801_fa90
+            | 0x1801_faa8
+            | 0x1801_fb3c => {
                 let global = 0x1802_5668;
                 for off in [0x00, 0x04, 0x08] {
                     details.push(format!("glob+{:#04x}={:#010x}", off, self.read_guest_u32(global + off).unwrap_or(0)));
                 }
-                let obj = regs[0];
-                for off in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14] {
-                    details.push(format!("r0+{:#04x}={:#010x}", off, self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)));
+                let r4 = self.cpu.reg_get(mode, 4);
+                let r5 = self.cpu.reg_get(mode, 5);
+                let r6 = self.cpu.reg_get(mode, 6);
+                details.push(format!("lr={:#010x} r4={:#010x} r5={:#010x} r6={:#010x}", lr, r4, r5, r6));
+
+                // Most `0x1801fxxx` routines take the menu/resource object in
+                // r0 at function entry and keep it in r4 internally. At inner
+                // PCs (e.g. 0x1f558) r0 is often a scalar field, so also dump
+                // r4 when it looks like a work-RAM object.
+                for (label, obj) in [("r0", regs[0]), ("r4", r4)] {
+                    if !(WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&obj) {
+                        continue;
+                    }
+                    for off in [
+                        0x00, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28,
+                        0x2c, 0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54,
+                        0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74, 0x9c, 0xa0,
+                        0xa4,
+                    ] {
+                        details.push(format!(
+                            "{}+{:#04x}={:#010x}",
+                            label,
+                            off,
+                            self.read_guest_u32(obj.wrapping_add(off)).unwrap_or(0)
+                        ));
+                    }
+                    let str_obj = self.read_guest_u32(obj.wrapping_add(0x50)).unwrap_or(0);
+                    if (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&str_obj) {
+                        details.push(format!(
+                            "{}+50.str obj={:#010x} ptr={:#010x} len={:#010x}",
+                            label,
+                            str_obj,
+                            self.read_guest_u32(str_obj.wrapping_add(8)).unwrap_or(0),
+                            self.read_guest_u32(str_obj.wrapping_add(0x0c)).unwrap_or(0)
+                        ));
+                    }
                 }
             }
             0x1801_d644 => {
@@ -5317,6 +5447,24 @@ impl Eapp {
                     "owner={:#010x} status={:#x} bc={} ctx={:#010x} proc={:#010x} desc={:#010x} d[11c]={:#x} d[128]={:#x}",
                     owner, status, byte_count, ctx, processor, desc, idx_word, idx_word_tex
                 ));
+            }
+            0x1801_5c30 | 0x1801_5c74 => {
+                // Generic descriptor async registrar. 0x18003d54 calls this
+                // once for the wav-descriptor list; 0x18005468 re-enters it
+                // for the next descriptor until 0x18005480 advances state 4→5.
+                let desc = regs[0];
+                details.push(format!("lr={:#010x} desc={:#010x}", lr, desc));
+                for off in [
+                    0x00, 0x04, 0x08, 0x0c, 0x100, 0x107, 0x108, 0x109, 0x10c,
+                    0x110,
+                ] {
+                    details.push(format!(
+                        "desc+{:#04x}={:#010x}",
+                        off,
+                        self.read_guest_u32(desc.wrapping_add(off)).unwrap_or(0)
+                    ));
+                }
+                details.push(format!("r0ret/pre={:#010x}", regs[0]));
             }
             0x1801_5308 => {
                 // Strings.dta processor: (r0=res_obj, r1=byte_count, r2=ctx+8,
