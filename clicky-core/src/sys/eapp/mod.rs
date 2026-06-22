@@ -2046,104 +2046,115 @@ impl Eapp {
 
     /// Ordinal 165: surface/context bind (Vortex/iQuiz/Texas Hold'em fix).
     ///
-    /// Vortex crashes at `pc=0x18014d58` with null pointer writes. The issue:
-    /// - Container at 0x18063ebc has: +0x54=count, +0x5c=array_ptr
-    /// - Array contains object pointers; each object has +0=vtable, +4=buffer_ptr
-    /// - The file-mapped container's array_ptr is null, so no objects exist
-    ///
-    /// Fix: Allocate work-RAM structures and wire them up:
-    /// - Allocate array of object pointers
-    /// - Allocate objects with minimal vtable and buffer pointers
-    /// - Update container array_ptr to point to our work-RAM array
-    /// - Update container count
+    /// Vortex crashes at `pc=0x18014d58` with null pointer writes. The game
+    /// expects container structures with valid object arrays and buffers.
+    /// We pre-allocate these during Vortex-specific initialization.
     fn live_handle_ordinal_165(&mut self, args: [u32; 4]) {
+        // This handler is now mostly a no-op - structures are allocated
+        // during bootstrap for Vortex. Just log the call for diagnostics.
         let state_ptr = args[0];
-        // Vortex-specific: container at 0x18063ebc
-        if state_ptr != 0x18063ebc {
-            // For other games, use simple buffer allocation at +4
-            self.live_handle_ordinal_165_simple(args);
-            return;
+        info!(
+            target: "EAPP_GL",
+            "ordinal_165: state_ptr={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+            state_ptr, args[1], args[2], args[3]
+        );
+        // Simple buffer allocation for non-Vortex cases
+        if state_ptr != 0 && state_ptr != 0x18063ebc {
+            let current_val = self.read_guest_u32(state_ptr.wrapping_add(4)).unwrap_or(0);
+            if current_val == 0 {
+                let surface_size = 320u32 * 240 * 2;
+                if let Some(surface_buf) = self.alloc_surface_buffer(surface_size) {
+                    let _ = self.write_guest_u32(state_ptr.wrapping_add(4), surface_buf);
+                }
+            }
         }
-        info!(
-            target: "EAPP_GL",
-            "ordinal_165 VORTEX container={:#010x} r1={:#010x} r2={:#010x}",
-            state_ptr, args[1], args[2]
-        );
-        // Read current container state
-        let count = self.read_guest_u32(state_ptr.wrapping_add(0x54)).unwrap_or(0);
-        let array_ptr = self.read_guest_u32(state_ptr.wrapping_add(0x5c)).unwrap_or(0);
-        info!(
-            target: "EAPP_GL",
-            "ordinal_165 VORTEX current count={} array_ptr={:#010x}",
-            count, array_ptr
-        );
-        if array_ptr != 0 {
-            // Already initialized
-            return;
-        }
-        // Allocate work-RAM structures
-        // Surface buffer: 320x240 RGB565
-        let surface_size = 320u32 * 240 * 2;
-        let surface_buf = self.alloc_zeroed(surface_size);
-        // Object: vtable + refcount + buffer_ptr + ... (64 bytes)
-        let object_size = 0x40u32;
-        let object = self.alloc_zeroed(object_size);
-        // Array: single object pointer (4 bytes)
-        let array_size = 0x4u32;
-        let array = self.alloc_zeroed(array_size);
-        info!(
-            target: "EAPP_GL",
-            "ordinal_165 VORTEX allocated surface={:#010x} object={:#010x} array={:#010x}",
-            surface_buf, object, array
-        );
-        if surface_buf == 0 || object == 0 || array == 0 {
-            warn!(target: "EAPP_GL", "ordinal_165 VORTEX allocation failed");
-            return;
-        }
-        // Wire up the structures:
-        // Object: +0 = minimal vtable (return 1), +4 = refcount 1, +8 = buffer_ptr
-        let _ = self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000); // dummy vtable
-        let _ = self.write_guest_u32(object.wrapping_add(4), 1); // refcount
-        let _ = self.write_guest_u32(object.wrapping_add(8), surface_buf); // buffer
-        // Array[0] = object
-        let _ = self.write_guest_u32(array, object);
-        // Container: +0x54 = count 1, +0x5c = array
-        let _ = self.write_guest_u32(state_ptr.wrapping_add(0x54), 1);
-        let _ = self.write_guest_u32(state_ptr.wrapping_add(0x5c), array);
-        // Verify the writes by reading back
-        let verify_count = self.read_guest_u32(state_ptr.wrapping_add(0x54)).unwrap_or(0xdead);
-        let verify_array = self.read_guest_u32(state_ptr.wrapping_add(0x5c)).unwrap_or(0xdead);
-        let verify_array_0 = self.read_guest_u32(array).unwrap_or(0xdead);
-        let verify_obj_vt = self.read_guest_u32(object.wrapping_add(0)).unwrap_or(0xdead);
-        let verify_obj_ref = self.read_guest_u32(object.wrapping_add(4)).unwrap_or(0xdead);
-        let verify_obj_buf = self.read_guest_u32(object.wrapping_add(8)).unwrap_or(0xdead);
-        info!(
-            target: "EAPP_GL",
-            "ordinal_165 VORTEX wired: surface={:#010x} -> object={:#010x} -> array={:#010x} -> container. Verify: count={:#x} array={:#x} array[0]={:#x} obj[0]={:#x} obj[4]={:#x} obj[8]={:#x}",
-            surface_buf, object, array, verify_count, verify_array, verify_array_0, verify_obj_vt, verify_obj_ref, verify_obj_buf
-        );
     }
-
-    /// Simple ordinal 165 handler for non-Vortex games - just allocate surface buffer at +4
-    fn live_handle_ordinal_165_simple(&mut self, args: [u32; 4]) {
-        let state_ptr = args[0];
-        if state_ptr == 0 {
+    
+    /// Allocate and wire up Vortex-specific surface structures.
+    /// Called during bootstrap for game ID 12345 to prevent null pointer crashes.
+    fn vortex_preallocate_surfaces(&mut self) {
+        let container = 0x18063ebcu32;
+        info!(
+            target: "EAPP_GL",
+            "VORTEX bootstrap: pre-allocating surface structures at container={:#010x}",
+            container
+        );
+        
+        // Read and log the container's current state
+        let c0 = self.read_guest_u32(container).unwrap_or(0xdead);
+        let c4 = self.read_guest_u32(container.wrapping_add(4)).unwrap_or(0xdead);
+        let c54 = self.read_guest_u32(container.wrapping_add(0x54)).unwrap_or(0xdead);
+        let c5c = self.read_guest_u32(container.wrapping_add(0x5c)).unwrap_or(0xdead);
+        info!(
+            target: "EAPP_GL",
+            "VORTEX bootstrap: container state: +0={:#010x} +4={:#010x} +54={:#010x} +5c={:#010x}",
+            c0, c4, c54, c5c
+        );
+        
+        // Check if already initialized
+        if c5c != 0 {
+            info!(target: "EAPP_GL", "VORTEX bootstrap: array_ptr already non-null, skipping");
             return;
         }
-        let current_val = self.read_guest_u32(state_ptr.wrapping_add(4)).unwrap_or(0);
-        if current_val != 0 {
-            return;
-        }
-        let surface_size = 320u32 * 240 * 2;
+        
+        // The container's +4 field is what gets dereferenced by the crash function.
+        // Function at 0x18014d38 does: ldr r0, [r0, #4] to load a buffer pointer.
+        // We need to ensure the container+4 points to an object whose +4 is a valid buffer.
+        
+        // Allocate work-RAM structures
+        let surface_size = 320u32 * 240 * 2; // RGB565 framebuffer
         let surface_buf = self.alloc_zeroed(surface_size);
-        if surface_buf != 0 {
-            let _ = self.write_guest_u32(state_ptr.wrapping_add(4), surface_buf);
-            info!(
+        let object = self.alloc_zeroed(0x40); // 64-byte object
+        let array = self.alloc_zeroed(0x4);   // 4-byte array (single pointer)
+        
+        if surface_buf == 0 || object == 0 || array == 0 {
+            warn!(target: "EAPP_GL", "VORTEX bootstrap: allocation failed");
+            return;
+        }
+        
+        // Wire up the structure chain:
+        // container[+4] -> object -> object[+4] = surface_buf
+        // container[+5c] -> array[0] = object
+        // container[+54] = 1 (count)
+        
+        // Object layout: +0=vtable, +4=buffer_ptr (for ldr r0, [r0, #4])
+        let _ = self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000); // vtable
+        let _ = self.write_guest_u32(object.wrapping_add(4), surface_buf); // buffer pointer - THIS IS KEY
+        let _ = self.write_guest_u32(object.wrapping_add(8), 1); // refcount
+        
+        // Array points to object
+        let _ = self.write_guest_u32(array, object);
+        
+        // Container fields
+        let _ = self.write_guest_u32(container.wrapping_add(4), object); // +4 = object (for ldr r0, [r0, #4])
+        let _ = self.write_guest_u32(container.wrapping_add(0x54), 1); // count
+        let _ = self.write_guest_u32(container.wrapping_add(0x5c), array); // array_ptr
+        
+        // Verify all writes
+        let v_object = self.read_guest_u32(container.wrapping_add(4)).unwrap_or(0xdead);
+        let v_buf = self.read_guest_u32(object.wrapping_add(4)).unwrap_or(0xdead);
+        let v_array = self.read_guest_u32(container.wrapping_add(0x5c)).unwrap_or(0xdead);
+        let v_array_0 = self.read_guest_u32(array).unwrap_or(0xdead);
+        
+        info!(
+            target: "EAPP_GL",
+            "VORTEX bootstrap: wired container[+4]={:#010x} -> object[+4]={:#010x} -> surface={:#010x}, array={:#010x}[0]={:#010x}",
+            v_object, object, v_buf, v_array, v_array_0
+        );
+        
+        if v_object != object || v_buf != surface_buf || v_array_0 != object {
+            warn!(
                 target: "EAPP_GL",
-                "ordinal_165 surface_bind state={:#010x} buf={:#010x}",
-                state_ptr, surface_buf
+                "VORTEX bootstrap: VERIFICATION FAILED! object={:#010x}!={:#010x} or buf={:#010x}!={:#010x} or array_0={:#010x}!={:#010x}",
+                v_object, object, v_buf, surface_buf, v_array_0, object
             );
         }
+    }
+    
+    /// Helper to allocate a surface buffer of given size
+    fn alloc_surface_buffer(&mut self, size: u32) -> Option<u32> {
+        let addr = self.alloc_zeroed(size);
+        if addr != 0 { Some(addr) } else { None }
     }
 
     /// Ordinal 148: observed immediately before pointer-backed material
@@ -5058,6 +5069,11 @@ impl Eapp {
                     self.frame_context,
                     self.header.aux_addr
                 );
+                // Vortex-specific preallocation to prevent null pointer crashes
+                // Game ID 12345 has container at 0x18063ebc that needs surface structures
+                if self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345")) {
+                    self.vortex_preallocate_surfaces();
+                }
                 self.bootstrap_phase = BootstrapPhase::Running;
                 self.queue_next_frame();
                 self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
