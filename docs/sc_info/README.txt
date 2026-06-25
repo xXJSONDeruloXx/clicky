@@ -1,0 +1,1 @@
+May be useful for research purposes or if the games lose their auth for no reason (based on the date/time or other criterias to determine an unique hardware ID ?).

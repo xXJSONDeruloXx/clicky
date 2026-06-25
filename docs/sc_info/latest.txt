@@ -1,0 +1,5 @@
+The content of the "latest" folder is copied automatically to C:\ProgramData\Apple Computer\iTunes\SC Info
+each time the virtual computer reboot. The idea is that the virtual machine will "repair" itself if the games de-authed on iTunes for some reason. On de-auth, iTunes is replacing the SC Info folder and corrupts the folder, which requires to rebuild completely the virtual machine or copy manually the folder which can be a complicated affair for the average iPod Gamer.
+
+The script that rebuild the SC Info is available here: C:\Shared Resources\RebuildSCInfo.bat
+and is called automatically at each session opening by the taskschd.msc

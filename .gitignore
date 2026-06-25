@@ -7,3 +7,8 @@ sysdump.log
 
 # I use a custom config to speed up link times
 .cargo/
+
+# Large FairPlay key material (kept local, not committed)
+docs/sc_info/CoreFP.dll
+docs/sc_info/SC Info.sidd
+docs/sc_info/accounts/*/SC Info.sidd
