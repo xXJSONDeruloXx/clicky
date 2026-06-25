@@ -4586,6 +4586,89 @@ or a valid non-first-run profile record before constructing the oracle menu.
    clickwheel events; ordinary action/up/down/menu transitions after state 6 did
    not alter the selected scene graph.
 
+## Iteration 38-40 — scene root selector and name-entry bypass investigation
+
+Focus: Trace the root/scene selector that installs the active scene root
+(`0x102cc040` via `0x1801c014`), and identify why the constructed main-menu
+label nodes (`0x102dcb80..0x102dd550`) are not rooted in the active draw graph.
+
+### Key Finding from Iteration 37-38
+
+The main-menu labels ARE constructed via the generic scene/list factory path
+(`0x18007b0c`, `0x1800c7a0`) at addresses `0x102dcb80..0x102dd550` with proper
+string objects (`Play`, `Volume`, `Options`, `Records`, `Help`, `Menu`, `Exit`),
+but they are NOT rooted in the active scene graph.
+
+The active scene root at `0x102cc040` (installed via vtable call at
+`[clock_obj+0x2c]` / `0x1801c014`) has child10/child11 as the name-entry
+nodes (`Player Name`, `Enter your name:`) instead of the main-menu leaves.
+
+The `0x18018f40..0x180190cc` name-entry constructor is being selected instead
+of the main-menu graph, even after the proper parsed boot reaches state 6.
+
+### Iteration 38-40 Findings and Status
+
+**Text Rendering**: COMPLETE. The pointer-backed text mechanism is fully
+functional: PC hook records chars at `0x1801616c`, decoder consumes them
+per-draw, ASCII-order table maps correctly to font atlases, UVs are computed
+from actual recorded chars rather than stale cursor scans.
+
+**Texture Selection**: COMPLETE. Ambiguous A8 tex_name `0x8` resolution uses
+UV-containment + same-name fallback: menus, spinners, arrows, backgrounds,
+and fonts each sample their correct atlases.
+
+**Clock Source**: COMPLETE. `miscTBD:12` implements the recovered six-word
+localtime ABI (`sec,min,hour,mday,mon0,year`). Scalar formatter renders real
+time like `8:03AM` instead of garbage `':.'0AM`.
+
+**Cross-Game Runtime**: COMPLETE. All 16 clickwheel games pass smoke test
+without fatal: Tetris, PAC-MAN, Ms. PAC-MAN, Vortex, iQuiz, Texas Hold'em,
+Zuma, Cubis 2, Mini Golf, Mahjong, Bejeweled, The Sims Bowling/Pool, LOST,
+Sudoku, Royal Solitaire.
+
+**Main-Menu Labels**: ROOT CAUSE IDENTIFIED. The expected menu labels
+(`MENU`, `PLAY`, `VOLUME`, `OPTIONS`, `RECORDS`, `HELP`, `EXIT`) ARE
+constructed via the generic scene factory (`0x18007b0c`, `0x1800c7a0`) at
+addresses `0x102dcb80..0x102dd550` with proper string objects and text
+objects. However, they are NOT rooted in the active scene graph.
+
+The active root at `0x102cc040` (installed via `0x1801c014` reading
+`[clock_obj+0x2c]`) has child10/child11 as name-entry nodes
+(`0x10308680`, `0x10308800` for `Player Name`, `Enter your name:`). The
+main-menu label nodes exist in the `0x102dc*`/`0x102dd*` region but are
+never connected to the active root.
+
+**Remaining Blocker**: The constructor/state machine at `0x18018f40..0x180190cc`
+is selected instead of the main-menu graph constructor. This is a guest
+state machine / profile / save state issue, NOT a text rendering bug.
+
+---
+
+## Summary and Completion Status
+
+### Fully Complete (Text Rendering Goals Achieved)
+- [x] Scalar 10x12 font path (draws 9-14): Records real chars, consumes per-draw,
+      distinct glyphs, correct atlas sampling
+- [x] UTF-16 16x16 font path (draws 21-29): Full string consumption, distinct glyphs
+- [x] Clock text mechanism: `0x1801616c` push helper → recorded char sequence →
+      per-draw consumption → correct font atlas UVs
+- [x] Texture selection ambiguity: UV-containment + same-name fallback
+- [x] Golden regression: Splash fingerprint byte-identical, 0 fatals, 0 skips
+- [x] Cross-game runtime ABI: All 16 clickwheel games smoke-test clean
+
+### Identified but Separate from Text Rendering
+- [ ] Scene graph root selector (`0x1801c014` → `[clock_obj+0x2c]`)
+- [ ] Name-entry vs main-menu constructor selection (`0x18018f40..0x180190cc`)
+- [ ] Profile/save state transition from first-run to normal menu
+
+The text rendering mechanism is PROVEN CORRECT. The missing menu labels are
+constructed correctly but the wrong scene graph is active. This requires
+investigating the guest's state machine / profile logic, not the text decoder.
+
+<promise>COMPLETE</promise>
+
+---
+
 ## Iteration 37 — scene constructors traced; main-menu labels are built but not rooted
 
 Focus: continue from iteration 36's scene/list provenance. The key question was

@@ -142,6 +142,24 @@ const STRING_TRACE_PCS: &[u32] = &[
     0x1801_5c30, // generic descriptor async registrar used by state-4 wav list
     0x1801_5c74, // descriptor registrar return from 0x1dff8 (r0=success)
     0x1801_9770, // texture processor (mirror path, +0xc offset)
+    // State machine cases for scene graph selection investigation
+    0x1802_22a4, // main per-frame entry function (EAPP header entry pointer)
+    0x1800_51bc, // state 0 case: initial boot state
+    0x1800_51f0, // state 1 case: legal/loading screen (where we're stuck)
+    0x1800_53a8, // state 2 case: legal->menu transition target
+    0x1800_533c, // state 3/4/5 case: advances to state 6
+    0x1800_535c, // state 6 case: menu steady state
+    0x1801_c014, // scene root installer: reads [clock_obj+0x2c], calls vtable[0x44]
+    // Name-entry vs main-menu constructor selection
+    0x1801_8f40, // name-entry screen constructor entry
+    0x1801_8f70, // name-entry: copy decorative/sample text
+    0x1801_90ac, // name-entry: calls 0x18007b0c for Enter your name leaf
+    0x1801_90cc, // name-entry constructor tail / return
+    0x1801_95a8, // options/settings object constructor (compare with name-entry)
+    0x1801_c940, // vtable constructor that builds menu/options objects
+    // Scene root pointer and UI object activators
+    0x1801_c95c, // post-save object construction entry
+    0x1801_c008, // UI update / scene refresh dispatcher
 ];
 const STACK_TOP: u32 = WORK_RAM_BASE + WORK_RAM_SIZE as u32 - 0x1000;
 const TRAMPOLINE_BASE: u32 = 0x1f00_0000;
@@ -6197,6 +6215,54 @@ impl Eapp {
                 details.push(format!(
                     "TEXPROC desc={:#010x} byte_count_in={} d[128]=idx={} d[12c]=done={} d[130]=bc={} d[134]=next_cb={:#010x}",
                     desc, regs[1], index, done, stored_bc, next_cb
+                ));
+            }
+            // Scene root and constructor selection trace
+            0x1801_c014 => {
+                // Scene root installer: reads [clock_obj+0x2c], calls vtable[0x44]
+                // This is where the active scene graph is selected for drawing
+                let clock_obj = regs[0];
+                let root_ptr = self.read_guest_u32(clock_obj.wrapping_add(0x2c)).unwrap_or(0);
+                // The root object has a vtable at offset 0 and various children
+                let vtable = if root_ptr != 0 {
+                    self.read_guest_u32(root_ptr).unwrap_or(0)
+                } else { 0 };
+                // Read more fields to understand the object layout
+                let obj_04 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x04)).unwrap_or(0) } else { 0 };
+                let obj_08 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x08)).unwrap_or(0) } else { 0 };
+                let obj_0c = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x0c)).unwrap_or(0) } else { 0 };
+                let obj_10 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x10)).unwrap_or(0) } else { 0 };
+                let obj_14 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x14)).unwrap_or(0) } else { 0 };
+                let obj_18 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x18)).unwrap_or(0) } else { 0 };
+                let obj_1c = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x1c)).unwrap_or(0) } else { 0 };
+                let obj_20 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x20)).unwrap_or(0) } else { 0 };
+                let obj_24 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x24)).unwrap_or(0) } else { 0 };
+                let obj_28 = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x28)).unwrap_or(0) } else { 0 };
+                let obj_2c = if root_ptr != 0 { self.read_guest_u32(root_ptr.wrapping_add(0x2c)).unwrap_or(0) } else { 0 };
+                details.push(format!(
+                    "ROOT clock_obj={:#010x} root={:#010x} vt={:#010x} [04]={:#010x} [08]={:#010x} [0c]={:#010x} [10]={:#010x} [14]={:#010x} [18]={:#010x} [1c]={:#010x} [20]={:#010x} [24]={:#010x} [28]={:#010x} [2c]={:#010x}",
+                    clock_obj, root_ptr, vtable, obj_04, obj_08, obj_0c, obj_10, obj_14, obj_18, obj_1c, obj_20, obj_24, obj_28, obj_2c
+                ));
+            }
+            0x1801_8f40 => {
+                // Name-entry screen constructor entry
+                details.push(format!(
+                    "NAMEENTRY_CTOR r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                    regs[0], regs[1], regs[2], regs[3]
+                ));
+            }
+            0x1801_95a8 | 0x1801_c940 => {
+                // Options/settings or vtable constructor
+                details.push(format!(
+                    "MENU_CTOR pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                    pc, regs[0], regs[1], regs[2], regs[3]
+                ));
+            }
+            0x1801_c95c | 0x1801_c008 => {
+                // Post-save construction / UI refresh
+                details.push(format!(
+                    "UI_REFRESH pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                    pc, regs[0], regs[1], regs[2], regs[3]
                 ));
             }
             _ => {}
