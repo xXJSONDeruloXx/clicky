@@ -271,3 +271,62 @@ Sudoku:     cfd1e8538a6ee838933f2100c336f0bc
 *Documented: 2025-01-23*  
 *Researcher: AI coding assistant*  
 *Status: Ready for Requiem code analysis and CoreFP comparison*
+
+## Update: iPod Storage Discovery
+
+**Critical Finding (2025-06-25):** The iPod stores **encrypted files on disk**, not decrypted EAPP files!
+
+### Observed Behavior
+
+Files on the iPod:
+```
+Bejeweled_1_1_3367225.bin:  9d95 38ab 87bb a1aa... (ENCRYPTED)
+Minigolf_1_1_3299468.bin:  179c d338 88f0 9fbc... (ENCRYPTED)
+```
+
+Same files in preservation dump:
+```
+Bejeweled_1_1_3367225.bin:  6561 7070 0010 0010... (eapp header - DECRYPTED)
+Minigolf_1_1_3299468.bin:  6561 7070 0010 0010... (eapp header - DECRYPTED)
+```
+
+### Implications
+
+1. **iPod OS has FairPlay decryption built-in**
+   - The iPod decrypts files at runtime when loading into memory
+   - Uses hardware-derived device key (stored in secure storage)
+   - Reads .sinf files to get wrapped content keys
+
+2. **No "SC Info" on iPod**
+   - The iPod doesn't have SC Info.sidb/sidd files like Windows
+   - Device key is in hardware/firmware, not files
+
+3. **Extraction requires either:**
+   - **Memory dumping** while game is running (hard)
+   - **Hardware key extraction** from iPod firmware (very hard)
+   - **VM + iTunes sync** to get decrypted files (preservation did this)
+
+4. **The preservation release used VM method**
+   - The `16-ipod-games` decrypted files came from the VM approach
+   - Not from the iPod directly (which would be encrypted)
+
+### Why This Matters
+
+**Option 1: Extract from iPod**
+- Would require reverse engineering iPod firmware
+- Finding hardware key or decryption vulnerability
+- Much harder than Windows approach
+
+**Option 2: Use preservation VM (RECOMMENDED)**
+- Already has iTunes + authorized accounts
+- Sync creates files that can be extracted
+- This is how the `16-ipod-games` dump was created
+
+**Option 3: Emulator with on-device decryption**
+- Would need to emulate iPod's FairPlay hardware
+- Even harder than Option 1
+
+### Conclusion
+
+The preservation VM approach remains the most viable path to get decrypted games. The iPod's on-device encryption means we cannot simply copy decrypted files from it.
+
