@@ -12,190 +12,110 @@ Lost uses a fundamentally different rendering architecture from all other iPod g
 │  ┌─── EAPP Header (0x28 bytes) ────────────┐ │
 │  │  magic="eapp", load_addr=0x10001000, ... │ │
 │  └─────────────────────────────────────────┘ │
-│  ┌─── Code/Data (0x10001xxx) ──────────────┐ │
-│  │  ARM exception vectors, game logic       │ │
+│  ┌─── 0x10001038+ ──────────────────────────┐ │
 │  │  *** OVERWRITTEN BY rserver.bin ***       │ │
+│  │  Original: ARM exception vectors + code   │ │
+│  │  After load: rserver render engine code   │ │
 │  └─────────────────────────────────────────┘ │
-│  ┌─── Game Assets (0x10005xxx+) ───────────┐ │
-│  │  Textures, strings, etc.                  │ │
-│  └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
-
-After AsyncFileIO:3 loads rserver.bin to 0x10001038:
-
-┌─────────────────────────────────────────────┐
-│  0x10001038..0x10001237: rserver header     │
-│    ALL ZEROS (0x200 bytes = 128 words)      │
-│    ← Ordinal 164 would write state here     │
-│                                              │
-│  0x10001238..0x1001A35C: rserver ARM code   │
-│    The game's rendering engine               │
-│    Executes on the iPod's ARM CPU directly   │
 └─────────────────────────────────────────────┘
 ```
 
-## rserver.bin Analysis
+## rserver.bin — The Rendering Engine
 
-**File size:** 105,020 bytes (105KB)  
-**Loaded at:** Guest address 0x10001038 (via AsyncFileIO:3)  
-**Header:** 0x200 bytes of all zeros  
-**Code:** Starts at offset 0x200 (guest 0x10001238)
+- **Size:** 105,020 bytes (105KB)
+- **Loaded to:** Guest address 0x10001038 (via AsyncFileIO:3)
+- **Header region:** 0x10001038..0x10001237 (0x200 bytes, all zeros)
+- **Code region:** 0x10001238+ (ARM/Thumb rendering functions)
 
-The rserver.bin is NOT a shader binary for the GPU — it's ARM code that the iPod's CPU executes directly. The game's original binary at 0x10001038 (the ARM exception vectors and early code) gets completely overwritten by rserver.bin.
+**Key discovery:** rserver.bin is NOT a shader binary for the GPU. It's ARM code that the iPod's CPU executes directly. The game's original binary at 0x10001038 gets overwritten during loading.
 
-### Why Zeros in the Header?
+## Experiments & Results
 
-On a real iPod, ordinal 164 (shader create) would:
-1. Parse the rserver.bin binary structure
-2. Extract function entry points and configuration data
-3. Write the parsed results into the first 0x200 bytes (the "header")
-4. Return a program handle
-
-Since our ordinal 164 stub does NOT parse the binary, the header stays all zeros. The game's rendering engine code reads from the header region, finds null pointers/data, and skips all rendering.
-
-## Material Object Analysis
-
-When Lost binds material 0xe via ordinal 159, the state_ptr points to a structure at 0x18060910:
-
-```
-Offset  Value           Meaning
-------  -----           -------
-0x00    0x00000000      Flags/status
-0x04    0x00000000      Flags/status
-0x08    0x00000988      Texture 1 data size (2440 = 122×10×2 LA8)
-0x0C    0x0000007A      Texture 1 width (122)
-0x10    0x0000000A      Texture 1 height (10)
-0x14    0x0000007A      Texture 1 width (confirmed)
-0x18    0x0000000A      Texture 1 height (confirmed)
-0x1C    0x00000000      Zero
-0x20    0x0000190A      Texture 1 format (GL_LUMINANCE_ALPHA)
-0x24    0x00001401      Texture 1 type (GL_UNSIGNED_BYTE)
-0x28    0x00000000      Zero
-0x2C    0x00000001      Texture 1 index
-0x30    0x00000001      Texture 1 count
-0x34    0x00000348      Texture 2 data size (840 = 42×10×2 LA8)
-0x38    0x0000002A      Texture 2 width (42)
-0x3C    0x0000000A      Texture 2 height (10)
-0x40    0x0000002A      Texture 2 width
-0x44    0x0000000A      Texture 2 height
-0x48    0x00000000      Zero
-0x4C    0x0000190A      Texture 2 format (GL_LUMINANCE_ALPHA)
-0x50    0x00001401      Texture 2 type (GL_UNSIGNED_BYTE)
-0x54    0x00000000      Zero
-0x58    0x00000002      Texture 2 index
-0x5C    0x00000002      Texture 2 count
-0x60    0xFFFFFFFF      **Shader compilation state** (-1 = not compiled)
-0x64+   0x00000000×7    All zeros
-```
-
-## Ordinal Trace
-
-### Init (Frame 1)
-```
-153 → viewport(0, 0xFFFF, 0xFFFF, 0)
-164 → shader_create(r1=0x10001038)     ← rserver.bin address
-152 → program_query(buf, size_ptr)        ← check link status
-153 → viewport(0, 0, 0, 0)
-152 → program_query(buf, size_ptr)        ← second query
-4   → bind_texture(0x84F5, 0)             ← GL_TEXTURE_2D
-99  → upload(0x84F5, ..., 0x190A, 0x1401) ← 122×10 LA8
-4   → bind_texture(0x84F5, 0)
-99  → upload(0x84F5, ..., 0x190A, 0x1401) ← 42×10 LA8
-```
-
-### Frame Loop (repeats forever)
-```
-13  → glCullFace(0)                       ← no culling
-12  → glClear(0x4000)                     ← clear color buffer
-159 → bind_material(0xe, 0x18060910)      ← shader material
-157 → present(0x0)                         ← show frame (nothing drawn)
-```
-
-**0 draws per frame.** The game never calls ordinal 37 (draw arrays) or 38 (draw elements).
-
-## What We've Tried
-
-### 1. Shader Program Handle Return
-Made ordinal 164 return 1 (program handle) instead of 0.
-**Result:** No change. Game still does `13,12,159,157`.
-
-### 2. Program Query Success
-Made ordinal 152 write GL_TRUE=1 to the query buffer and return program handle 1.
-**Result:** No change.
-
-### 3. Shader State Patch
-Wrote 0 to [state_ptr+0x60] during present (to clear the 0xffffffff "not compiled" flag).
-**Result:** Flag patched to 0, but game still doesn't draw. The rendering engine
-has additional checks beyond this single flag.
-
-### 4. Skip rserver.bin Load
-Used `CLICKY_EAPP_SKIP_RSERVER=1` to prevent loading rserver.bin over the
-original game binary.
-**Result:** The original binary also had mostly zeros at 0x10001038 (it was
-designed to have rserver.bin overwrite it). No change in rendering behavior.
+| Experiment | What We Did | Result |
+|-----------|-------------|--------|
+| Program handle return | ordinal 164 returns 1 (was 0) | Still 0 draws |
+| Program query success | ordinal 152 writes GL_TRUE=1 + size=4 | Still 0 draws |
+| Shader state patch | Write 0 to [material+0x60] (was 0xffffffff) | Still 0 draws |
+| Skip rserver.bin load | Don't overwrite original game code | Still 0 draws (original also zero-padded) |
+| **Fill header with values** | Write 1..128 to all 128 header words | **Still 0 draws** |
 
 ## Root Cause
 
-Lost's rendering engine IS the ARM code in rserver.bin. Our CPU emulator
-DOES execute this code, but the engine's internal logic checks multiple
-conditions before issuing draw calls:
+The game's frame loop is `ordinal 13 → 12 → 159 → 157` (cull, clear, bind, present). **Zero draw calls per frame.** This is because:
 
-1. **Header population:** The rendering engine reads from the 0x200-byte
-   header at 0x10001038..0x10001237, expecting function pointers and
-   configuration written by ordinal 164. Since all values are zero,
-   the engine treats all function pointers as null and skips rendering.
+1. **No shader activation:** Lost never calls ordinal 167 (glUseProgram). The game expects the shader to be implicitly active after ordinal 164, but our stubs don't make that happen.
 
-2. **Shader binary parsing:** Ordinal 164 on a real iPod would parse the
-   rserver binary format, find rendering functions, and write their
-   addresses into the header region. This creates a dispatch table that
-   the game's frame loop code uses to call the appropriate rendering
-   functions.
+2. **No vertex/draw setup:** The game doesn't call ordinals 137 (vertex array def), 40 (enable array), or 37/38 (draw). The entire rendering pipeline is gated behind conditions in the rserver.bin ARM code that we can't satisfy.
 
-Without a real implementation of ordinal 164, the rendering engine has
-no valid dispatch table and cannot render.
+3. **Header isn't the blocker:** Even filling the entire 0x200-byte header with non-zero values doesn't enable rendering. The game's code has additional checks beyond the header.
 
-## Possible Paths Forward
+## Material Object (0x18060910)
 
-### A. Reverse Engineer Ordinal 164
-Parse the rserver.bin format to understand:
-- Where the function entry points are encoded
-- What configuration data needs to be written to the header
-- What the expected header layout is
+```
+Offset  Value           Meaning
+0x00    0x00000000      Flags
+0x08    0x00000988      Tex1 size (2440 = 122×10×2 LA8)
+0x0C    0x0000007A      Tex1 width (122)
+0x10    0x0000000A      Tex1 height (10)
+0x20    0x0000190A      Format: GL_LUMINANCE_ALPHA
+0x24    0x00001401      Type: GL_UNSIGNED_BYTE
+0x34    0x00000348      Tex2 size (840 = 42×10×2 LA8)
+0x38    0x0000002A      Tex2 width (42)
+0x3C    0x0000000A      Tex2 height (10)
+0x60    0xFFFFFFFF      Shader state (-1 = not compiled)
+```
 
-This would require significant binary reverse engineering of both
-rserver.bin and the iPod's GL ES implementation.
+## Ordinal Sequences
 
-### B. Instrumented Tracing
-Add read-watchpoints on the 0x200-byte header region to see exactly
-which offsets the game code reads and what values it expects. This
-would reveal the header structure without fully reverse engineering
-ordinal 164.
+### Init (frame 1):
+```
+153 → viewport(0, 0xFFFF, 0xFFFF, 0)
+164 → shader_create(r1=rserver_addr, r2=0xFFFFFFFF)
+152 → program_query(buf, size_ptr)
+153 → viewport(0, 0, 0, 0)
+152 → program_query(buf, size_ptr)
+4   → bind_texture(0x84F5, 0)
+99  → upload(0x190A, 0x1401, 122×10)   ← LA8 text label
+4   → bind_texture(0x84F5, 0)
+99  → upload(0x190A, 0x1401, 42×10)    ← LA8 text label
+```
 
-### C. Shader State Machine Emulation
-Build a complete implementation of the "shader compile" process:
-- Parse rserver.bin format
-- Extract rendering function addresses
-- Write them to the header
-- Let the game's ARM code call through them naturally
+### Frame loop (repeats forever):
+```
+13  → glCullFace(GL_NONE)
+12  → glClear(GL_COLOR_BUFFER_BIT)
+159 → bind_material(0xe, 0x18060910)
+157 → present(0x0)
+```
 
-This is the most complete solution but also the most complex.
+## Paths Forward
 
-### D. Fixed-Function Fallback
-If the game has a fixed-function rendering path (used when no shader
-is available), we could trigger it by:
-- Making ordinal 164 return 0 (compilation failed)
-- The game might fall back to a simple rendering mode
-- But from our experiments, this doesn't happen either
+### A. Full rserver.bin reverse engineering
+Parse the ARM code to find the rendering dispatch table and
+what conditions it checks. Requires significant ARM RE effort.
 
-## Data Points
+### B. Memory access tracing
+Add read-watchpoints on the header region to see exactly which
+offsets the game reads and what values it expects. Would reveal
+the header structure without fully reverse engineering ordinal 164.
 
-| Experiment | Shader State at 0x60 | Program Handle | Draw Count |
-|-----------|----------------------|----------------|------------|
-| Baseline  | 0xFFFFFFFF           | 0              | 0          |
-| Handle=1  | 0xFFFFFFFF           | 1              | 0          |
-| Patched   | 0x00000000           | 1              | 0          |
-| Skip load  | 0x00000000 (orig)   | 0              | 0          |
+### C. Shader interpreter
+Parse the PowerVR MBX shader format from rserver.bin and
+implement a software shader interpreter that produces the
+rendering dispatch table entries.
 
-The shader state and program handle are necessary but not sufficient
-conditions for drawing. The rendering engine has additional internal
-checks that we haven't identified yet.
+### D. Fixed-function workaround
+Force a basic rendering pipeline for Lost's material:
+- Read the material object's texture descriptors
+- Synthesize vertex arrays from the texture dimensions
+- Inject a draw call after bind_material
+- This would produce visible but wrong rendering
+
+## Technical Details
+
+- **rserver header:** 0x200 bytes at 0x10001038, all zeros before and after ordinal 164
+- **Code entry:** 0x10001238 (offset 0x200 in rserver.bin)
+- **Material state:** 0x18060910 with two LA8 texture descriptors
+- **Shader state flag:** 0xffffffff at [0x18060910+0x60], patched to 0 by emulator
+- **Program handle:** Returned as 1 by ordinal 164 (was 0)
+- **GL imports:** Only 4, 12, 13, 99, 152, 153, 157, 159, 164
