@@ -187,6 +187,9 @@ pub struct LiveGlState {
     pub presented_buffer: Vec<Rgba8>,
     /// True between candidate begin (158) and present (157).
     pub frame_active: bool,
+    /// True when a DMA overlay has been applied to the current frame.
+    /// Causes complete_frame to use the framebuffer even with 0 GL draws.
+    pub has_dma_overlay: bool,
     /// Monotonic count of completed/presented frames.
     pub completed_frame_index: u64,
     /// Candidate frame-begin ordinal, derived from observed ordering (always
@@ -253,6 +256,7 @@ impl LiveGlState {
             completed_buffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
             presented_buffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
             frame_active: false,
+            has_dma_overlay: false,
             completed_frame_index: 0,
             candidate_begin_ordinal: 158,
             candidate_present_ordinal: 157,
@@ -426,6 +430,7 @@ impl LiveGlState {
             ));
         }
         self.skipped_draws_this_frame = 0;
+        self.has_dma_overlay = false;
         if self.frame_active {
             // 158 received while a frame is already active → the previous
             // frame never received a 157 (incomplete / missing present).
@@ -449,6 +454,7 @@ impl LiveGlState {
     /// This method takes the DMA background, then alpha-blends the current
     /// framebuffer (which has transparent background + opaque sprites) on top.
     pub fn overlay_dma_rgb565(&mut self, rgb565: &[u8]) {
+        self.has_dma_overlay = true;
         if rgb565.len() < FB_WIDTH * FB_HEIGHT * 2 {
             return;
         }
@@ -481,7 +487,7 @@ impl LiveGlState {
                 self.framebuffer[y * FB_WIDTH + x] = Rgba8::rgba(out_r, out_g, out_b, 255);
             }
         }
-        if nonzero_count > 0 {
+        if nonzero_count > 0 && self.completed_frame_index < 20 {
             log::info!(target: "EAPP_GL", "DMA overlay: {}/{} non-zero pixels", nonzero_count, FB_PIXELS);
         }
     }
@@ -499,7 +505,7 @@ impl LiveGlState {
         }
         self.frame_active = false;
         let draw_count = self.draws.len();
-        if draw_count == 0 {
+        if draw_count == 0 && !self.has_dma_overlay {
             self.push_anomaly(format!(
                 "clear_without_draws ordinal={} (present with zero draws)",
                 self.candidate_present_ordinal

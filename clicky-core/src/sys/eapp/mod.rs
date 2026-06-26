@@ -380,6 +380,8 @@ pub struct Eapp {
     app_object: u32,
     frame_context: u32,
     frame_counter: u64,
+    /// Total CPU steps executed (for throttling DMA present checks)
+    step_counter: u64,
     pending_guest_calls: VecDeque<PendingGuestCall>,
     /// Host file contents staged for delivery to the guest, keyed by the guest
     /// request-object address that asked for them.
@@ -461,11 +463,16 @@ struct EappBus {
     image: Ram,
     image_len: u32,
     work_ram: Ram,
-    /// PopCap engine DMA framebuffer at 0x1402_0000. The engine renders
-    /// into this buffer using its own software rasterizer, then triggers
-    /// a DMA transfer to the LCD. We store the pixels so the GL HLE
-    /// path can present them.
     dma_framebuf: Ram,
+    /// Track range of DMA FB writes
+    hw_fb_write_count: usize,
+    hw_fb_write_min: u32,
+    hw_fb_write_max: u32,
+    /// DMA frame counter: incremented each time pixel 0 is re-written
+    hw_dma_frame: usize,
+    /// Set to true when DMA FB has been written at least once.
+    /// Cleared by the Eapp struct after presenting the DMA content.
+    hw_dma_dirty: bool,
     /// Optional write-watchpoint range (start, end exclusive). When set,
     /// every byte write whose address falls in [start, end) is recorded to
     /// `watch_log` tagged with `pending_pc`. Used for RE: attributing
@@ -567,6 +574,11 @@ impl Eapp {
                 image_len: mapped_image_len as u32,
                 work_ram,
                 dma_framebuf: Ram::new(320 * 240 * 2), // RGB565 320×240
+                hw_fb_write_count: 0,
+                hw_fb_write_min: u32::MAX,
+                hw_fb_write_max: 0,
+                hw_dma_frame: 0,
+                hw_dma_dirty: false,
                 watch: None,
                 pending_pc: 0,
                 watch_log: Vec::new(),
@@ -586,6 +598,7 @@ impl Eapp {
             app_object: 0,
             frame_context: 0,
             frame_counter: 0,
+            step_counter: 0,
             pending_guest_calls: VecDeque::new(),
             staged_files: HashMap::new(),
             dumped_requests: HashSet::new(),
@@ -688,6 +701,60 @@ impl Eapp {
                 hit.addr, hit.val, ascii, hit.pc,
             );
         }
+    }
+
+    /// Log DMA framebuffer write stats (bytes written, range, coverage).
+    pub fn log_dma_stats(&self) {
+        let count = self.bus.hw_fb_write_count;
+        let min = self.bus.hw_fb_write_min;
+        let max = self.bus.hw_fb_write_max;
+        if count == 0 {
+            info!(target: "EAPP_HW", "DMA FB: no pixel writes");
+            return;
+        }
+        let range = max - min;
+        let coverage = range as usize * 100 / (DMA_FB_SIZE);
+        info!(target: "EAPP_HW", "DMA FB: {} w32 writes, {} frames, range {:#010x}..{:#010x} ({} bytes, {}% coverage)", count, self.bus.hw_dma_frame, min, max, range, coverage);
+    }
+
+    /// If the DMA framebuffer has been written to (PopCap engine background),
+    /// overlay it into the live_gl framebuffer and force-present. The PopCap
+    /// game engine renders its background via software rasterization into the
+    /// DMA buffer at 0x1402_0000 and does NOT use the GL lifecycle (no
+    /// ordinal-158/157 calls). So we must inject a frame present here.
+    fn maybe_present_dma_frame(&mut self) {
+        // Read DMA buffer
+        let dma_data = {
+            let mut buf = vec![0u8; DMA_FB_SIZE];
+            self.bus.dma_framebuf.bulk_read(0, &mut buf);
+            buf
+        };
+        // Only present once the buffer is mostly-filled
+        let coverage = dma_data.iter().filter(|b| **b != 0x2d).count();
+        if coverage < DMA_FB_SIZE / 2 {
+            return;
+        }
+
+        // Overlay DMA into live_gl and complete frame
+        let completed = if let Some(lg) = self.live_gl.as_mut() {
+            lg.begin_frame();
+            lg.overlay_dma_rgb565(&dma_data);
+            lg.complete_frame()
+        } else {
+            None
+        };
+
+        // Present (separate borrow from live_gl)
+        if let Some(completed) = completed {
+            self.live_log_completed_frame(&completed, true);
+            self.live_log_signature_detail(&completed);
+            self.live_dump_completed_frame();
+            let gate_b = self.live_gl.as_ref().map(|lg| lg.gate_b).unwrap_or(false);
+            if gate_b {
+                self.live_present_completed_to_window();
+            }
+        }
+        self.bus.hw_dma_dirty = false;
     }
 
     /// Log the most-frequent import calls seen so far. Useful for finding
@@ -1201,6 +1268,18 @@ impl Eapp {
     pub fn step(&mut self) -> FatalMemResult<()> {
         if self.halted {
             return Ok(());
+        }
+        // PopCap DMA background present: when the game writes RGB565 pixels
+        // to the DMA framebuffer outside the GL frame lifecycle, inject a
+        // DMA-only frame present. Throttle to ~every 10K steps to avoid overhead.
+        // Only inject if no GL frame is currently active (avoid double-begin).
+        self.step_counter += 1;
+        if self.bus.hw_dma_dirty
+            && self.live_gl.is_some()
+            && self.step_counter % 10000 == 0
+            && !self.live_gl.as_ref().map(|lg| lg.frame_active).unwrap_or(false)
+        {
+            self.maybe_present_dma_frame();
         }
         let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
         self.record_pc(pc);
@@ -1891,6 +1970,18 @@ impl Eapp {
                 // begin when ordinal-158 is absent.
                 if let Some(lg) = self.live_gl.as_mut() {
                     lg.begin_frame();
+                }
+                // Overlay DMA background before completing the frame
+                let dma_data = {
+                    let mut buf = vec![0u8; DMA_FB_SIZE];
+                    self.bus.dma_framebuf.bulk_read(0, &mut buf);
+                    buf
+                };
+                let has_dma = dma_data.iter().any(|b| *b != 0x2d);
+                if has_dma {
+                    if let Some(lg) = self.live_gl.as_mut() {
+                        lg.overlay_dma_rgb565(&dma_data);
+                    }
                 }
                 match self.live_gl.as_mut().and_then(|lg| lg.complete_frame()) {
                     Some(frame) => frame,
@@ -6656,7 +6747,7 @@ impl Memory for EappBus {
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
                 let rel = offset - HW_STUB_BASE;
                 if rel < 0x20000 {
-                    // DMA control registers — always return completion
+                    // DMA control registers
                     Ok(1)
                 } else {
                     // DMA framebuffer: read back stored pixel data
@@ -6697,18 +6788,29 @@ impl Memory for EappBus {
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
                 let rel = offset - HW_STUB_BASE;
-                // DMA framebuffer pixel storage: PopCap engine writes RGB565
-                // pixels at 0x1402_0000+ for display
-                if rel >= 0x20000 {
+                if rel < 0x20000 {
+                    // DMA control register writes
+                } else {
+                    // DMA framebuffer pixel storage
                     let fb_off = (rel - 0x20000) as u32;
                     if (fb_off as usize) + 4 <= DMA_FB_SIZE {
                         self.dma_framebuf.bulk_write(fb_off, &val.to_le_bytes());
-                    }
-                    if fb_off == 0 && false { // disabled debug log
-                        log::info!(target: "EAPP_HW", "DMA FB first write: off={:#010x} val={:#010x}", offset, val);
+                        self.hw_fb_write_count += 1;
+                        self.hw_dma_dirty = true;
+                        if fb_off < self.hw_fb_write_min {
+                            self.hw_fb_write_min = fb_off;
+                        }
+                        if fb_off + 4 > self.hw_fb_write_max {
+                            self.hw_fb_write_max = fb_off + 4;
+                        }
+                        // Detect new DMA frame: first pixel rewritten
+                        if fb_off == 0 && self.hw_fb_write_count > 1 {
+                            self.hw_dma_frame += 1;
+                        }
+                        // (DMA write verification disabled)
                     }
                 }
-                Ok(()) // write accepted
+                Ok(())
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6725,7 +6827,7 @@ impl Memory for EappBus {
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
                 let rel = offset - HW_STUB_BASE;
                 if rel < 0x20000 {
-                    Ok(1) // DMA control: always complete
+                    Ok(1)
                 } else {
                     let fb_off = (rel - 0x20000) as usize;
                     if fb_off < DMA_FB_SIZE {
@@ -6752,7 +6854,7 @@ impl Memory for EappBus {
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
                 let rel = offset - HW_STUB_BASE;
                 if rel < 0x20000 {
-                    Ok(1) // DMA control: always complete
+                    Ok(1)
                 } else {
                     let fb_off = (rel - 0x20000) as usize;
                     if fb_off + 2 <= DMA_FB_SIZE {
@@ -6794,6 +6896,7 @@ impl Memory for EappBus {
                     let fb_off = (rel - 0x20000) as u32;
                     if (fb_off as usize) < DMA_FB_SIZE {
                         self.dma_framebuf.bulk_write(fb_off, &[val]);
+                        self.hw_dma_dirty = true;
                     }
                 }
                 Ok(())
@@ -6828,6 +6931,7 @@ impl Memory for EappBus {
                     let fb_off = (rel - 0x20000) as u32;
                     if (fb_off as usize) + 2 <= DMA_FB_SIZE {
                         self.dma_framebuf.bulk_write(fb_off, &val.to_le_bytes());
+                        self.hw_dma_dirty = true;
                     }
                 }
                 Ok(())
