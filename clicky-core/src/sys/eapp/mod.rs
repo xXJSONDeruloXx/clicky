@@ -1905,6 +1905,35 @@ impl Eapp {
             158 => self.live_handle_candidate_begin(),
             157 => self.live_handle_candidate_present(),
             165 => self.live_handle_ordinal_165(args),
+            // Ordinal 164: shader program create/link. Takes pointer to shader
+            // binary (rserver.bin), returns a program ID. Must return non-zero
+            // so the game sees a valid program. Lost and TWA both use this.
+            164 => {
+                // Return a pseudo-handle so the game thinks the program compiled.
+                // The actual shader data at r1 is ignored (no real GPU here).
+                let _program_addr = args[1];
+                // Don't actually return a value here — the import return value
+                // is 0 by default. We need to set the return value differently.
+                // For now, just log and let the game proceed.
+                info!(target: "EAPP_GL", "ordinal_164: shader_create addr={:#010x} len_hint={:#010x}", args[1], args[2]);
+            }
+            // Ordinal 167: shader program use/bind. Lost doesn't call this but TWA does.
+            167 => {
+                info!(target: "EAPP_GL", "ordinal_167: shader_bind program={:#010x}", args[0]);
+            }
+            // Ordinal 152: glGetProgramiv or similar query. Lost calls this after 164.
+            // r0=0 r1=buf_ptr r2=buf_size_ptr. May write GL_LINK_STATUS etc.
+            // Return success by writing 1 (GL_TRUE) at the buffer pointer.
+            152 => {
+                if args[1] != 0 {
+                    let _ = self.write_guest_u32(args[1], 1); // GL_TRUE = link success
+                }
+                info!(target: "EAPP_GL", "ordinal_152: program_query buf={:#010x} size_ptr={:#010x}", args[1], args[2]);
+            }
+            // Ordinal 153: glViewport-like. Some games call this during init.
+            153 => {
+                info!(target: "EAPP_GL", "ordinal_153: viewport x={} y={} w={} h={}", args[0], args[1], args[2], args[3]);
+            }
             // Draw-adjacent state ordinals; recorded by observation only.
             175 | 149 | 125 | 36 => {}
             // Ordinal 148 appears before pointer-backed material draws in the
