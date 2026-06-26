@@ -1940,9 +1940,21 @@ impl Eapp {
             // menu phase. Evidence: r0=4, r1=1, r2=0x101029e8 (work RAM ptr).
             // Semantics not yet confirmed — capture args for analysis.
             148 => self.live_handle_ordinal_148(args),
-            // Upload prep/bind ordinals; ordinal 45 is handled above when it
-            // carries a Mahjong-style work-RAM resource descriptor.
-            4 => {}
+            // Ordinal 4: glBindTexture(target, texture).
+            // r0=target (e.g. 0xDE1=GL_TEXTURE_2D), r1=texture_name.
+            // Capture the texture name so that the next ordinal-99 upload
+            // can be associated with it (instead of / in addition to ordinal-45).
+            4 => {
+                let tex_name = args[1];
+                if tex_name != 0 {
+                    if let Some(lg) = self.live_gl.as_mut() {
+                        // Only set if not already captured by ordinal 45
+                        if lg.pending_tex_name.is_none() {
+                            lg.pending_tex_name = Some(tex_name);
+                        }
+                    }
+                }
+            }
             _ => {
                 // Unknown/unsupported ordinal; fail safe (no panic).
             }
@@ -2057,9 +2069,10 @@ impl Eapp {
         let desc_ptr = args[1];
         let prep_width = args[2] as usize;
         let prep_height = args[3] as usize;
-        if desc_ptr == 0 || prep_width == 0 || prep_height == 0 {
-            return;
-        }
+        // Even when prep_width/prep_height are 0 (TWA/iQuiz style ordinal-45
+        // calls that just set up texture handles), still try to capture the
+        // pending texture name from the descriptor for later match.
+        // The full Mahjong-style upload path below still requires valid dims.
         // Cross-title evidence (Tetris, Texas Hold'em): the ordinal-45
         // descriptor at r1 is the texture object itself (not a pointer to
         // one) with layout:
@@ -2082,7 +2095,20 @@ impl Eapp {
                 if let Some(lg) = self.live_gl.as_mut() {
                     lg.pending_tex_name = Some(w1);
                 }
+            } else if !is_gl_format || !is_small_handle {
+                // Log the descriptor contents for RE when the capture fails
+                let w0 = self.read_guest_u32(desc_ptr).unwrap_or(0);
+                let w3 = self.read_guest_u32(desc_ptr.wrapping_add(12)).unwrap_or(0);
+                let w4 = self.read_guest_u32(desc_ptr.wrapping_add(16)).unwrap_or(0);
+                let w5 = self.read_guest_u32(desc_ptr.wrapping_add(20)).unwrap_or(0);
+                info!(target: "EAPP_GL", "ordinal_45 desc missed: ptr={:#010x} w0={:#010x} w1={:#010x} w2={:#010x} w3={:#010x} w4={:#010x} w5={:#010x} small={} gl_fmt={} prep_w={} prep_h={}",
+                    desc_ptr, w0, w1, w2, w3, w4, w5, is_small_handle, is_gl_format, prep_width, prep_height);
             }
+        }
+        // Early return for ordinal-45 calls that have no proper width/height
+        // (TWA/iQuiz style: just set up texture handles, no bulk upload).
+        if prep_width == 0 || prep_height == 0 {
+            return;
         }
         let Some(texture_obj) = self.read_guest_u32(desc_ptr.wrapping_add(4)) else {
             return;
