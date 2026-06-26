@@ -1635,6 +1635,7 @@ impl Eapp {
                 0
             }
             "AsyncFileIO" => self.handle_async_file_io_import(import.ordinal, args),
+            "Filesytem" => self.handle_filesystem_import(import.ordinal, args),
             other => {
                 warn!(target: "EAPP_IMPORT", "unhandled module {}", other);
                 self.fill_framebuffer(HLE_WARN_FRAMEBUFFER);
@@ -5113,6 +5114,24 @@ impl Eapp {
     /// Calendar/local-time ABI used by Tetris' menu clock. The game calls
     /// `miscTBD:12(out_tm, ...)`, then reads `out_tm[1] + 60 * out_tm[2]` as
     /// minutes since midnight before passing that scalar to its `H:MM AM/PM`
+    /// Handle `Filesytem` (sic) import module used by iQuiz/TWA and some other
+    /// games. On real iPod hardware this provides filesystem open/read/close.
+    /// The emulator stubs it with minimal responses so games can progress past
+    /// their init sequences.
+    fn handle_filesystem_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        info!(target: "EAPP_IMPORT", "Filesytem:{} pc={:#010x} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+            ordinal, self.bus.pending_pc, 0, args[0], args[1], args[2], args[3]);
+        match ordinal {
+            // Ordinal 0: likely filesystem open or init. Return non-zero (success).
+            0 => 1,
+            // Unknown ordinals: return 0 (no-op).
+            _ => {
+                warn!(target: "EAPP_IMPORT", "unhandled Filesytem ordinal {}", ordinal);
+                0
+            }
+        }
+    }
+
     /// formatter. Recovered layout: six u32 fields (`sec, min, hour, mday,
     /// mon0, year_since_1900`). Tetris passes a stack slot with room for these
     /// six words; writing a full 9-word C `struct tm` would overwrite the

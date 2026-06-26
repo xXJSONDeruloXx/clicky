@@ -193,3 +193,45 @@ RUST_LOG=EAPP_GL=info,EAPP_IMPORT=info
 ---
 
 *Updated: 2026-06-25 with crash analysis and engine classification*
+
+---
+
+## Post-Fix Update (2026-06-25)
+
+### HW Stub Fix (committed)
+- Added `HW_STUB_BASE` (0x14000000) with 64MiB stub region
+- Prevents FatalMemException crash in Zuma and Bejeweled
+- Both games now gracefully exit with "Abnormal termination" instead of crashing
+- Games still don't progress because DMA registers need proper response simulation
+
+### Filesytem Handler Fix (committed)
+- Added `handle_filesystem_import()` for the `Filesytem` module
+- Returns 1 for ordinal 0 (init/open success)
+- TWA still shows 0 rasterized draws because .ipd texture files need AsyncFileIO:7 directory enumeration support
+
+### Remaining Issues
+1. **Zuma/Bejeweled DMA**: Write to 0x1402_000c, then reads back waiting for completion. Need DMA controller emulation or at least "complete" status bit.
+2. **TWA .ipd loading**: Needs AsyncFileIO:7 to enumerate directory contents and return file lists
+3. **Lost divide-by-zero**: ARM exception during audio init
+4. **Sudoku/Bejeweled partial**: Need more texture loading paths
+
+### Compatibility After Fixes
+
+| Bundle | Draws | Change | Status |
+|--------|-------|--------|--------|
+| 11002 | 0 | same | TWA - needs .ipd loading via AsyncFileIO:7 |
+| 12345 | 99 | ~same | Vortex - partial renders |
+| 14004 | 26,405 | same | Ms. Pac-Man - WORKS |
+| 1500C | 3,296 | same | Sims Bowling - WORKS |
+| 1500E | 3,397 | same | Sims Pool - WORKS |
+| 1B200 | 0 | same | Lost - divide-by-zero crash |
+| 33333 | 34,088 | same | Texas Hold'em - WORKS |
+| 44444 | 42 | no crash! | Zuma - DMA spin-wait (was FatalMem) |
+| 50513 | 2 | same | Sudoku - minimal renders |
+| 50514 | 346 | same | Solitaire - partial renders |
+| 55555 | 180 | no crash! | Bejeweled - DMA spin-wait (was FatalMem) |
+| 66666 | 10,840 | same | Tetris - WORKS |
+| 77777 | 21,235 | same | Mahjong - WORKS |
+| 88888 | 11,166 | same | Mini Golf - WORKS |
+| 99999 | 42,990 | same | Cubis 2 - WORKS |
+| AAAAA | 24,511 | same | Pac-Man - WORKS |
