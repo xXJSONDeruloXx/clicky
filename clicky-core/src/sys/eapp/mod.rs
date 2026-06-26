@@ -1992,6 +1992,23 @@ impl Eapp {
     /// surface ordinal and always follows steady-state draws. Neutral name;
     /// exact ABI semantics remain unproven.
     fn live_handle_candidate_present(&mut self) {
+        // Lost shader state patch: if we have a bind material with a pending
+        // shader state (0xffffffff at [state_ptr+0x60]), patch it to 0 so the
+        // game's rendering engine thinks the shader compiled. This must happen
+        // during present so the patched value is visible at the start of the
+        // NEXT frame.
+        if let Some(lg) = self.live_gl.as_ref() {
+            let state_ptr = lg.current_state_ptr;
+            let handle = lg.current_handle;
+            if handle < 0x1000_0000 && (state_ptr >= 0x1000_0000 && state_ptr < 0x2000_0000) {
+                let shader_state_off = 0x60;
+                let shader_state = self.read_guest_u32(state_ptr.wrapping_add(shader_state_off)).unwrap_or(0);
+                if shader_state == 0xffffffff {
+                    self.write_guest_u32(state_ptr.wrapping_add(shader_state_off), 0);
+                    info!(target: "EAPP_GL", "present: patched shader state 0xffffffff -> 0 at {:#010x}+0x60", state_ptr);
+                }
+            }
+        }
         let continuous = self
             .live_gl
             .as_ref()
@@ -2454,7 +2471,28 @@ impl Eapp {
             "live_bind_material handle={:#x} state_ptr={:#010x}",
             handle, state_ptr
         );
-        // Pointer handles are work-RAM addresses. Dump the object layout once.
+        // One-time dump of state_ptr object for shader-program materials
+        // (small handle + high state_ptr = likely shader-bound resource)
+        if handle < 0x1000_0000
+            && (state_ptr >= 0x1000_0000 && state_ptr < 0x2000_0000)
+        {
+            if self.dumped_pointer_handles.insert(state_ptr) {
+                let words = self.read_guest_words(state_ptr, 32);
+                let hex: Vec<String> = words.iter().map(|w| format!("{:#010x}", w)).collect();
+                info!(target: "EAPP_GL", "bind_material state_ptr_dump handle={:#x} addr={:#010x} words=[{}]", handle, state_ptr, hex.join(","));
+            }
+            // Lost (1B200): The material object may have 0xffffffff at
+            // offset 0x60 meaning "shader compilation pending". Patched
+            // during candidate_present for the next frame.
+            if self.dumped_pointer_handles.insert(state_ptr) {
+                let words = self.read_guest_words(state_ptr, 32);
+                let shader_state = self.read_guest_u32(state_ptr.wrapping_add(0x60)).unwrap_or(0);
+                let hex: Vec<String> = words.iter().map(|w| format!("{:#010x}", w)).collect();
+                info!(target: "EAPP_GL", "bind_material handle={:#x} state_ptr={:#010x} shader_st={:#010x} words=[{}]", handle, state_ptr, shader_state, hex.join(","));
+            }
+        }
+        // Pointer handles are work-RAM addresses. Dump the object layout once
+        // (via texgen verbose) only if not already dumped above.
         if texgen_verbose_enabled()
             && (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle)
             && self.dumped_pointer_handles.insert(handle)
