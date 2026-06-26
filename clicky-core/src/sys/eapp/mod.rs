@@ -1790,8 +1790,7 @@ impl Eapp {
         // ordinal into persistent state and a software framebuffer. When
         // disabled, the legacy fill-color diagnostic path is used unchanged.
         if self.gl_hle_enabled() {
-            self.handle_open_gl_hle(ordinal, args);
-            return 0;
+            return self.handle_open_gl_hle(ordinal, args);
         }
 
         self.fill_framebuffer(HLE_OPENGL_FRAMEBUFFER);
@@ -1856,7 +1855,7 @@ impl Eapp {
     /// Experimental live GL HLE dispatch. Called for every OpenGLES import
     /// when the flag is enabled. Records state for the observed ordinals and
     /// drives the software framebuffer via `LiveGlState`.
-    fn handle_open_gl_hle(&mut self, ordinal: u32, args: [u32; 4]) {
+    fn handle_open_gl_hle(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
         let frame = self.frame_counter;
         let boundary = matches!(self.live_gl.as_ref(), Some(lg) if frame != lg.last_frame_counter);
         if boundary {
@@ -1891,56 +1890,63 @@ impl Eapp {
             lg.ordinal_trace.push((ordinal, trace_handle));
         }
 
-        match ordinal {
-            99 => self.live_handle_upload(args),
-            137 => self.live_handle_array_def(args),
-            40 => self.live_handle_enable_array(args),
-            169 => self.live_handle_translate(args),
-            159 => self.live_handle_bind_material(args),
-            37 => self.live_handle_draw(args),
-            38 => self.live_handle_draw_elements(args),
-            45 => self.live_handle_resource_upload(args),
+        let ret = match ordinal {
+            99 => { self.live_handle_upload(args); 0 }
+            137 => { self.live_handle_array_def(args); 0 }
+            40 => { self.live_handle_enable_array(args); 0 }
+            169 => { self.live_handle_translate(args); 0 }
+            159 => { self.live_handle_bind_material(args); 0 }
+            37 => { self.live_handle_draw(args); 0 }
+            38 => { self.live_handle_draw_elements(args); 0 }
+            45 => { self.live_handle_resource_upload(args); 0 }
             // Candidate lifecycle from observed live ordering:
             // 158 always precedes all steady-state draws; 157 always follows.
             // Neutral names until exact ABI semantics are proven.
-            158 => self.live_handle_candidate_begin(),
-            157 => self.live_handle_candidate_present(),
-            165 => self.live_handle_ordinal_165(args),
+            158 => { self.live_handle_candidate_begin(); 0 }
+            157 => { self.live_handle_candidate_present(); 0 }
+            165 => { self.live_handle_ordinal_165(args); 0 }
             // Ordinal 164: shader program create/link. Takes pointer to shader
             // binary (rserver.bin), returns a program ID. Must return non-zero
             // so the game sees a valid program. Lost and TWA both use this.
             164 => {
                 // Return a pseudo-handle so the game thinks the program compiled.
                 // The actual shader data at r1 is ignored (no real GPU here).
-                let _program_addr = args[1];
-                // Don't actually return a value here — the import return value
-                // is 0 by default. We need to set the return value differently.
-                // For now, just log and let the game proceed.
+                // A non-zero return is critical: Lost checks the program handle
+                // and won't draw if it's 0 (meaning compilation failed).
                 info!(target: "EAPP_GL", "ordinal_164: shader_create addr={:#010x} len_hint={:#010x}", args[1], args[2]);
+                1u32 // First program handle = 1
             }
             // Ordinal 167: shader program use/bind. Lost doesn't call this but TWA does.
             167 => {
                 info!(target: "EAPP_GL", "ordinal_167: shader_bind program={:#010x}", args[0]);
+                0
             }
             // Ordinal 152: glGetProgramiv or similar query. Lost calls this after 164.
-            // r0=0 r1=buf_ptr r2=buf_size_ptr. May write GL_LINK_STATUS etc.
+            // r0=query_type r1=buf_ptr r2=size_ptr. May write GL_LINK_STATUS etc.
             // Return success by writing 1 (GL_TRUE) at the buffer pointer.
+            // Also write size (4) to size_ptr if provided, and return the
+            // program handle as R0 so the game can use it.
             152 => {
                 if args[1] != 0 {
                     let _ = self.write_guest_u32(args[1], 1); // GL_TRUE = link success
                 }
-                info!(target: "EAPP_GL", "ordinal_152: program_query buf={:#010x} size_ptr={:#010x}", args[1], args[2]);
+                if args[2] != 0 {
+                    let _ = self.write_guest_u32(args[2], 4); // size = 4 bytes
+                }
+                info!(target: "EAPP_GL", "ordinal_152: program_query r0={} buf={:#010x} size_ptr={:#010x}", args[0], args[1], args[2]);
+                1u32 // return program handle 1
             }
             // Ordinal 153: glViewport-like. Some games call this during init.
             153 => {
                 info!(target: "EAPP_GL", "ordinal_153: viewport x={} y={} w={} h={}", args[0], args[1], args[2], args[3]);
+                0
             }
             // Draw-adjacent state ordinals; recorded by observation only.
-            175 | 149 | 125 | 36 => {}
+            175 | 149 | 125 | 36 => 0,
             // Ordinal 148 appears before pointer-backed material draws in the
             // menu phase. Evidence: r0=4, r1=1, r2=0x101029e8 (work RAM ptr).
             // Semantics not yet confirmed — capture args for analysis.
-            148 => self.live_handle_ordinal_148(args),
+            148 => { self.live_handle_ordinal_148(args); 0 }
             // Ordinal 4: glBindTexture(target, texture).
             // r0=target (e.g. 0xDE1=GL_TEXTURE_2D), r1=texture_name.
             // Capture the texture name so that the next ordinal-99 upload
@@ -1955,11 +1961,11 @@ impl Eapp {
                         }
                     }
                 }
+                0
             }
-            _ => {
-                // Unknown/unsupported ordinal; fail safe (no panic).
-            }
-        }
+            _ => 0
+        };
+        ret
     }
 
     /// Candidate begin from observed live ordering: ordinal 158 is the first
@@ -5179,7 +5185,16 @@ impl Eapp {
                             // requests large font buffers whose capacity overlaps the following
                             // heap request object; memset-style short-read filling wipes [req+8]
                             // and the callback PC before the completion trampoline runs.
-                            let delivered = dest != 0 && self.write_guest_bytes(dest, &bytes[..n]);
+                            let should_deliver = if std::env::var_os("CLICKY_EAPP_SKIP_RSERVER").is_some() {
+                                // When set, skip loading rserver.bin so the game keeps its
+                                // original code at 0x10001038 (used by Lost to test if the
+                                // built-in fixed-function engine renders).
+                                !host_path.to_str().map_or(false, |p| p.contains("rserver.bin"))
+                            } else {
+                                true
+                            };
+                            let bytes_delivered = should_deliver && dest != 0 && self.write_guest_bytes(dest, &bytes[..n]);
+                            let delivered = dest != 0 && (bytes_delivered || !should_deliver);
                             if delivered {
                                 // The async completion callback `0x1801fc68`
                                 // is a thin trampoline: it reads
