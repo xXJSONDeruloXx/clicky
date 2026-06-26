@@ -788,6 +788,19 @@ impl LiveGlState {
             skipped_reason: None,
         };
 
+        // NDC-to-pixel scaling for engine families that pass 0–1 positions.
+        let max_coord = positions.iter().map(|p| p.0.max(p.1)).fold(0.0f32, f32::max);
+        let pixel_positions = if max_coord < 2.0 {
+            [
+                (positions[0].0 * FB_WIDTH as f32, positions[0].1 * FB_HEIGHT as f32),
+                (positions[1].0 * FB_WIDTH as f32, positions[1].1 * FB_HEIGHT as f32),
+                (positions[2].0 * FB_WIDTH as f32, positions[2].1 * FB_HEIGHT as f32),
+                (positions[3].0 * FB_WIDTH as f32, positions[3].1 * FB_HEIGHT as f32),
+            ]
+        } else {
+            positions
+        };
+
         if handle == 0x3 {
             if let Some(color) = solid_color {
                 record.selected_upload = None;
@@ -796,7 +809,7 @@ impl LiveGlState {
                     FB_WIDTH,
                     FB_HEIGHT,
                     color,
-                    &positions,
+                    &pixel_positions,
                 );
                 return record;
             }
@@ -809,7 +822,7 @@ impl LiveGlState {
                     FB_WIDTH,
                     FB_HEIGHT,
                     color,
-                    &positions,
+                    &pixel_positions,
                 );
                 return record;
             }
@@ -829,7 +842,7 @@ impl LiveGlState {
             FB_WIDTH,
             FB_HEIGHT,
             &texture,
-            &positions,
+            &pixel_positions,
             &uvs,
             tint,
         );
@@ -885,19 +898,31 @@ impl LiveGlState {
             record.skipped_reason = Some(format!("upload #{upload_idx} has no decoded texture"));
             return record;
         };
+
+        // NDC-to-pixel scaling for engine families that pass 0–1 positions.
+        let max_coord = positions.iter().map(|p| p.0.max(p.1)).fold(0.0f32, f32::max);
+        let pixel_positions: Vec<(f32, f32)> = if max_coord < 2.0 {
+            positions
+                .iter()
+                .map(|(x, y)| (x * FB_WIDTH as f32, y * FB_HEIGHT as f32))
+                .collect()
+        } else {
+            positions.to_vec()
+        };
+
         if let Some(uvs) = uvs {
-            for i in 0..positions.len().saturating_sub(2) {
+            for i in 0..pixel_positions.len().saturating_sub(2) {
                 let tri = [
-                    (positions[i].0, positions[i].1, uvs[i].0, uvs[i].1),
+                    (pixel_positions[i].0, pixel_positions[i].1, uvs[i].0, uvs[i].1),
                     (
-                        positions[i + 1].0,
-                        positions[i + 1].1,
+                        pixel_positions[i + 1].0,
+                        pixel_positions[i + 1].1,
                         uvs[i + 1].0,
                         uvs[i + 1].1,
                     ),
                     (
-                        positions[i + 2].0,
-                        positions[i + 2].1,
+                        pixel_positions[i + 2].0,
+                        pixel_positions[i + 2].1,
                         uvs[i + 2].0,
                         uvs[i + 2].1,
                     ),
