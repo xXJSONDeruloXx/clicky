@@ -57,7 +57,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
 fi
 
 EAPP_BIN="$(cargo metadata --format-version=1 --no-deps 2>/dev/null \
-    | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["target_directory"])'))/debug/eapp"
+    | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["target_directory"])')/debug/eapp"
 
 if [[ -n "${RUST_LOG_OVERRIDE:-}" ]]; then
     export RUST_LOG="$RUST_LOG_OVERRIDE"
