@@ -5345,11 +5345,31 @@ impl Eapp {
     /// The emulator stubs it with minimal responses so games can progress past
     /// their init sequences.
     fn handle_filesystem_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
-        info!(target: "EAPP_IMPORT", "Filesytem:{} pc={:#010x} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
-            ordinal, self.bus.pending_pc, 0, args[0], args[1], args[2], args[3]);
+        // Try to read the path from r1 for diagnostic purposes
+        let path_str = self.try_read_c_string(args[1], 256);
+        info!(target: "EAPP_IMPORT", "Filesytem:{} pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} path={:?}",
+            ordinal, self.bus.pending_pc, args[0], args[1], args[2], args[3], path_str);
         match ordinal {
-            // Ordinal 0: likely filesystem open or init. Return non-zero (success).
-            0 => 1,
+            // Ordinal 0: filesystem open/init. r1=path, r2=flags.
+            // Return 1 (success) and track the file for later reads.
+            0 => {
+                if let Some(path) = path_str.as_deref() {
+                    if let Some(host_path) = self.resolve_or_create_host_path(path) {
+                        if host_path.exists() {
+                            let handle = self.next_async_file_handle;
+                            self.next_async_file_handle = self.next_async_file_handle.wrapping_add(1).max(1);
+                            self.async_open_files.insert(handle, host_path.clone());
+                            // Write handle to the output pointer if provided
+                            if args[2] != 0 {
+                                // r2 might be an output pointer for the handle
+                                // But on the real iPod this might be flags, not a pointer
+                            }
+                            info!(target: "EAPP_IMPORT", "Filesytem:0 opened {} -> handle {}", host_path.display(), handle);
+                        }
+                    }
+                }
+                1
+            }
             // Unknown ordinals: return 0 (no-op).
             _ => {
                 warn!(target: "EAPP_IMPORT", "unhandled Filesytem ordinal {}", ordinal);
