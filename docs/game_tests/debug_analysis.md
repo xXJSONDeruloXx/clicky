@@ -235,3 +235,56 @@ RUST_LOG=EAPP_GL=info,EAPP_IMPORT=info
 | 88888 | 11,166 | same | Mini Golf - WORKS |
 | 99999 | 42,990 | same | Cubis 2 - WORKS |
 | AAAAA | 24,511 | same | Pac-Man - WORKS |
+
+---
+
+## 2026-06-26 Update: Sudoku Fixed, Three New Bugs Found and Fixed
+
+### Bug 1: Present Without Active Frame (Sudoku/SS Engine)
+**Symptom:** Sudoku rendered 1 rasterized draw, then all subsequent frames showed
+`candidate_present without active frame; discarded`.
+
+**Root Cause:** The Sudoku/Solitaire engine never calls ordinal-158 (frame begin).
+Its per-frame loop is: `OpenGLES:159 (bind) → 149 (setup) → 157 (present)`.
+The emulator required ordinal-158 to start a frame, so every present after the
+first was discarded.
+
+**Fix:** Auto-begin a frame when ordinal-157 arrives with no active frame,
+matching the existing pattern for auto-begin on draw calls. Also preserve
+the previous framebuffer content for 0-draw idle frames instead of
+overwriting with black.
+
+### Bug 2: NDC Coordinates → 1 Pixel of Coverage
+**Symptom:** Sudoku's draw showed `cov=1` (1 pixel of rasterization) despite
+being a fullscreen 320×240 quad.
+
+**Root Cause:** Sudoku passes vertex positions in normalized device coordinates
+like `(0,0)→(1.2,0.9)`. The Tetris engine uses pixel coordinates `(0,0)→(320,239)`.
+The rasterizer iterates `min_y..=max_y` clamped to `(0..239)`, so coordinates
+in the 0–1 range only covered 1 pixel row.
+
+**Fix:** Detect NDC coordinates (max_coord < 2.0) and apply viewport-style
+scaling: map `(min_x..max_x, min_y..max_y)` → `(0..FB_WIDTH, 0..FB_HEIGHT)`.
+This both fills the screen and correctly centers the content.
+
+Initially used `x * 320, y * 240` which extended 1.2→384 pixels past the screen
+edge, causing the image to be shifted 30px right. Viewport-style scaling
+fixed the centering.
+
+### Bug 3: Upside-Down Image (Vflip on NDC Frames)
+**Symptom:** Sudoku splash appeared vertically flipped.
+
+**Root Cause:** `CLICKY_GL_PRESENT_VFLIP=1` flips the framebuffer vertically,
+which is needed for pixel-coord engines (Tetris renders bottom-to-top) but
+incorrect for NDC engines (Sudoku renders top-to-bottom).
+
+**Fix:** Added `ndc_frame: bool` field to `LiveGl`, set when NDC scaling is
+applied. The vflip in `complete_frame()` and `present()` is suppressed when
+`ndc_frame` is true.
+
+### Impact
+- Sudoku: 0% → 19% framebuffer content, 120 presented frames, properly
+  centered and right-side-up
+- Solitaire: 0 → 120 presented frames (idle loop now works)
+- Zero regressions in 9 previously working games
+- All 16 unit tests pass
