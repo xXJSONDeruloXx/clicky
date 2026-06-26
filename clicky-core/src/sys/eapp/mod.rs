@@ -56,6 +56,11 @@ const HW_STUB_BASE: u32 = 0x1400_0000;
 const HW_STUB_SIZE: usize = 0x400_0000; // 64 MiB - covers entire 0x14000000..0x18000000 gap
 // (DMA channel register banks at 64KB strides: 0x14000000, 0x14010000, 0x14020000, etc.)
 
+/// PopCap engine DMA framebuffer base — the engine writes RGB565 pixels
+/// directly into this region for display via hardware DMA transfer.
+const DMA_FB_BASE: u32 = 0x1402_0000;
+const DMA_FB_SIZE: usize = 320 * 240 * 2; // 153,600 bytes for 320×240 RGB565
+
 /// Guest callsite for the shared eapp text-runtime "push one char into a
 /// text object" helper. Convention (recovered from disassembly of the Tetris
 /// scalar formatter at `0x18008480..0x1800857c`): `r0 = text_obj`,
@@ -456,6 +461,11 @@ struct EappBus {
     image: Ram,
     image_len: u32,
     work_ram: Ram,
+    /// PopCap engine DMA framebuffer at 0x1402_0000. The engine renders
+    /// into this buffer using its own software rasterizer, then triggers
+    /// a DMA transfer to the LCD. We store the pixels so the GL HLE
+    /// path can present them.
+    dma_framebuf: Ram,
     /// Optional write-watchpoint range (start, end exclusive). When set,
     /// every byte write whose address falls in [start, end) is recorded to
     /// `watch_log` tagged with `pending_pc`. Used for RE: attributing
@@ -556,6 +566,7 @@ impl Eapp {
                 image: image_ram,
                 image_len: mapped_image_len as u32,
                 work_ram,
+                dma_framebuf: Ram::new(320 * 240 * 2), // RGB565 320×240
                 watch: None,
                 pending_pc: 0,
                 watch_log: Vec::new(),
@@ -1855,6 +1866,21 @@ impl Eapp {
         if !continuous {
             return; // one-shot diagnostic capture keeps its existing heuristic
         }
+        // Read DMA framebuffer before borrowing live_gl (for PopCap background)
+        let dma_data = {
+            let mut buf = vec![0u8; DMA_FB_SIZE];
+            self.bus.dma_framebuf.bulk_read(0, &mut buf);
+            buf
+        };
+        let has_dma = dma_data.iter().any(|b| *b != 0x2d);
+
+        // Overlay DMA background into the live_gl framebuffer before completing
+        if has_dma {
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.overlay_dma_rgb565(&dma_data);
+            }
+        }
+
         let completed = match self.live_gl.as_mut().and_then(|lg| lg.complete_frame()) {
             Some(frame) => frame,
             None => {
@@ -6628,7 +6654,21 @@ impl Memory for EappBus {
                 self.work_ram.r32(offset - WORK_RAM_BASE)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(0) // stubbed hardware register
+                let rel = offset - HW_STUB_BASE;
+                if rel < 0x20000 {
+                    // DMA control registers — always return completion
+                    Ok(1)
+                } else {
+                    // DMA framebuffer: read back stored pixel data
+                    let fb_off = (rel - 0x20000) as u32;
+                    if (fb_off as usize) + 4 <= DMA_FB_SIZE {
+                        let mut buf = [0u8; 4];
+                        self.dma_framebuf.bulk_read(fb_off, &mut buf);
+                        Ok(u32::from_le_bytes(buf))
+                    } else {
+                        Ok(0)
+                    }
+                }
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6656,7 +6696,19 @@ impl Memory for EappBus {
                 self.work_ram.w32(offset - WORK_RAM_BASE, val)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(()) // stubbed hardware register (write discard)
+                let rel = offset - HW_STUB_BASE;
+                // DMA framebuffer pixel storage: PopCap engine writes RGB565
+                // pixels at 0x1402_0000+ for display
+                if rel >= 0x20000 {
+                    let fb_off = (rel - 0x20000) as u32;
+                    if (fb_off as usize) + 4 <= DMA_FB_SIZE {
+                        self.dma_framebuf.bulk_write(fb_off, &val.to_le_bytes());
+                    }
+                    if fb_off == 0 && false { // disabled debug log
+                        log::info!(target: "EAPP_HW", "DMA FB first write: off={:#010x} val={:#010x}", offset, val);
+                    }
+                }
+                Ok(()) // write accepted
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6671,7 +6723,19 @@ impl Memory for EappBus {
                 self.work_ram.r8(offset - WORK_RAM_BASE)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(0) // stubbed hardware register
+                let rel = offset - HW_STUB_BASE;
+                if rel < 0x20000 {
+                    Ok(1) // DMA control: always complete
+                } else {
+                    let fb_off = (rel - 0x20000) as usize;
+                    if fb_off < DMA_FB_SIZE {
+                        let mut buf = [0u8; 1];
+                        self.dma_framebuf.bulk_read(fb_off as u32, &mut buf);
+                        Ok(buf[0])
+                    } else {
+                        Ok(0)
+                    }
+                }
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6686,7 +6750,19 @@ impl Memory for EappBus {
                 self.work_ram.r16(offset - WORK_RAM_BASE)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(0) // stubbed hardware register
+                let rel = offset - HW_STUB_BASE;
+                if rel < 0x20000 {
+                    Ok(1) // DMA control: always complete
+                } else {
+                    let fb_off = (rel - 0x20000) as usize;
+                    if fb_off + 2 <= DMA_FB_SIZE {
+                        let mut buf = [0u8; 2];
+                        self.dma_framebuf.bulk_read(fb_off as u32, &mut buf);
+                        Ok(u16::from_le_bytes(buf))
+                    } else {
+                        Ok(0)
+                    }
+                }
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6713,7 +6789,14 @@ impl Memory for EappBus {
                 self.work_ram.w8(offset - WORK_RAM_BASE, val)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(()) // stubbed hardware register (write discard)
+                let rel = offset - HW_STUB_BASE;
+                if rel >= 0x20000 {
+                    let fb_off = (rel - 0x20000) as u32;
+                    if (fb_off as usize) < DMA_FB_SIZE {
+                        self.dma_framebuf.bulk_write(fb_off, &[val]);
+                    }
+                }
+                Ok(())
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6740,7 +6823,14 @@ impl Memory for EappBus {
                 self.work_ram.w16(offset - WORK_RAM_BASE, val)
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
-                Ok(()) // stubbed hardware register (write discard)
+                let rel = offset - HW_STUB_BASE;
+                if rel >= 0x20000 {
+                    let fb_off = (rel - 0x20000) as u32;
+                    if (fb_off as usize) + 2 <= DMA_FB_SIZE {
+                        self.dma_framebuf.bulk_write(fb_off, &val.to_le_bytes());
+                    }
+                }
+                Ok(())
             }
             _ => Err(MemException::Unexpected),
         }

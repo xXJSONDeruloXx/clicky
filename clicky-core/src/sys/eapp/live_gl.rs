@@ -443,6 +443,49 @@ impl LiveGlState {
 
     /// Finalize the active frame at the candidate present event (ordinal 157).
     /// Copies active → completed → presented (with optional vflip) and returns
+    /// Composite the DMA-rendered RGB565 background with the live_gl
+    /// framebuffer. PopCap engine writes its background into hardware DMA
+    /// buffer at 0x1402_0000, then GL draws overlay text/sprites on top.
+    /// This method takes the DMA background, then alpha-blends the current
+    /// framebuffer (which has transparent background + opaque sprites) on top.
+    pub fn overlay_dma_rgb565(&mut self, rgb565: &[u8]) {
+        if rgb565.len() < FB_WIDTH * FB_HEIGHT * 2 {
+            return;
+        }
+        let mut nonzero_count = 0usize;
+        for y in 0..FB_HEIGHT {
+            let src_y = if self.ndc_frame || !self.present_vflip {
+                y
+            } else {
+                FB_HEIGHT - 1 - y
+            };
+            for x in 0..FB_WIDTH {
+                let src_idx = (src_y * FB_WIDTH + x) * 2;
+                let raw = u16::from_le_bytes([rgb565[src_idx], rgb565[src_idx + 1]]);
+                if raw != 0 {
+                    nonzero_count += 1;
+                }
+                let r = ((raw >> 11) & 0x1F) as u8;
+                let g = ((raw >> 5) & 0x3F) as u8;
+                let b = (raw & 0x1F) as u8;
+                let r8 = (r << 3) | (r >> 2);
+                let g8 = (g << 2) | (g >> 4);
+                let b8 = (b << 3) | (b >> 2);
+                let dst = self.framebuffer[y * FB_WIDTH + x];
+                let alpha = dst.a as u32;
+                // Alpha blend: dst over DMA background
+                let inv_a = 255 - alpha;
+                let out_r = ((r8 as u32 * inv_a + dst.r as u32 * alpha) / 255) as u8;
+                let out_g = ((g8 as u32 * inv_a + dst.g as u32 * alpha) / 255) as u8;
+                let out_b = ((b8 as u32 * inv_a + dst.b as u32 * alpha) / 255) as u8;
+                self.framebuffer[y * FB_WIDTH + x] = Rgba8::rgba(out_r, out_g, out_b, 255);
+            }
+        }
+        if nonzero_count > 0 {
+            log::info!(target: "EAPP_GL", "DMA overlay: {}/{} non-zero pixels", nonzero_count, FB_PIXELS);
+        }
+    }
+
     /// the completed-frame metadata. Returns None if no frame is active
     /// (present without begin). The active `framebuffer` is left untouched;
     /// it is cleared by the next boundary reset / begin.
