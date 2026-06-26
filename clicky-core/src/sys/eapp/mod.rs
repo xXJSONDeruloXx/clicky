@@ -6810,7 +6810,6 @@ impl Memory for EappBus {
                         if fb_off == 0 && self.hw_fb_write_count > 1 {
                             self.hw_dma_frame += 1;
                         }
-                        // (DMA write verification disabled)
                     }
                 }
                 Ok(())
