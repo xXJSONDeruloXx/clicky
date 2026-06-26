@@ -723,17 +723,20 @@ impl Eapp {
     /// DMA buffer at 0x1402_0000 and does NOT use the GL lifecycle (no
     /// ordinal-158/157 calls). So we must inject a frame present here.
     fn maybe_present_dma_frame(&mut self) {
+        // Only present once the DMA buffer is fully written. PopCap games
+        // write the entire 320×240 RGB565 buffer in one pass (~38K w32 writes).
+        // Presenting a partially-written buffer shows a half-rendered frame.
+        let fully_written = self.bus.hw_fb_write_max as usize >= DMA_FB_SIZE - 256;
+        if !fully_written {
+            return;
+        }
+
         // Read DMA buffer
         let dma_data = {
             let mut buf = vec![0u8; DMA_FB_SIZE];
             self.bus.dma_framebuf.bulk_read(0, &mut buf);
             buf
         };
-        // Only present once the buffer is mostly-filled
-        let coverage = dma_data.iter().filter(|b| **b != 0x2d).count();
-        if coverage < DMA_FB_SIZE / 2 {
-            return;
-        }
 
         // Overlay DMA into live_gl and complete frame
         let completed = if let Some(lg) = self.live_gl.as_mut() {

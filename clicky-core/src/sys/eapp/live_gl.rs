@@ -460,11 +460,12 @@ impl LiveGlState {
         }
         let mut nonzero_count = 0usize;
         for y in 0..FB_HEIGHT {
-            let src_y = if self.ndc_frame || !self.present_vflip {
-                y
-            } else {
-                FB_HEIGHT - 1 - y
-            };
+            // DMA framebuffer is in display orientation (top-to-bottom).
+            // GL framebuffer is in OpenGL orientation (bottom-to-top, needs vflip).
+            // When overlaying DMA data, always read top-to-bottom regardless
+            // of vflip setting — the vflip is applied separately during
+            // present() to the entire composited framebuffer.
+            let src_y = y;
             for x in 0..FB_WIDTH {
                 let src_idx = (src_y * FB_WIDTH + x) * 2;
                 let raw = u16::from_le_bytes([rgb565[src_idx], rgb565[src_idx + 1]]);
