@@ -418,6 +418,9 @@ pub struct Eapp {
     /// into the caller's file object.
     async_open_files: HashMap<u32, PathBuf>,
     next_async_file_handle: u32,
+    /// Directory entries from most recent AsyncFileIO:7 directory enumeration.
+    /// Stored so the game can query pack names via subsequent calls.
+    async_dir_entries: Vec<String>,
     /// Optional inclusive frame window in which to log every OpenGLES call
     /// with full args + return address, for reverse-engineering the GL stream.
     gl_trace_frames: Option<(u64, u64)>,
@@ -621,6 +624,7 @@ impl Eapp {
             async_pending_requests: HashSet::new(),
             async_open_files: HashMap::new(),
             next_async_file_handle: 1,
+            async_dir_entries: Vec::new(),
             gl_trace_frames: None,
             gl_capture: None,
             staged_file_generation: 0,
@@ -5233,6 +5237,69 @@ impl Eapp {
                 }
                 self.async_pending_requests.remove(&req);
                 warn!(target: "EAPP_IMPORT", "AsyncFileIO:3 missing host path {}", path);
+                return 0;
+            }
+
+            if ordinal == 7 {
+                // Directory enumeration: list subdirectories of the given path.
+                // Uses the same request-object protocol as ordinal 3:
+                //   r3 = request object with callback at [r3+0x34]/[r3+0x38]
+                //   [r3+0x04] = max entries (game pre-allocates for this many)
+                //   [r3+0x10] = operation type (1 = directory enum)
+                // The completion callback receives (req, ctx) after the enumeration.
+                // We write status=1 (success) and count=N to the request object,
+                // then queue the callback.
+                //
+                // The game's callback at 0x1804862c reads the result from
+                // the callback context (0x180fb264), which is a game-internal
+                // pack-list structure. The callback fills in the pack data
+                // and the game's main loop can then access it.
+                let req = args[3];
+                if req != 0 {
+                    let cb_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
+                    let cb_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
+
+                    if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                        let mut entries = Vec::new();
+                        if let Ok(read_dir) = fs::read_dir(&host_path) {
+                            for entry in read_dir.flatten() {
+                                let full = host_path.join(entry.file_name());
+                                let is_dir = fs::metadata(&full).map(|m| m.is_dir()).unwrap_or(false);
+                                if is_dir {
+                                    if let Some(name) = entry.file_name().to_str() {
+                                        entries.push(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        entries.sort();
+                        let count = entries.len();
+
+                        // Store pack names in the EappBus so the game can
+                        // query them later via subsequent AsyncFileIO calls.
+                        self.async_dir_entries = entries.clone();
+
+                        // Set completion status and count in the request object.
+                        // Status 0 = success (matching the \"golden\" ordinal-3 convention).
+                        self.write_guest_u32(req.wrapping_add(0x20), 0); // status = success
+                        self.write_guest_u32(req.wrapping_add(0x24), count as u32); // result = entry count
+
+                        // Queue async completion callback
+                        if cb_pc != 0 {
+                            self.async_callback_queued_count =
+                                self.async_callback_queued_count.wrapping_add(1);
+                            self.pending_guest_calls.push_back(PendingGuestCall {
+                                pc: cb_pc,
+                                arg0: req,
+                                arg1: cb_ctx,
+                            });
+                        }
+
+                        info!(target: "EAPP_IMPORT", "AsyncFileIO:7 enum {} -> {} entries: {:?} cb_pc={:#010x}", host_path.display(), count, entries, cb_pc);
+                        return 1; // request accepted
+                    }
+                }
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:7 missing host path {}", path);
                 return 0;
             }
 
