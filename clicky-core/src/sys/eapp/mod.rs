@@ -2315,11 +2315,36 @@ impl Eapp {
     /// valid client array also marks that slot enabled.
     fn live_handle_array_def(&mut self, args: [u32; 4]) {
         let array_index = args[0];
-        let component_count = args[1];
+        let mut component_count = args[1];
         let format = args[2];
         let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         let stride = self.read_guest_u32(sp).unwrap_or(0);
         let guest_ptr = self.read_guest_u32(sp.wrapping_add(0x04)).unwrap_or(0);
+        // VBO fix: when a VBO is active, the game may pass a VBO offset/pointer
+        // in args[1] instead of a real component count. Detect this by checking
+        // for absurdly large values and infer the real count from format+stride.
+        // GL_FIXED is 4 bytes per component. If stride > 0, estimate comps from
+        // stride / sizeof(GLfixed). Otherwise, use the last known good count.
+        if component_count > 32 {
+            let inferred = if format == live_gl::GL_FIXED && stride > 0 && stride % 4 == 0 {
+                let total_comps = stride / 4; // total components across all arrays in this struct
+                // For the position array (idx=0), typically 4 comps (x,y,z,w)
+                // For UV array (idx=1), typically 2 comps (u,v)
+                // Use a conservative estimate based on array_index
+                if array_index == 0 { total_comps.min(4) }
+                else if array_index == 1 { 2 }
+                else { 4 }
+            } else {
+                // Fallback: use 4 for pos, 2 for UV
+                if array_index == 0 { 4 } else if array_index == 1 { 2 } else { 4 }
+            };
+            info!(
+                target: "EAPP_GL",
+                "live_array idx={} VBO-mode comps={:#x} -> inferred {} (fmt={:#x} stride={})",
+                array_index, component_count, inferred, format, stride
+            );
+            component_count = inferred;
+        }
         let valid = guest_ptr != 0 && component_count != 0;
         info!(
             target: "EAPP_GL",
@@ -3342,6 +3367,8 @@ impl Eapp {
     ) -> Option<Vec<(f32, f32)>> {
         let def = def.as_ref()?;
         if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count < 2 {
+            info!(target: "EAPP_GL", "positions_range failed: enabled={} valid={} fmt={:#x} comps={}",
+                enabled, def.valid, def.format, def.component_count);
             return None;
         }
         let pts = self.read_fixed_array_range(
