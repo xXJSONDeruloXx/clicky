@@ -1914,6 +1914,37 @@ impl Eapp {
                 // A non-zero return is critical: Lost checks the program handle
                 // and won't draw if it's 0 (meaning compilation failed).
                 info!(target: "EAPP_GL", "ordinal_164: shader_create addr={:#010x} len_hint={:#010x}", args[1], args[2]);
+                // Scan the rserver header after the game calls ordinal-164 to see
+                // if the iPod's GL driver has written anything there. For Lost,
+                // rserver.bin is loaded at 0x10001038, and the 0x200-byte header
+                // is at 0x10001038..0x10001237.
+                let bin_addr = args[1];
+                if bin_addr >= 0x10000000 && bin_addr < 0x10800000 {
+                    let header_start = bin_addr;
+                    let header_words = self.read_guest_words(header_start, 0x80); // First 128 words (0x200 bytes)
+                    let non_zero: Vec<(String, u32)> = header_words.iter().enumerate()
+                        .filter(|(_, &w)| w != 0)
+                        .map(|(i, w)| (format!("+0x{:03x}", i * 4), *w))
+                        .collect();
+                    if !non_zero.is_empty() {
+                        let summary: Vec<String> = non_zero.iter()
+                            .map(|(off, val)| format!("{}={:#010x}", off, val))
+                            .collect();
+                        info!(target: "EAPP_GL", "ordinal_164: rserver header non-zero: {}", summary.join(", "));
+                    } else {
+                        info!(target: "EAPP_GL", "ordinal_164: rserver header all zeros (0x200 bytes)");
+                    }
+                    // Nuclear option: fill the rserver header with incrementing values
+                    // to see if the game's rendering engine uses any of them.
+                    // Behind CLICKY_EAPP_FILL_RSERVER_HEADER=1 env var.
+                    if std::env::var_os("CLICKY_EAPP_FILL_RSERVER_HEADER").is_some() {
+                        for i in 0..0x80 {
+                            let val = (i + 1) as u32; // 1, 2, 3, ...
+                            self.write_guest_u32(header_start.wrapping_add(i * 4), val);
+                        }
+                        info!(target: "EAPP_GL", "ordinal_164: filled rserver header with incrementing values (1..128)");
+                    }
+                }
                 1u32 // First program handle = 1
             }
             // Ordinal 167: shader program use/bind. Lost doesn't call this but TWA does.
