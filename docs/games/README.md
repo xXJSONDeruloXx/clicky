@@ -19,7 +19,7 @@ Game-by-game compatibility and launch documentation.
 | Zuma | 44444 | — | ⚠️ DMA WAIT | [→](44444_zuma.md) |
 | Solitaire | 50514 | — | ⚠️ PARTIAL | — |
 | Vortex | 12345 | — | ⚠️ PARTIAL | — |
-| Sudoku | 50513 | — | 👀 MINIMAL | — |
+| Sudoku | 50513 | — | ✅ SPLASH | [→](50513_sudoku.md) |
 | TWA/iQuiz | 11002 | — | ❌ NO GFX | [→](11002_twa.md) |
 | Lost | 1B200 | — | ❌ CRASH | [→](1B200_lost.md) |
 
