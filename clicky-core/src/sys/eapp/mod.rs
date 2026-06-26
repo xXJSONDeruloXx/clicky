@@ -49,6 +49,13 @@ const WORK_RAM_BASE: u32 = 0x1000_0000;
 // 0x1080_0000 (8 MiB) and 0x1200_0000 (32 MiB).
 const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
 
+/// Base address of stubbed hardware registers (observed in Zuma/Bejeweled at
+/// `0x1400000c`). On real iPod hardware this region contains DMA/display FIFO
+/// registers; the emulator stubs it with read-zero/write-discard semantics.
+const HW_STUB_BASE: u32 = 0x1400_0000;
+const HW_STUB_SIZE: usize = 0x400_0000; // 64 MiB - covers entire 0x14000000..0x18000000 gap
+// (DMA channel register banks at 64KB strides: 0x14000000, 0x14010000, 0x14020000, etc.)
+
 /// Guest callsite for the shared eapp text-runtime "push one char into a
 /// text object" helper. Convention (recovered from disassembly of the Tetris
 /// scalar formatter at `0x18008480..0x1800857c`): `r0 = text_obj`,
@@ -6565,6 +6572,13 @@ impl Device for EappBus {
                     next: Box::new(self.work_ram.probe(offset - WORK_RAM_BASE)),
                 }
             }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Probe::Device {
+                    kind: "HWStub",
+                    label: Some("eapp-hw-stub"),
+                    next: Box::new(Probe::Unmapped),
+                }
+            }
             _ => Probe::Unmapped,
         }
     }
@@ -6583,6 +6597,9 @@ impl Memory for EappBus {
             }
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.r32(offset - WORK_RAM_BASE)
+            }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(0) // stubbed hardware register
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6609,6 +6626,9 @@ impl Memory for EappBus {
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.w32(offset - WORK_RAM_BASE, val)
             }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(()) // stubbed hardware register (write discard)
+            }
             _ => Err(MemException::Unexpected),
         }
     }
@@ -6621,6 +6641,9 @@ impl Memory for EappBus {
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.r8(offset - WORK_RAM_BASE)
             }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(0) // stubbed hardware register
+            }
             _ => Err(MemException::Unexpected),
         }
     }
@@ -6632,6 +6655,9 @@ impl Memory for EappBus {
             }
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.r16(offset - WORK_RAM_BASE)
+            }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(0) // stubbed hardware register
             }
             _ => Err(MemException::Unexpected),
         }
@@ -6657,6 +6683,9 @@ impl Memory for EappBus {
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.w8(offset - WORK_RAM_BASE, val)
             }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(()) // stubbed hardware register (write discard)
+            }
             _ => Err(MemException::Unexpected),
         }
     }
@@ -6680,6 +6709,9 @@ impl Memory for EappBus {
             }
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
                 self.work_ram.w16(offset - WORK_RAM_BASE, val)
+            }
+            HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
+                Ok(()) // stubbed hardware register (write discard)
             }
             _ => Err(MemException::Unexpected),
         }

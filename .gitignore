@@ -12,3 +12,4 @@ sysdump.log
 docs/sc_info/CoreFP.dll
 docs/sc_info/SC Info.sidd
 docs/sc_info/accounts/*/SC Info.sidd
+docs/game_tests/debug_logs/
