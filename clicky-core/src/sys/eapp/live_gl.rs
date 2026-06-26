@@ -190,6 +190,8 @@ pub struct LiveGlState {
     /// True when a DMA overlay has been applied to the current frame.
     /// Causes complete_frame to use the framebuffer even with 0 GL draws.
     pub has_dma_overlay: bool,
+    /// Game identifier for PPM dump filenames.
+    pub game_id: String,
     /// Monotonic count of completed/presented frames.
     pub completed_frame_index: u64,
     /// Candidate frame-begin ordinal, derived from observed ordering (always
@@ -225,7 +227,7 @@ pub struct LiveGlState {
 }
 
 impl LiveGlState {
-    pub fn new(present_vflip: bool, gate_b: bool, continuous_capture: bool) -> Self {
+    pub fn new(present_vflip: bool, gate_b: bool, continuous_capture: bool, game_id: String) -> Self {
         Self {
             uploads: Vec::new(),
             resource_uploads_by_handle: HashMap::new(),
@@ -257,6 +259,7 @@ impl LiveGlState {
             presented_buffer: vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS],
             frame_active: false,
             has_dma_overlay: false,
+            game_id,
             completed_frame_index: 0,
             candidate_begin_ordinal: 158,
             candidate_present_ordinal: 157,
@@ -1173,7 +1176,7 @@ mod tests {
 
     #[test]
     fn select_upload_prefers_tex_name_then_falls_back_to_dims() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         // Two uploads with identical dimensions but distinct GL texture names.
         lg.uploads.push(LiveGlState::build_upload(
             0,
@@ -1219,7 +1222,7 @@ mod tests {
 
     #[test]
     fn select_upload_matches_by_dimensions() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         lg.uploads.push(LiveGlState::build_upload(
             0,
             0x0de1,
@@ -1249,7 +1252,7 @@ mod tests {
 
     #[test]
     fn select_upload_for_uvs_uses_smallest_containing_atlas_when_span_is_subrect() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         lg.uploads.push(LiveGlState::build_upload(
             0,
             0x0de1,
@@ -1278,7 +1281,7 @@ mod tests {
 
     #[test]
     fn tex_name_match_must_contain_uvs_before_it_wins() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         // Intended menu strip upload.
         lg.uploads.push(LiveGlState::build_upload(
             0,
@@ -1318,7 +1321,7 @@ mod tests {
 
     #[test]
     fn same_tex_name_uv_fallback_beats_unrelated_exact_dimensions() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         // Unrelated exact 50x50 upload with another tex name (EA logo).
         lg.uploads.push(LiveGlState::build_upload(
             0,
@@ -1367,7 +1370,7 @@ mod tests {
 
     #[test]
     fn generated_text_uvs_prefer_matching_font_cell_atlas() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         lg.uploads.push(LiveGlState::build_upload(
             0,
             0x0de1,
@@ -1421,7 +1424,7 @@ mod tests {
 
     #[test]
     fn present_applies_configurable_vflip_only_when_enabled() {
-        let mut lg = LiveGlState::new(false, false, false);
+        let mut lg = LiveGlState::new(false, false, false, "test".to_string());
         lg.framebuffer[0] = Rgba8::rgba(255, 0, 0, 255);
         lg.framebuffer[FB_WIDTH * (FB_HEIGHT - 1)] = Rgba8::rgba(0, 0, 255, 255);
         let no_flip = lg.present();
@@ -1452,7 +1455,7 @@ mod tests {
 
     #[test]
     fn reset_for_frame_clears_per_frame_state_but_keeps_uploads() {
-        let mut lg = LiveGlState::new(true, false, false);
+        let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         lg.uploads.push(LiveGlState::build_upload(
             0,
             0x0de1,

@@ -528,6 +528,7 @@ impl Eapp {
     }
 
     pub fn from_image(image: EappImage) -> Result<Eapp, EappBuildError> {
+        let game_id = image.metadata.title.replace(' ', "_").to_ascii_lowercase();
         let render_state = Arc::new(Mutex::new(vec![DEFAULT_FRAMEBUFFER; SCREEN_PIXELS]));
         let input_state = Arc::new(Mutex::new(EappInputState::default()));
         let controls = make_controls(Arc::clone(&input_state));
@@ -629,7 +630,7 @@ impl Eapp {
             gl_capture: None,
             staged_file_generation: 0,
             halted: false,
-            live_gl: Self::maybe_init_live_gl(),
+            live_gl: Self::maybe_init_live_gl(game_id),
         };
         eapp.bus.watch = Self::parse_watch_env();
         Ok(eapp)
@@ -1822,7 +1823,7 @@ impl Eapp {
     /// Read the experimental GL HLE env flags and construct live state only
     /// when `CLICKY_EXPERIMENTAL_GL_HLE=1`. Returns `None` (legacy path) when
     /// the flag is absent or not enabled, so default behavior is unchanged.
-    fn maybe_init_live_gl() -> Option<LiveGlState> {
+    fn maybe_init_live_gl(game_id: String) -> Option<LiveGlState> {
         let enabled = std::env::var_os("CLICKY_EXPERIMENTAL_GL_HLE")
             .map(|v| v.to_string_lossy() == "1")
             .unwrap_or(false);
@@ -1847,7 +1848,7 @@ impl Eapp {
             "experimental GL HLE enabled: present_vflip={} gate_b={} continuous={} dump_frames={}",
             present_vflip, gate_b, continuous, dump_frames
         );
-        let mut lg = LiveGlState::new(present_vflip, gate_b, continuous);
+        let mut lg = LiveGlState::new(present_vflip, gate_b, continuous, game_id);
         lg.dump_remaining = dump_frames;
         Some(lg)
     }
@@ -2101,7 +2102,7 @@ impl Eapp {
                 let w3 = self.read_guest_u32(desc_ptr.wrapping_add(12)).unwrap_or(0);
                 let w4 = self.read_guest_u32(desc_ptr.wrapping_add(16)).unwrap_or(0);
                 let w5 = self.read_guest_u32(desc_ptr.wrapping_add(20)).unwrap_or(0);
-                info!(target: "EAPP_GL", "ordinal_45 desc missed: ptr={:#010x} w0={:#010x} w1={:#010x} w2={:#010x} w3={:#010x} w4={:#010x} w5={:#010x} small={} gl_fmt={} prep_w={} prep_h={}",
+                debug!(target: "EAPP_GL", "ordinal_45 desc missed: ptr={:#010x} w0={:#010x} w1={:#010x} w2={:#010x} w3={:#010x} w4={:#010x} w5={:#010x} small={} gl_fmt={} prep_w={} prep_h={}",
                     desc_ptr, w0, w1, w2, w3, w4, w5, is_small_handle, is_gl_format, prep_width, prep_height);
             }
         }
@@ -3367,7 +3368,7 @@ impl Eapp {
     ) -> Option<Vec<(f32, f32)>> {
         let def = def.as_ref()?;
         if !enabled || !def.valid || def.format != live_gl::GL_FIXED || def.component_count < 2 {
-            info!(target: "EAPP_GL", "positions_range failed: enabled={} valid={} fmt={:#x} comps={}",
+            debug!(target: "EAPP_GL", "positions_range failed: enabled={} valid={} fmt={:#x} comps={}",
                 enabled, def.valid, def.format, def.component_count);
             return None;
         }
@@ -4055,8 +4056,8 @@ impl Eapp {
             let internal = lg.internal_hash();
             let presented = lg.presented_hash();
             let wrote = lg.write_diagnostic_ppms(
-                std::path::Path::new("/tmp/tetris_live_gl_hle_internal.ppm"),
-                std::path::Path::new("/tmp/tetris_live_gl_hle_presented.ppm"),
+                std::path::Path::new(&format!("/tmp/{}_live_gl_hle_internal.ppm", lg.game_id)),
+                std::path::Path::new(&format!("/tmp/{}_live_gl_hle_presented.ppm", lg.game_id)),
             );
             lg.presented = Some(lg.present());
             info!(
@@ -4305,7 +4306,7 @@ impl Eapp {
             if lg.dump_remaining == 0 {
                 return;
             }
-            let path = format!("/tmp/tetris_live_frame_{:04}.ppm", lg.dump_counter);
+            let path = format!("/tmp/{}_live_frame_{:04}.ppm", lg.game_id, lg.dump_counter);
             lg.dump_counter += 1;
             lg.dump_remaining -= 1;
             (path, lg.presented_buffer.clone())
