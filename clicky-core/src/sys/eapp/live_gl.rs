@@ -157,6 +157,10 @@ pub struct LiveGlState {
     pub candidate_frames: usize,
     pub captured_first_frame: bool,
     pub present_vflip: bool,
+    /// If true, the current frame used NDC (0–1) positions that were scaled
+    /// to pixel coords. NDC engine families render top-to-bottom, so the
+    /// usual bottom-to-top vflip should be suppressed for these frames.
+    pub ndc_frame: bool,
     pub gate_b: bool,
     pub continuous_capture: bool,
     pub last_frame_counter: u64,
@@ -237,6 +241,7 @@ impl LiveGlState {
             candidate_frames: 0,
             captured_first_frame: false,
             present_vflip,
+            ndc_frame: false,
             gate_b,
             continuous_capture,
             last_frame_counter: 0,
@@ -280,6 +285,7 @@ impl LiveGlState {
         self.draws.clear();
         self.draw_count_in_frame = 0;
         self.ordinal_trace.clear();
+        self.ndc_frame = false;
         // Scalar-formatter char sequences are rebuilt by the guest each frame,
         // so drop the prior frame's recorded pushes+consumption.
         self.text_char_seqs.clear();
@@ -479,7 +485,9 @@ impl LiveGlState {
 
         self.completed_buffer.copy_from_slice(&self.framebuffer);
         let mut presented = self.framebuffer.clone();
-        if self.present_vflip {
+        // Pixel-coord engines (Tetris) render bottom-to-top so need vflip.
+        // NDC engines (Sudoku/Solitaire) render top-to-bottom and don't.
+        if self.present_vflip && !self.ndc_frame {
             flip_vertical_in_place(&mut presented, FB_WIDTH, FB_HEIGHT);
         }
         self.presented_buffer.copy_from_slice(&presented);
@@ -789,14 +797,23 @@ impl LiveGlState {
         };
 
         // NDC-to-pixel scaling for engine families that pass 0–1 positions.
+        // These engines use a projection where the full screen maps to a
+        // (0,0)–(1.something, 0.something) NDC range. Rather than just
+        // multiplying by screen dims (which clips if max > 1.0), we treat
+        // the NDC quad as if it should fill the viewport: find the min/max
+        // extents and scale them to (0, FB_WIDTH) × (0, FB_HEIGHT).
         let max_coord = positions.iter().map(|p| p.0.max(p.1)).fold(0.0f32, f32::max);
         let pixel_positions = if max_coord < 2.0 {
-            [
-                (positions[0].0 * FB_WIDTH as f32, positions[0].1 * FB_HEIGHT as f32),
-                (positions[1].0 * FB_WIDTH as f32, positions[1].1 * FB_HEIGHT as f32),
-                (positions[2].0 * FB_WIDTH as f32, positions[2].1 * FB_HEIGHT as f32),
-                (positions[3].0 * FB_WIDTH as f32, positions[3].1 * FB_HEIGHT as f32),
-            ]
+            self.ndc_frame = true;
+            let (min_x, min_y, max_x, max_y) = bounds;
+            // Shift and scale so (min_x, min_y)–(max_x, max_y) maps to
+            // (0, 0)–(FB_WIDTH, FB_HEIGHT).
+            let range_x = (max_x - min_x).max(0.001);
+            let range_y = (max_y - min_y).max(0.001);
+            positions.map(|(x, y)| {
+                ((x - min_x) / range_x * FB_WIDTH as f32,
+                 (y - min_y) / range_y * FB_HEIGHT as f32)
+            })
         } else {
             positions
         };
@@ -902,9 +919,19 @@ impl LiveGlState {
         // NDC-to-pixel scaling for engine families that pass 0–1 positions.
         let max_coord = positions.iter().map(|p| p.0.max(p.1)).fold(0.0f32, f32::max);
         let pixel_positions: Vec<(f32, f32)> = if max_coord < 2.0 {
+            self.ndc_frame = true;
+            let min_x = positions.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+            let min_y = positions.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+            let max_x = positions.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+            let max_y = positions.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+            let range_x = (max_x - min_x).max(0.001);
+            let range_y = (max_y - min_y).max(0.001);
             positions
                 .iter()
-                .map(|(x, y)| (x * FB_WIDTH as f32, y * FB_HEIGHT as f32))
+                .map(|(x, y)| (
+                    (x - min_x) / range_x * FB_WIDTH as f32,
+                    (y - min_y) / range_y * FB_HEIGHT as f32,
+                ))
                 .collect()
         } else {
             positions.to_vec()
@@ -945,7 +972,7 @@ impl LiveGlState {
     /// never mutated by presentation.
     pub fn present(&self) -> Vec<Rgba8> {
         let mut out = self.framebuffer.clone();
-        if self.present_vflip {
+        if self.present_vflip && !self.ndc_frame {
             flip_vertical_in_place(&mut out, FB_WIDTH, FB_HEIGHT);
         }
         out
