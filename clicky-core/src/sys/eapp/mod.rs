@@ -1858,18 +1858,28 @@ impl Eapp {
         let completed = match self.live_gl.as_mut().and_then(|lg| lg.complete_frame()) {
             Some(frame) => frame,
             None => {
-                warn!(target: "EAPP_GL", "candidate_present without active frame; discarded");
-                return;
+                // The Sims/Sudoku/Solitaire engine family never calls
+                // ordinal-158 (begin frame). Its per-frame loop is
+                // 159 → 149 → 157 with no explicit begin. Auto-begin
+                // so the present can succeed, the same way draws auto-
+                // begin when ordinal-158 is absent.
+                if let Some(lg) = self.live_gl.as_mut() {
+                    lg.begin_frame();
+                }
+                match self.live_gl.as_mut().and_then(|lg| lg.complete_frame()) {
+                    Some(frame) => frame,
+                    None => {
+                        warn!(target: "EAPP_GL", "candidate_present auto-begin still failed; discarded");
+                        return;
+                    }
+                }
             }
         };
 
-        // Continuous rendering publishes completed, non-empty 158→157 frames.
-        // The old `== 4` gate was useful while validating the static splash,
-        // but after runtime time starts advancing Tetris legitimately emits
-        // 3-draw loading frames and later higher-draw menu frames. Rasterizer
-        // behavior is unchanged; this only avoids pinning the window to the
-        // last 4-draw splash frame.
-        let should_present = completed.draw_count > 0;
+        // Continuous rendering publishes completed frames. 0-draw idle
+        // frames (Sudoku/Solitaire input-wait loops) now preserve the
+        // previous frame's content, so they are safe to present.
+        let should_present = true;
         self.live_log_completed_frame(&completed, should_present);
         self.live_log_signature_detail(&completed);
         if should_present {

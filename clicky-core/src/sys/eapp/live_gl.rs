@@ -455,6 +455,20 @@ impl LiveGlState {
                 "clear_without_draws ordinal={} (present with zero draws)",
                 self.candidate_present_ordinal
             ));
+            // 0-draw frames (input-wait idle loops in Sudoku/Solitaire)
+            // would overwrite the good framebuffer with the cleared (black)
+            // content. Instead, keep the previously presented frame and just
+            // advance the index.
+            self.completed_frame_index += 1;
+            let prev_hash = framebuffer_hash(&self.presented_buffer);
+            return Some(CompletedFrame {
+                index: self.completed_frame_index,
+                draw_count,
+                skipped_draws: self.skipped_draws_this_frame,
+                internal_hash: framebuffer_hash(&self.completed_buffer),
+                presented_hash: prev_hash,
+                handle_signature: vec![],
+            });
         }
         if draw_count != 0 && draw_count != 4 {
             self.push_anomaly(format!(
