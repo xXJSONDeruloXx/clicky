@@ -823,6 +823,13 @@ impl LiveGlState {
             self.select_upload_by_tex_name_containing(handle, &uvs)
                 .or_else(|| self.select_upload_for_uv_slice_with_tex_name(handle, &uvs))
                 .or_else(|| self.select_upload_for_uvs(&uvs))
+                .or_else(|| {
+                    if state_ptr != 0 && state_ptr < 0x1000_0000 && state_ptr != handle {
+                        self.select_upload_for_uv_slice_with_tex_name(state_ptr, &uvs)
+                    } else {
+                        None
+                    }
+                })
         } else {
             self.select_upload_by_tex_name(handle)
         };
@@ -935,7 +942,16 @@ impl LiveGlState {
         let selected_upload = uvs
             .and_then(|uvs| self.select_upload_by_tex_name_containing_slice(handle, uvs))
             .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice_with_tex_name(handle, uvs)))
-            .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs)));
+            .or_else(|| uvs.and_then(|uvs| self.select_upload_for_uv_slice(uvs)))
+            // 4th fallback: some engines (e.g. Solitaire) put the GL texture
+            // name in state_ptr rather than handle. Try matching by state_ptr.
+            .or_else(|| {
+                if state_ptr != 0 && state_ptr < 0x1000_0000 && state_ptr != handle {
+                    uvs.and_then(|uvs| self.select_upload_for_uv_slice_with_tex_name(state_ptr, uvs))
+                } else {
+                    None
+                }
+            });
         let mut record = LiveDrawRecord {
             draw_index,
             handle,
