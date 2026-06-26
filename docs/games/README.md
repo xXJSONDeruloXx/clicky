@@ -16,14 +16,14 @@ Game-by-game compatibility and launch documentation.
 | Sims Bowling | 1500C | `./scripts/simsbowling.sh` | ✅ WORKS | [→](1500C_simsbowling.md) |
 | Sims Pool | 1500E | `./scripts/simspool.sh` | ✅ WORKS | [→](1500E_simspool.md) |
 | Sudoku | 50513 | — | ✅ WORKS | [→](50513_sudoku.md) |
-| Solitaire | 50514 | — | ⚠️ PARTIAL | — |
-| Vortex | 12345 | — | ⚠️ PARTIAL | — |
-| Bejeweled | 55555 | — | ⚠️ DMA WAIT | [→](55555_bejeweled.md) |
+| Solitaire | 50514 | — | ✅/close | — |
+| Vortex | 12345 | — | ⚠️ VBO | — |
+| Bejeweled | 55555 | — | ⚠️ DMA | [→](55555_bejeweled.md) |
 | Zuma | 44444 | — | 🔴 DMA STALL | [→](44444_zuma.md) |
 | TWA/iQuiz | 11002 | — | 🔌 NO GFX | [→](11002_twa.md) |
 | Lost | 1B200 | — | ❌ CRASH | [→](1B200_lost.md) |
 
-**Summary:** 10 working, 3 partial, 3 not working
+**Summary:** 10 working, 2 close/partial, 1 VBO issue, 3 not working
 
 ## Running Games
 
@@ -97,12 +97,12 @@ TETRIS_BUNDLE=/path/to/66666 ./scripts/tetris.sh
 
 ## Recent Changes
 
-### 2026-06-26: Sudoku now works!
-- **Auto-begin on present**: Sudoku's engine never calls ordinal-158 (begin frame). Its per-frame loop is 159→149→157. The emulator now auto-begins a frame when present arrives with no active frame.
-- **NDC coordinate scaling**: Sudoku passes positions in 0–1 range instead of pixel coordinates. The rasterizer auto-detects this (`max_coord < 2.0`) and applies viewport-style scaling to fill the screen.
-- **Auto-vflip suppression**: NDC engines render top-to-bottom (correct orientation), while pixel-coord engines render bottom-to-top (need vflip). The `ndc_frame` flag per-frame disables vflip automatically.
-- **0-draw frame preservation**: Idle frames during input-wait loops keep the previous frame's content instead of clearing to black.
-- Result: Sudoku went from 0 visible content → fully rendered splash screen (120 presented frames).
+### 2026-06-26: Sudoku works, PopCap DMA foundation, 10/16 games rendering
+- **Sudoku fix**: Three bugs found and fixed (auto-begin, NDC scaling, auto-vflip)
+- **DMA framebuffer**: Foundation for PopCap engine (Bejeweled, Zuma) — pixel
+  storage, overlay path, completion stubs. Gem sprites now visible in Bejeweled.
+- **Solitaire**: Actually works at ~93% content, upgraded from partial
+- DMA background not yet visible (needs interrupt/async mechanism)
 
 ### 2026-06-25: Initial compatibility report
 - 9/16 games working, HW stub for 0x14000000 region, Filesytem handler added
