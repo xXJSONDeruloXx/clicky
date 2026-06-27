@@ -1730,7 +1730,23 @@ impl Eapp {
             "miscTBD" => self.handle_misc_import(import.ordinal, args),
             "Audio" => {
                 self.trace_audio_call(import.ordinal, pc, lr, args);
-                0
+                // Audio:52 (r0=rserver base) and Audio:51 (r0=prev_ret, r3=shared_ptr)
+                // are part of Lost's render server init. The game divides:
+                //   result = -Audio51_ret / Audio52_ret
+                // We need non-zero from both to avoid 0/0 and get a useful result.
+                // Audio:51 is called with r0 = Audio:52's return value (1 after our fix)
+                // and r3 = shared data pointer (0x1001208C).
+                let r3 = args[3];
+                if import.ordinal == 52 && args[0] >= 0x10000000 {
+                    info!(target: "EAPP_GL", "audio_52_rserver: r0={:#010x} ret=1", args[0]);
+                    1u32
+                } else if import.ordinal == 51 && r3 >= 0x10000000 {
+                    // r3 is the same shared data pointer as Audio:52's r3
+                    info!(target: "EAPP_GL", "audio_51_rserver: r0={:#010x} ret=1", args[0]);
+                    1u32
+                } else {
+                    0
+                }
             }
             "AsyncFileIO" => self.handle_async_file_io_import(import.ordinal, args),
             "Filesytem" => self.handle_filesystem_import(import.ordinal, args),
@@ -1993,7 +2009,24 @@ impl Eapp {
             }
             // Ordinal 153: glViewport-like. Some games call this during init.
             153 => {
-                info!(target: "EAPP_GL", "ordinal_153: viewport x={} y={} w={} h={}", args[0], args[1], args[2], args[3]);
+                // glViewport(x, y, w, h) — many games pass 0 dimensions
+                // during init or when querying the shader. Lost passes h=0
+                // which causes divide-by-zero in the render server. Fix:
+                // if width or height is 0, fill with default 320×240.
+                let (x, y, w, h) = (args[0], args[1], args[2], args[3]);
+                if w == 0 || h == 0 || w == 0xFFFFFFFF || h == 0xFFFFFFFF {
+                    info!(target: "EAPP_GL", "ordinal_153: viewport fixup: ({},{},{},{}) -> (0,0,320,240)", x, y, w, h);
+                    if let Some(lg) = self.live_gl.as_mut() {
+                        lg.viewport_w = 320;
+                        lg.viewport_h = 240;
+                    }
+                } else {
+                    if let Some(lg) = self.live_gl.as_mut() {
+                        lg.viewport_w = w;
+                        lg.viewport_h = h;
+                    }
+                }
+                info!(target: "EAPP_GL", "ordinal_153: viewport x={} y={} w={} h={}", x, y, w, h);
                 0
             }
             // Draw-adjacent state ordinals; recorded by observation only.
@@ -7120,7 +7153,12 @@ impl Memory for EappBus {
                 self.image.r32(offset - FILE_VMA_BASE)
             }
             WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
-                self.work_ram.r32(offset - WORK_RAM_BASE)
+                let val = self.work_ram.r32(offset - WORK_RAM_BASE);
+                // Watch reads from the rserver header/init region (Lost game)
+                // Rserver loaded at 0x10001038, header at 0x10001038..0x10001237
+                // Data at 0x10012038
+                // rserver_watch removed (too noisy) — use ordinal-level tracing instead
+                val
             }
             HW_STUB_BASE..=u32::MAX if offset - HW_STUB_BASE < HW_STUB_SIZE as u32 => {
                 let rel = offset - HW_STUB_BASE;

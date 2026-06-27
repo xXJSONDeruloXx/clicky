@@ -192,6 +192,10 @@ pub struct LiveGlState {
     pub has_dma_overlay: bool,
     /// Game identifier for PPM dump filenames.
     pub game_id: String,
+    /// Viewport dimensions from ordinal 153 (glViewport).
+    /// Default 320×240 for iPod screen.
+    pub viewport_w: u32,
+    pub viewport_h: u32,
     /// Monotonic count of completed/presented frames.
     pub completed_frame_index: u64,
     /// Candidate frame-begin ordinal, derived from observed ordering (always
@@ -260,6 +264,8 @@ impl LiveGlState {
             frame_active: false,
             has_dma_overlay: false,
             game_id,
+            viewport_w: 320,
+            viewport_h: 240,
             completed_frame_index: 0,
             candidate_begin_ordinal: 158,
             candidate_present_ordinal: 157,
