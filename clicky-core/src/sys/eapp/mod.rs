@@ -2101,10 +2101,12 @@ impl Eapp {
         // buffer and rserver region for non-zero data written during init.
         if self.frame_counter == 10 && std::env::var_os("CLICKY_EAPP_LOST_MEMSCAN").is_some() {
             let alloc_base = 0x10502B00;
-            let scan_ranges: [(u32, &str); 3] = [
+            let scan_ranges: [(u32, &str); 5] = [
                 (alloc_base, "large_alloc"),
                 (0x10012038, "rserver_data_0x11000"),
                 (0x18060000, "game_heap_0x1806"),
+                (0x10012700, "rserver_ptrs_0x10012700"),
+                (0x1001F400, "rserver_ptrs_0x1001F400"),
             ];
             for (base, name) in scan_ranges.iter() {
                 let mut non_zero_count = 0usize;
@@ -2123,8 +2125,23 @@ impl Eapp {
                     }
                 }
                 if non_zero_count > 0 {
-                    info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: {}/0x2000 non-zero, first: {}",
-                        name, base, non_zero_count, first5.join(", "));
+                    if *name == "rserver_data_0x11000" || *name == "rserver_ptrs_0x10012700" || *name == "rserver_ptrs_0x1001F400" {
+                        // Full dump for rserver data
+                        let mut all_nz: Vec<String> = vec![];
+                        for i in (0..0x8000).step_by(4) {
+                            let addr = base.wrapping_add(i);
+                            let w = match self.read_guest_u32(addr) {
+                                Some(w) if w != 0 => Some(format!("+0x{:04x}={:#010x}", i, w)),
+                                _ => None,
+                            };
+                            if let Some(s) = w { all_nz.push(s); }
+                        }
+                        info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: FULL DUMP:\n  {}",
+                            name, base, all_nz.join(",\n  "));
+                    } else {
+                        info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: {}/0x2000 non-zero, first: {}",
+                            name, base, non_zero_count, first5.join(", "));
+                    }
                 } else {
                     info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: all zeros", name, base);
                 }
