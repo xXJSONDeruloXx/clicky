@@ -2064,6 +2064,67 @@ impl Eapp {
                 }
             }
         }
+        // One-time work RAM scan for Lost: scan the large allocation
+        // buffer and rserver region for non-zero data written during init.
+        if self.frame_counter == 10 && std::env::var_os("CLICKY_EAPP_LOST_MEMSCAN").is_some() {
+            let alloc_base = 0x10502B00;
+            let scan_ranges: [(u32, &str); 3] = [
+                (alloc_base, "large_alloc"),
+                (0x10012038, "rserver_data_0x11000"),
+                (0x18060000, "game_heap_0x1806"),
+            ];
+            for (base, name) in scan_ranges.iter() {
+                let mut non_zero_count = 0usize;
+                let mut first5: Vec<String> = vec![];
+                for i in (0..0x8000).step_by(4) {
+                    let addr = base.wrapping_add(i);
+                    let w = match self.read_guest_u32(addr) {
+                        Some(w) => w,
+                        None => break,
+                    };
+                    if w != 0 {
+                        non_zero_count += 1;
+                        if first5.len() < 5 {
+                            first5.push(format!("+0x{:04x}={:#010x}", i, w));
+                        }
+                    }
+                }
+                if non_zero_count > 0 {
+                    info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: {}/0x2000 non-zero, first: {}",
+                        name, base, non_zero_count, first5.join(", "));
+                } else {
+                    info!(target: "EAPP_GL", "lost_memscan {} base={:#010x}: all zeros", name, base);
+                }
+            }
+        }
+        // Patch 0xFFFFFFFF values in game heap for Lost. The game heap
+        // has many -1 values that represent uninitialized render state.
+        if std::env::var_os("CLICKY_EAPP_LOST_PATCH_NEG1").is_some() {
+            // Scan multiple heap regions for -1 markers
+            let patch_ranges: [(u32, u32); 4] = [
+                (0x18040000, 0x20000), // game data 0x1804
+                (0x18060000, 0x20000), // game heap 0x1806
+                (0x18080000, 0x20000), // game data 0x1808
+                (0x10010000, 0x10000), // rserver area 0x1001
+            ];
+            let mut total_patched = 0usize;
+            for (base, size) in patch_ranges.iter() {
+                for i in (0..*size).step_by(4) {
+                    let addr = base.wrapping_add(i);
+                    let w = match self.read_guest_u32(addr) {
+                        Some(w) => w,
+                        None => break,
+                    };
+                    if w == 0xFFFFFFFF {
+                        self.write_guest_u32(addr, 0);
+                        total_patched += 1;
+                    }
+                }
+            }
+            if total_patched > 0 && self.frame_counter <= 20 {
+                info!(target: "EAPP_GL", "lost_patch_neg1: patched {} -1s frame={}", total_patched, self.frame_counter);
+            }
+        }
         let continuous = self
             .live_gl
             .as_ref()

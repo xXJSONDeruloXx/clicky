@@ -1,121 +1,322 @@
-# Lost (1B200) — Technical Deep Dive
+# Lost (1B200) — Comprehensive Analysis & Experiment Log
 
-**Status:** ❌ NO GFX | **Draws:** 0 | **Engine:** Lost Engine (rserver.bin ARM rendering)
+**Status:** ❌ NO GFX | **Draws:** 0 | **Engine:** Lost Engine (rserver.bin render server)  
+**Last updated:** 2026-06-26
 
-## Architecture Overview
+---
 
-Lost uses a fundamentally different rendering architecture from all other iPod games:
+## 1. Architecture
+
+Lost is architecturally unique among iPod click wheel games. It uses a dedicated **GL Render Server** binary (`rserver.bin`) that contains the iPod's OpenGL ES driver implementation.
 
 ```
-┌─────────────────────────────────────────────┐
-│  Game Binary (0x10000000+)                   │
-│  ┌─── EAPP Header (0x28 bytes) ────────────┐ │
-│  │  magic="eapp", load_addr=0x10001000, ... │ │
-│  └─────────────────────────────────────────┘ │
-│  ┌─── 0x10001038+ ──────────────────────────┐ │
-│  │  *** OVERWRITTEN BY rserver.bin ***       │ │
-│  │  Original: ARM exception vectors + code   │ │
-│  │  After load: rserver render engine code   │ │
-│  └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  iPod GL Architecture (Real Device)                          │
+│                                                              │
+│  ┌──────────────┐   IPC   ┌────────────────────────────────┐ │
+│  │  Game Binary  │───────▶│  rserver.bin (Render Server)  │ │
+│  │  (0x18000000+)│        │  - GL driver (gldMalloc, etc) │ │
+│  │  Game logic,   │        │  - ShaderMachine (USSE code)  │ │
+│  │  scene graph,  │        │  - FrontBufferA compositor    │ │
+│  │  input handling│        │  - Display control (TV/MPU)   │ │
+│  └──────────────┘          └────────────────────────────────┘ │
+│          │                            │                       │
+│          │ GL ordinal imports          │ Direct HW access      │
+│          ▼                            ▼                       │
+│    ┌───────────────┐         ┌──────────────────┐            │
+│    │ Import Thunks  │         │ iPod LCD Driver   │            │
+│    │ (0x1F000000+)  │         │ (PowerVR MBX)     │            │
+│    └───────────────┘         └──────────────────┘            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## rserver.bin — The Rendering Engine
+### rserver.bin
 
-- **Size:** 105,020 bytes (105KB)
+- **Size:** 105,020 bytes (0x19A3C)
 - **Loaded to:** Guest address 0x10001038 (via AsyncFileIO:3)
-- **Header region:** 0x10001038..0x10001237 (0x200 bytes, all zeros)
-- **Code region:** 0x10001238+ (ARM/Thumb rendering functions)
+- **Structure:**
 
-**Key discovery:** rserver.bin is NOT a shader binary for the GPU. It's ARM code that the iPod's CPU executes directly. The game's original binary at 0x10001038 gets overwritten during loading.
+| Offset | Size | Content |
+|--------|------|---------|
+| 0x000 | 0x200 | Dispatch table (all zeros, filled by ordinal 164 on real HW) |
+| 0x200 | ~0x10C00 | USSE shader microcode + data tables |
+| 0x10C24 | ~0x200 | `RenderServerVersion:RELEASE:2704` and config strings |
+| 0x10C60+ | ~0x300 | Display/power config strings: "power", "freeze", "model", "default", "dac", "svideo", "mode", "width", "height", "wide" |
+| 0x10DFC+ | ~0x200 | `FrontBufferA`, `display control`, `display map`, `TV buffer`, `MPU stripe`, `Image stripe` |
+| 0x11000+ | varies | Zero-initialized data regions (populated at runtime) |
 
-## Experiments & Results
+### Key Embedded Strings
 
-| Experiment | What We Did | Result |
-|-----------|-------------|--------|
-| Program handle return | ordinal 164 returns 1 (was 0) | Still 0 draws |
-| Program query success | ordinal 152 writes GL_TRUE=1 + size=4 | Still 0 draws |
-| Shader state patch | Write 0 to [material+0x60] (was 0xffffffff) | Still 0 draws |
-| Skip rserver.bin load | Don't overwrite original game code | Still 0 draws (original also zero-padded) |
-| **Fill header with values** | Write 1..128 to all 128 header words | **Still 0 draws** |
+| String | Meaning |
+|--------|---------|
+| `RenderServerVersion:RELEASE:2704` | GL driver version |
+| `gldCalloc` / `gldMallocSlow` / `gldVecMalloc` / `gldVecCalloc` | GL driver memory allocation |
+| `ShaderMachine: Attempt to set uniform when no shader is bound` | Shader state machine |
+| `ShaderMachine: Invalid shader type found` | Shader type validation |
+| `Length is less than data described in texture sub data header` | Texture upload validation |
+| `FrontBufferA` | iPod front buffer identifier |
+| `display control` / `display map` | Low-level display API |
+| `TV buffer` / `MPU stripe` / `Image stripe` | Hardware display layers |
+| `getpower` / `powersave` / `encoding` / `backlight` | Power management |
+| `%d=%d` | Likely uniform name/value pairs |
 
-## Root Cause
+### USSE Microcode (offset 0x200+)
 
-The game's frame loop is `ordinal 13 → 12 → 159 → 157` (cull, clear, bind, present). **Zero draw calls per frame.** This is because:
+The code section is **NOT ARM or Thumb instructions**. It's PowerVR MBX USSE
+(Universal Scalable Shader Engine) microcode — a GPU-specific instruction format.
+Disassembly as ARM or Thumb produces invalid/nonsensical instructions.
 
-1. **No shader activation:** Lost never calls ordinal 167 (glUseProgram). The game expects the shader to be implicitly active after ordinal 164, but our stubs don't make that happen.
+---
 
-2. **No vertex/draw setup:** The game doesn't call ordinals 137 (vertex array def), 40 (enable array), or 37/38 (draw). The entire rendering pipeline is gated behind conditions in the rserver.bin ARM code that we can't satisfy.
+## 2. Init Sequence
 
-3. **Header isn't the blocker:** Even filling the entire 0x200-byte header with non-zero values doesn't enable rendering. The game's code has additional checks beyond the header.
+### Non-GL imports (before frame loop)
 
-## Material Object (0x18060910)
+| Import | Args | Notes |
+|--------|------|-------|
+| miscTBD:0 | r0=0x7FF80 | malloc(524160) — large allocation, likely render server heap |
+| miscTBD:9 | r0=stack, r1=0x10502B00, r2=0x90000, r3=0x78000 | Time/tick API |
+| AsyncFileIO:3 | path=rserver.bin | Load 105,020 bytes to 0x10001038 |
+| miscTBD:6 | r0=2, r1=0x10012038, r2=0x180401FF, r3=0x180401D1 | **Render server comm?** r1 is inside rserver region |
+| Settings:0 | key=Language | Language query |
+| Audio:52 | r0=0x10001038 (rserver base!) | Audio passes rserver address — coordination |
+| Audio:51 | r0=0, r1=0x55 | Audio init |
+| Audio:56 | r0=0, r1=0x1000B038 | Audio |
+
+### GL imports (init frame)
 
 ```
-Offset  Value           Meaning
-0x00    0x00000000      Flags
-0x08    0x00000988      Tex1 size (2440 = 122×10×2 LA8)
-0x0C    0x0000007A      Tex1 width (122)
-0x10    0x0000000A      Tex1 height (10)
-0x20    0x0000190A      Format: GL_LUMINANCE_ALPHA
-0x24    0x00001401      Type: GL_UNSIGNED_BYTE
-0x34    0x00000348      Tex2 size (840 = 42×10×2 LA8)
-0x38    0x0000002A      Tex2 width (42)
-0x3C    0x0000000A      Tex2 height (10)
-0x60    0xFFFFFFFF      Shader state (-1 = not compiled)
+153 → viewport(0, 0xFFFF, 0xFFFF, 0)   // Set viewport
+164 → shader_create(r0=1, r1=rserver_addr, r2=0xFFFFFFFF)
+152 → program_query(r1=buf_ptr, r2=size_ptr)
+153 → viewport(0, 0, 0, 0)              // Reset viewport
+152 → program_query(r1=buf_ptr, r2=size_ptr)
+4   → bind_texture(GL_TEXTURE_2D, 0)    // Bind for upload
+99  → upload_2d(GL_TEXTURE_2D, 0, LA8, 122×10)   // Text label atlas 1
+4   → bind_texture(GL_TEXTURE_2D, 0)    // Re-bind
+99  → upload_2d(GL_TEXTURE_2D, 0, LA8, 42×10)    // Text label atlas 2
 ```
 
-## Ordinal Sequences
+### Frame loop (repeats forever)
 
-### Init (frame 1):
 ```
-153 → viewport(0, 0xFFFF, 0xFFFF, 0)
-164 → shader_create(r1=rserver_addr, r2=0xFFFFFFFF)
-152 → program_query(buf, size_ptr)
-153 → viewport(0, 0, 0, 0)
-152 → program_query(buf, size_ptr)
-4   → bind_texture(0x84F5, 0)
-99  → upload(0x190A, 0x1401, 122×10)   ← LA8 text label
-4   → bind_texture(0x84F5, 0)
-99  → upload(0x190A, 0x1401, 42×10)    ← LA8 text label
+13  → glCullFace(0)            // No culling
+12  → glClear(0x4000)          // Clear color buffer  
+159 → bind_material(0xe, 0x18060910)  // Shader material
+157 → present(0x0)             // Show frame (nothing drawn)
 ```
 
-### Frame loop (repeats forever):
+**0 draws per frame. No vertex setup, no draw calls.**
+
+---
+
+## 3. Material Object
+
+The shader material at `state_ptr=0x18060910` when `handle=0xE`:
+
 ```
-13  → glCullFace(GL_NONE)
-12  → glClear(GL_COLOR_BUFFER_BIT)
-159 → bind_material(0xe, 0x18060910)
-157 → present(0x0)
+Offset  Value           Interpretation
+0x00    0x00000000      Flags / status
+0x04    0x00000000      Flags / status
+0x08    0x00000988      Texture 1 data size (2440 = 122×10×2 LA8 bytes)
+0x0C    0x0000007A      Texture 1 width (122)
+0x10    0x0000000A      Texture 1 height (10)
+0x14    0x0000007A      Texture 1 width (confirm)
+0x18    0x0000000A      Texture 1 height (confirm)
+0x1C    0x00000000      Padding
+0x20    0x0000190A      Texture 1 format: GL_LUMINANCE_ALPHA (0x190A)
+0x24    0x00001401      Texture 1 type: GL_UNSIGNED_BYTE (0x1401)
+0x28    0x00000000      Padding
+0x2C    0x00000001      Texture 1 index / count
+0x30    0x00000001      Texture 1 index
+0x34    0x00000348      Texture 2 data size (840 = 42×10×2 LA8 bytes)
+0x38    0x0000002A      Texture 2 width (42)
+0x3C    0x0000000A      Texture 2 height (10)
+0x40    0x0000002A      Texture 2 width (confirm)
+0x44    0x0000000A      Texture 2 height (confirm)
+0x48    0x00000000      Padding
+0x4C    0x0000190A      Texture 2 format: GL_LUMINANCE_ALPHA
+0x50    0x00001401      Texture 2 type: GL_UNSIGNED_BYTE
+0x54    0x00000000      Padding
+0x58    0x00000002      Texture 2 index / count
+0x5C    0x00000002      Texture 2 index
+0x60    0xFFFFFFFF      **Shader state (-1 = not compiled)**
+0x64..  0x00000000×7    All zeros
 ```
 
-## Paths Forward
+---
 
-### A. Full rserver.bin reverse engineering
-Parse the ARM code to find the rendering dispatch table and
-what conditions it checks. Requires significant ARM RE effort.
+## 4. Experiments & Results
 
-### B. Memory access tracing
-Add read-watchpoints on the header region to see exactly which
-offsets the game reads and what values it expects. Would reveal
-the header structure without fully reverse engineering ordinal 164.
+### Experiment 1: Baseline
+**Setup:** Default export handling (ordinal 164 returns 1, 152 returns success)  
+**Result:** 0 draws per frame  
+**Frame loop:** `13, 12, 159, 157`
 
-### C. Shader interpreter
-Parse the PowerVR MBX shader format from rserver.bin and
-implement a software shader interpreter that produces the
-rendering dispatch table entries.
+### Experiment 2: miscTBD:6 Return Value
+**Setup:** `CLICKY_MISCTBD6_RET=1` (returns 1 instead of 0)  
+**Rationale:** miscTBD:6 is called with r1 pointing inside rserver region — might be a render server communication channel whose return value gates drawing  
+**Result:** 0 draws per frame  
+**Frame loop:** `13, 12, 159, 157` (unchanged)
 
-### D. Fixed-function workaround
-Force a basic rendering pipeline for Lost's material:
-- Read the material object's texture descriptors
-- Synthesize vertex arrays from the texture dimensions
-- Inject a draw call after bind_material
-- This would produce visible but wrong rendering
+### Experiment 3: miscTBD:6 Large Return Value
+**Setup:** `CLICKY_MISCTBD6_RET=9999`  
+**Rationale:** Return value might be a handle or capability ID  
+**Result:** 0 draws per frame (unchanged)
 
-## Technical Details
+### Experiment 4: Rserver Header Fill (incrementing values)
+**Setup:** `CLICKY_EAPP_FILL_RSERVER_HEADER=1` — fills 128 header words with values 1..128  
+**Rationale:** The 0x200-byte header at 0x10001038 is all zeros; filling it would satisfy any null-pointer checks  
+**Result:** 0 draws per frame (unchanged)  
+**Conclusion:** The header values are NOT the sole gating factor
 
-- **rserver header:** 0x200 bytes at 0x10001038, all zeros before and after ordinal 164
-- **Code entry:** 0x10001238 (offset 0x200 in rserver.bin)
-- **Material state:** 0x18060910 with two LA8 texture descriptors
-- **Shader state flag:** 0xffffffff at [0x18060910+0x60], patched to 0 by emulator
-- **Program handle:** Returned as 1 by ordinal 164 (was 0)
-- **GL imports:** Only 4, 12, 13, 99, 152, 153, 157, 159, 164
+### Experiment 5: Rserver Header Fill + miscTBD:6
+**Setup:** Both CLICKY_EAPP_FILL_RSERVER_HEADER=1 and CLICKY_MISCTBD6_RET=1  
+**Result:** 0 draws per frame (unchanged)
+
+### Experiment 6: Thumb Stub Function Pointers
+**Setup:** `CLICKY_EAPP_THUMB_STUBS=1` — allocates two ARM Thumb stubs in work RAM:
+- `stub0`: `mov r0, #0; bx lr` (returns 0)
+- `stub1`: `mov r0, #1; bx lr` (returns 1)
+
+Fills all 128 header entries with `stub1 | 1` (Thumb mode bit set).  
+**Rationale:** On real HW, ordinal 164 writes function pointers into the header. If the game reads these as function pointers and calls them, valid Thumb stubs returning 1 would indicate "success"  
+**Result:** 0 draws per frame (unchanged)  
+**Conclusion:** The game DOESN'T call the header function pointers before deciding not to draw. The draw-blocking condition is checked BEFORE the stubs would be called.
+
+### Experiment 7: Shader State Patch
+**Setup:** Write 0 to [state_ptr+0x60] (was 0xFFFFFFFF) during present handler  
+**Rationale:** 0xFFFFFFFF at offset 0x60 looks like a "not compiled" flag  
+**Result:** Patch applies once (0xFFFFFFFF → 0), but game still 0 draws in subsequent frames  
+**Conclusion:** The shader state flag is necessary but not sufficient
+
+### Experiment 8: Skip rserver.bin Load
+**Setup:** `CLICKY_EAPP_SKIP_RSERVER=1` — don't load rserver.bin over game binary  
+**Rationale:** If the game's original code (before overwrite) has a rendering path that doesn't need rserver  
+**Result:** 0 draws per frame (the original game binary also has zeros at 0x10001038)  
+**Conclusion:** The game was DESIGNED to have rserver.bin overwrite its early code
+
+### Experiment 10: Mass -1 Patching
+**Setup:** `CLICKY_EAPP_LOST_PATCH_NEG1=1` — patches all `0xFFFFFFFF` values in 4 heap regions to 0 each frame
+
+Results:
+- Frame 0: 150 patches (initial clear)
+- Frame 2: 98 patches (game re-writes -1s each frame)
+- Frame 3+: 2 patches (steady state)
+- **Still 0 draws per frame**
+
+**Conclusion:** The 0xFFFFFFFF markers are not the sole blocking condition. The game re-creates them each frame, and even zeroing them out before the next frame's decision doesn't enable drawing. The blocking condition is elsewhere in the game code's execution path — possibly a variable that's never set by the render server's initialization, or a conditional branch that depends on the render server's USSE code actually executing and producing output.
+
+---
+
+## 5. Splash Screen Data
+
+File: `lostLaunch.raw.lcd5` (138,256 bytes)  
+Format: 16-byte header + 320×216 RGB565 pixel data
+
+| Offset | Value | Meaning |
+|--------|-------|---------|
+| 0x00 | 320 | Width |
+| 0x04 | 216 | Height |
+| 0x08 | 640 | Stride? |
+| 0x0C | '565L' | RGB565 format marker |
+| 0x10+ | 138,240 bytes | 320×216 RGB565 pixels |
+
+This is the splash/title screen image available for fallback rendering.
+
+---
+
+## 6. Root Cause Analysis
+
+Lost's 0-draw behavior is caused by the **game code's decision logic** that runs before calling any GL draw ordinals. This decision code is in the game binary at `0x18000000+` and executes within the CPU emulator.
+
+The decision tree approximately looks like:
+
+```
+Game Frame Loop:
+  1. Read render server state from shared memory
+  2. Check if render server is initialized and operational
+  3. If NOT operational: skip all drawing, go to present
+  4. If operational: set up vertex arrays, issue draw calls
+```
+
+**The problem is step 2-3.** Even though we've tried:
+- Valid program handles (ordinal 164)
+- Successful program queries (ordinal 152)
+- Non-zero dispatch table (header fill)
+- Valid function pointers (Thumb stubs)
+- Successful miscTBD:6 returns
+- Clear shader state flags
+
+...the game STILL decides the render server is not operational.
+
+**Most likely cause:** The game reads from a **shared memory region** that the render server writes to during its initialization. On a real iPod, after rserver.bin is loaded and ordinal 164 is called, the render server process would:
+1. Parse the USSE microcode
+2. Set up internal state (shader compilation tables, buffer allocations)
+3. Write status pointers/flags to a **different memory region** (not the rserver header)
+4. The game reads this status region to decide if drawing is safe
+
+This shared memory region is likely the large allocation from miscTBD:0 (r0=0x7FF80 = 524,160 bytes). The game allocates this BEFORE loading rserver.bin, passes a pointer to it via rserver header or miscTBD:6, and expects the render server to write a "ready" flag somewhere in this buffer.
+
+---
+
+## 7. Paths Forward (Priority Order)
+
+### A. Memory Region Identification (Most Promising)
+Scan the large allocation buffer (0x10502B00, 524KB) for writes after rserver.bin is loaded. The render server code might write status values here during init. Look for non-zero values appearing in this region after ordinal 164 returns.
+
+**Implementation:** Periodic scan of the 524KB buffer for changes, or read-watchpoints.
+
+### B. USSE Microcode Interpretation
+Build a USSE shader interpreter that can:
+1. Parse the microcode at rserver.bin offset 0x200+
+2. Execute shader programs for each frame
+3. Write results to the framebuffer
+
+This is the most complete solution but requires reverse engineering the PowerVR MBX USSE instruction format, which is poorly documented.
+
+### C. ARM Binary Patching
+Find and patch the game's conditional branch that gates the draw calls. This requires:
+1. Proper ARM disassembly of the game binary (respecting ARM/Thumb switching)
+2. Identifying the branch that tests render server readiness
+3. NOPing the branch or forcing it to always take the "ready" path
+
+### D. Fallback Splash Screen Rendering
+Inject the `lostLaunch.raw.lcd5` splash image into the DMA framebuffer as a cosmetic workaround. This wouldn't produce interactive gameplay but would show the game's title screen.
+
+### E. Full Render Server Emulation
+Implement ordinal 164 to actually parse rserver.bin and set up the complete rendering pipeline. This includes:
+- USSE microcode parser
+- Shader compilation pipeline
+- Render server state machine
+- FrontBufferA compositor
+
+This is essentially reimplementing Apple's GL driver for the iPod — a massive engineering effort.
+
+---
+
+## 8. Env Var Reference
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CLICKY_MISCTBD6_RET` | Return value for miscTBD:6 | 0 |
+| `CLICKY_EAPP_FILL_RSERVER_HEADER` | Fill header with incrementing values | disabled |
+| `CLICKY_EAPP_THUMB_STUBS` | Fill header with Thumb stub pointers | disabled |
+| `CLICKY_EAPP_LOST_MEMSCAN` | Scan memory regions at frame 10 | disabled |
+| `CLICKY_EAPP_LOST_PATCH_NEG1` | Patch all 0xFFFFFFFF values to 0 each frame | disabled |
+| `CLICKY_EAPP_SKIP_RSERVER` | Skip loading rserver.bin | disabled |
+
+---
+
+## 9. Game Data Files
+
+The Lost game bundle contains extensive assets:
+
+| Type | Files | Notes |
+|------|-------|-------|
+| Splash screen | `lostLaunch.raw.lcd5` | 320×216 RGB565, 16-byte header |
+| Episode data | `d1`-`d15` | Episode-specific scene data (185KB-433KB) |
+| Location data | `l`, `l1`-`l26` | Location images (101KB-1.5MB each) |
+| Sound banks | `soundbank_*.dat` | 9 sound banks (165KB-2MB) |
+| Audio | `0.mp3`-`15.mp3/m4a` | Background music and sound effects |
+| Resources | `resources/{en,de,es,fr,it,ja}/` | Localized text resources |
