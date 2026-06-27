@@ -218,6 +218,47 @@ Results:
 
 **Conclusion:** The DMA overlay system works for Lost. The splash screen shows the game's title art. However, this is purely cosmetic — the game's GL rendering pipeline still produces 0 draws. Interactive gameplay would require the render server to actually function.
 
+### Experiment 12: Audio:52 Divide-by-Zero Fix
+**Setup:** Audio:52 returns 1 when called with r0>=0x10000000 (rserver base). Audio:51 returns 1 when called with r3>=0x10000000 (shared data pointer). Ordinal 153 viewport fixup applies 320×240 default when w=0 or h=0.
+
+Results:
+- **Divide-by-zero eliminated** — no more "Arithmetic exception: Divide By Zero"
+- Game now progresses past init — tries to load `options.sav`
+- Game heap shows fewer 0xFFFFFFFF markers
+- **Still 0 draws per frame**
+
+**Conclusion:** The divide-by-zero was caused by Audio:52 returning 0 when called with the rserver base address. The game's ARM code at 0x180054EC divides Audio:51's return by Audio:52's return. Both returning 0 gave 0/0 → crash. With Audio:52=1 and Audio:51=1, the division gives -1/1 = -1, which is valid and the game continues. However, the rendering is still gated by the rserver dispatch table not being populated.
+
+### Experiment 13: Render Function Analysis
+**Method:** ARM disassembly of the game binary's render code path
+
+Key discoveries:
+1. **Render function at 0x18007264** — contains `PUSH {r0-r11, lr}`, calls ordinal 19, and full rendering logic. But it's NEVER called from the main frame loop!
+2. **Main loop at 0x1803B924** — calls only `ordinal 13` (via `B 0x18000098`), then ordinal 12, then ordinal 159 (bind material), then ordinal 157 (present)
+3. **The render function is called from scene management code** at `0x18028DA8`, `0x18039E8C`, `0x1803A360` — NOT from the frame loop
+4. **Ordinal 19** (at import stub `0x180000B0`) is the key render dispatch call — it's only called from inside the render function, which is never reached
+5. The game's architecture: main loop does display management, scene system does rendering. The scene system is not activated because the rserver init didn't create any active render contexts.
+
+**Conclusion:** The root cause is architectural — the game separates "display management" (main loop) from "scene rendering" (render function). The scene system needs the rserver to create render contexts. Without a working rserver, no scenes are active, so the render function is never called, so ordinal 19 is never called, so no draws happen.
+
+### Experiment 14: Rserver Data Structure Analysis
+**Method:** Full memory dump of rserver data region (0x10012038) at frame 10
+
+Key findings in the 59 non-zero words:
+- `+0x0048=0x00066000` — buffer/memory size
+- `+0x0070=0x1001F520` — pointer into rserver ROM area
+- `+0x0164=0x10080F88` — pointer into work RAM (allocated buffer)
+- `+0x02D8=0x656e5553` = "USne" (locale string for US English)
+- **`+0x0734=0xCAFEBABE`** — Java-style magic structure marker
+- `+0x0738=0x5C` — structure length = 92 bytes
+- `+0x0750=0x00130010` — PowerVR shader format descriptor
+- `+0x076C=0x00010018` — shader program metadata
+- **Three CAFEBABE-tagged blocks** contain shader/render state descriptors
+- Next-level pointers: `0x100127E4`, `0x10012824`, `0x10012864` (all within rserver ROM)
+- `+0x0708=0x1001F4B4` — pointer to GL context state
+
+**Conclusion:** The rserver data region IS partially initialized by the game (59 words). The CAFEBABE markers indicate structured shader/render state objects. But the critical dispatch table (function pointers for rendering) is missing — it would be populated by the iPod's GL driver during shader compilation (ordinal 164).
+
 ---
 
 ## 5. Splash Screen Data
