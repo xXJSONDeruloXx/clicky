@@ -1934,6 +1934,30 @@ impl Eapp {
                     } else {
                         info!(target: "EAPP_GL", "ordinal_164: rserver header all zeros (0x200 bytes)");
                     }
+                    // Approach: Fill the rserver header with pointers to Thumb stubs
+                    // that return 0 or 1. On a real iPod, ordinal 164 would parse
+                    // the rserver binary and write function pointers to the header
+                    // (a dispatch table). Without valid pointers, the game code
+                    // finds null function entries and skips rendering entirely.
+                    // We create Thumb stubs (mov r0,#1; bx lr) in work RAM and
+                    // fill the header with pointers (bit 0 set for Thumb mode).
+                    // Behind CLICKY_EAPP_THUMB_STUBS=1 env var.
+                    if std::env::var_os("CLICKY_EAPP_THUMB_STUBS").is_some() {
+                        // Allocate 16 bytes for Thumb stubs (2 instructions each = 4 bytes per stub)
+                        let stub_base = self.alloc_zeroed(16);
+                        // Thumb LE packed as 32-bit words:
+                        // stub0 (return 0): mov r0,#0 (0x2000); bx lr (0x4770) = 0x47702000
+                        // stub1 (return 1): mov r0,#1 (0x2001); bx lr (0x4770) = 0x47702001
+                        self.write_guest_u32(stub_base, 0x47702000); // stub0: return 0
+                        self.write_guest_u32(stub_base.wrapping_add(4), 0x47702001); // stub1: return 1
+                        let stub0 = stub_base | 1; // Thumb mode bit
+                        let stub1 = (stub_base.wrapping_add(4)) | 1; // Thumb mode bit
+                        // Fill header with stub1 pointers (return 1 = success)
+                        for i in 0..0x80 {
+                            self.write_guest_u32(header_start.wrapping_add(i * 4), stub1);
+                        }
+                        info!(target: "EAPP_GL", "ordinal_164: filled rserver header with Thumb stubs (stub0={:#010x}, stub1={:#010x})", stub0, stub1);
+                    }
                     // Nuclear option: fill the rserver header with incrementing values
                     // to see if the game's rendering engine uses any of them.
                     // Behind CLICKY_EAPP_FILL_RSERVER_HEADER=1 env var.
@@ -2507,14 +2531,6 @@ impl Eapp {
         if handle < 0x1000_0000
             && (state_ptr >= 0x1000_0000 && state_ptr < 0x2000_0000)
         {
-            if self.dumped_pointer_handles.insert(state_ptr) {
-                let words = self.read_guest_words(state_ptr, 32);
-                let hex: Vec<String> = words.iter().map(|w| format!("{:#010x}", w)).collect();
-                info!(target: "EAPP_GL", "bind_material state_ptr_dump handle={:#x} addr={:#010x} words=[{}]", handle, state_ptr, hex.join(","));
-            }
-            // Lost (1B200): The material object may have 0xffffffff at
-            // offset 0x60 meaning "shader compilation pending". Patched
-            // during candidate_present for the next frame.
             if self.dumped_pointer_handles.insert(state_ptr) {
                 let words = self.read_guest_words(state_ptr, 32);
                 let shader_state = self.read_guest_u32(state_ptr.wrapping_add(0x60)).unwrap_or(0);
@@ -4563,6 +4579,19 @@ impl Eapp {
                 // thresholds in the guest are 4_000_000 and 2_000_000, matching
                 // microsecond units, so expose host monotonic microseconds.
                 self.handle_misc9_time_api(args)
+            }
+            6 => {
+                // Lost (1B200) calls this with r0=2 (command type?),
+                // r1=pointer into rserver data region (0x10012038 =
+                // rserver+0x11000), r2/r3=string pointers.
+                // Could be a render-server communication channel.
+                // Return value might affect game's draw decision.
+                let ret = std::env::var("CLICKY_MISCTBD6_RET")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                info!(target: "EAPP_IMPORT", "miscTBD:6 cmd={:#x} data_ptr={:#010x} r2={:#010x} r3={:#010x} ret={:#x}", args[0], args[1], args[2], args[3], ret);
+                ret
             }
             12 => self.handle_misc12_local_time(args),
             _ => 0,
