@@ -207,6 +207,17 @@ Results:
 
 **Conclusion:** The 0xFFFFFFFF markers are not the sole blocking condition. The game re-creates them each frame, and even zeroing them out before the next frame's decision doesn't enable drawing. The blocking condition is elsewhere in the game code's execution path — possibly a variable that's never set by the render server's initialization, or a conditional branch that depends on the render server's USSE code actually executing and producing output.
 
+### Experiment 11: Splash Screen Injection
+**Setup:** `CLICKY_EAPP_LOST_SPLASH=1` — Loads `lostLaunch.raw.lcd5` (320×216 RGB565, 16-byte header) from the game bundle and writes it into the DMA framebuffer on frame 0
+
+Results:
+- Splash image data successfully written to DMA framebuffer
+- DMA overlay system picks up the data and composites it
+- **Static splash screen visible in headed mode**
+- No interactive game rendering (expected — this is a static fallback)
+
+**Conclusion:** The DMA overlay system works for Lost. The splash screen shows the game's title art. However, this is purely cosmetic — the game's GL rendering pipeline still produces 0 draws. Interactive gameplay would require the render server to actually function.
+
 ---
 
 ## 5. Splash Screen Data
@@ -302,6 +313,7 @@ This is essentially reimplementing Apple's GL driver for the iPod — a massive 
 | `CLICKY_MISCTBD6_RET` | Return value for miscTBD:6 | 0 |
 | `CLICKY_EAPP_FILL_RSERVER_HEADER` | Fill header with incrementing values | disabled |
 | `CLICKY_EAPP_THUMB_STUBS` | Fill header with Thumb stub pointers | disabled |
+| `CLICKY_EAPP_LOST_SPLASH` | Inject lostLaunch splash into DMA framebuffer | disabled |
 | `CLICKY_EAPP_LOST_MEMSCAN` | Scan memory regions at frame 10 | disabled |
 | `CLICKY_EAPP_LOST_PATCH_NEG1` | Patch all 0xFFFFFFFF values to 0 each frame | disabled |
 | `CLICKY_EAPP_SKIP_RSERVER` | Skip loading rserver.bin | disabled |
