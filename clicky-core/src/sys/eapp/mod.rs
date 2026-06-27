@@ -2134,12 +2134,43 @@ impl Eapp {
             return; // one-shot diagnostic capture keeps its existing heuristic
         }
         // Read DMA framebuffer before borrowing live_gl (for PopCap background)
-        let dma_data = {
+        let mut dma_data = {
             let mut buf = vec![0u8; DMA_FB_SIZE];
             self.bus.dma_framebuf.bulk_read(0, &mut buf);
             buf
         };
-        let has_dma = dma_data.iter().any(|b| *b != 0x2d);
+        let mut has_dma = dma_data.iter().any(|b| *b != 0x2d);
+
+        // Lost splash screen injection: if no DMA data and the env var is set,
+        // load the lostLaunch.raw.lcd5 from the bundle and write it to the
+        // DMA framebuffer so the overlay system displays it.
+        if !has_dma && std::env::var_os("CLICKY_EAPP_LOST_SPLASH").is_some() && self.frame_counter <= 1 {
+            let splash_path = self.metadata.bundle_dir.join("lostLaunch.raw.lcd5");
+            if let Ok(data) = std::fs::read(&splash_path) {
+                // 16-byte header: width(4) + height(4) + stride(4) + '565L'(4)
+                // Then 320×216 RGB565 pixel data = 138,240 bytes
+                if data.len() >= 16 && data.len() >= 16 + 320 * 216 * 2 {
+                    let pixel_data = &data[16..16 + 320 * 216 * 2];
+                    // Write to DMA framebuffer (fill top 216 rows, bottom 24 stay black)
+                    self.bus.dma_framebuf.bulk_write(0, pixel_data);
+                    // Zero the bottom rows
+                    let bottom = vec![0u8; 320 * 24 * 2];
+                    self.bus.dma_framebuf.bulk_write(320 * 216 * 2, &bottom);
+                    has_dma = true;  // Treat as DMA content
+                    info!(target: "EAPP_GL", "lost_splash: wrote 320x216 RGB565 to DMA framebuffer from {:?}", splash_path);
+                    // Re-read DMA for the overlay
+                    dma_data = {
+                        let mut buf = vec![0u8; DMA_FB_SIZE];
+                        self.bus.dma_framebuf.bulk_read(0, &mut buf);
+                        buf
+                    };
+                } else {
+                    info!(target: "EAPP_GL", "lost_splash: file too small ({}) or wrong format", data.len());
+                }
+            } else {
+                info!(target: "EAPP_GL", "lost_splash: file not found {:?}", splash_path);
+            }
+        }
 
         // Overlay DMA background into the live_gl framebuffer before completing
         if has_dma {
