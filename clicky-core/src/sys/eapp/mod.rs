@@ -16,6 +16,7 @@ mod gl_decode;
 mod gl_trace;
 mod live_gl;
 mod rasterizer;
+mod usse;
 pub use gl_decode::{
     bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
     float_words_from_snapshot, format_from_gl, pix_payload_size, register, stack_word,
@@ -27,6 +28,7 @@ pub use gl_trace::{
     GlRegisterSnapshot, GlStackWordSnapshot, GlTraceFixture, GlTraceRecorder, GlValueClass,
 };
 use live_gl::LiveGlState;
+use usse::{UsseProgram, UsseVm};
 pub use rasterizer::{
     blend_src_over, decode_texture_pixels, framebuffer_hash, framebuffer_to_ppm, rasterize_quad,
     rasterize_triangle, sample_nearest, Rgba8, Texture, TextureFormat,
@@ -432,6 +434,9 @@ pub struct Eapp {
     /// `CLICKY_EXPERIMENTAL_GL_HLE=1`; when `None` the legacy fill-color
     /// GL path is used unchanged.
     live_gl: Option<LiveGlState>,
+    /// Parsed shader/render-server program from OpenGLES:164 (`rserver.bin`).
+    usse_program: Option<UsseProgram>,
+    usse_vm: UsseVm,
 }
 
 #[derive(Debug, Clone)]
@@ -631,6 +636,8 @@ impl Eapp {
             staged_file_generation: 0,
             halted: false,
             live_gl: Self::maybe_init_live_gl(game_id),
+            usse_program: None,
+            usse_vm: UsseVm::default(),
         };
         eapp.bus.watch = Self::parse_watch_env();
         Ok(eapp)
@@ -1027,6 +1034,23 @@ impl Eapp {
                 len: staged.len,
                 offset: addr.saturating_sub(staged.payload_addr),
             })
+    }
+
+    fn read_usse_program_bytes(&mut self, addr: u32, len_hint: u32) -> Option<Vec<u8>> {
+        if addr == 0 {
+            return None;
+        }
+        let len = if let Some(backing) = self.file_backing_for_addr(addr) {
+            backing.len.saturating_sub(backing.offset) as usize
+        } else if len_hint != 0 && len_hint != u32::MAX {
+            len_hint as usize
+        } else {
+            // Lost passes len_hint=0xffffffff for rserver.bin. Cap the blind
+            // read to 256 KiB, stopping early on unmapped memory below.
+            256 * 1024
+        };
+        let len = len.min(512 * 1024);
+        self.read_guest_bytes(addr, len)
     }
 
     fn describe_host_path(&self, host_path: &Path) -> String {
@@ -1930,6 +1954,16 @@ impl Eapp {
                 // A non-zero return is critical: Lost checks the program handle
                 // and won't draw if it's 0 (meaning compilation failed).
                 info!(target: "EAPP_GL", "ordinal_164: shader_create addr={:#010x} len_hint={:#010x}", args[1], args[2]);
+                // Parse/cache the loaded shader/render-server program. For Lost,
+                // args[1] points at rserver.bin loaded via AsyncFileIO:3.
+                if let Some(program_bytes) = self.read_usse_program_bytes(args[1], args[2]) {
+                    let program = UsseProgram::parse(args[1], &program_bytes);
+                    info!(target: "EAPP_GL", "ordinal_164: parsed_usse {}", program.summary());
+                    self.usse_vm = UsseVm::default();
+                    self.usse_program = Some(program);
+                } else {
+                    info!(target: "EAPP_GL", "ordinal_164: unable to read shader bytes at {:#010x}", args[1]);
+                }
                 // Scan the rserver header after the game calls ordinal-164 to see
                 // if the iPod's GL driver has written anything there. For Lost,
                 // rserver.bin is loaded at 0x10001038, and the 0x200-byte header
@@ -2027,6 +2061,19 @@ impl Eapp {
                     }
                 }
                 info!(target: "EAPP_GL", "ordinal_153: viewport x={} y={} w={} h={}", x, y, w, h);
+                0
+            }
+            // Ordinal 19: unknown render dispatch. Called from Lost's render
+            // function (0x18007264) which is currently unreachable because the
+            // rserver dispatch table is empty.
+            19 => {
+                if let Some(program) = self.usse_program.as_ref() {
+                    program.step_placeholder(&mut self.usse_vm, 64);
+                    info!(target: "EAPP_GL", "ordinal_19: render_dispatch r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} usse_pc={} executed={} r0_raw={:#010x} halted={}",
+                        args[0], args[1], args[2], args[3], self.usse_vm.pc_word, self.usse_vm.executed_words, self.usse_vm.scalar_regs[0], self.usse_vm.halted);
+                } else {
+                    info!(target: "EAPP_GL", "ordinal_19: render_dispatch r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} usse=<none>", args[0], args[1], args[2], args[3]);
+                }
                 0
             }
             // Draw-adjacent state ordinals; recorded by observation only.

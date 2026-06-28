@@ -241,6 +241,25 @@ Key discoveries:
 
 **Conclusion:** The root cause is architectural — the game separates "display management" (main loop) from "scene rendering" (render function). The scene system needs the rserver to create render contexts. Without a working rserver, no scenes are active, so the render function is never called, so ordinal 19 is never called, so no draws happen.
 
+### Experiment 15: USSE Parser Scaffold
+**Implementation:** Added `clicky-core/src/sys/eapp/usse.rs` and wired OpenGLES:164 to parse/cache the loaded `rserver.bin`.
+
+Runtime result:
+
+```text
+ordinal_164: parsed_usse base=0x10001038 bytes=105020 code=0x200..0x10c24 words=17033 strings=80 version=RenderServerVersion:RELEASE:2704 first=[+0x0200=0x0c602f78, +0x0204=0x2f790001, +0x0208=0x00025a3f, +0x020c=0x2eb96fc1, +0x0210=0x10c11c39, +0x0214=0x2f630075]
+```
+
+What it does now:
+- Locates apparent USSE/code region at offset `0x200`
+- Stops code region at `RenderServerVersion:RELEASE:2704` string offset (`0x10c24`)
+- Caches 17,033 32-bit words for future opcode semantics
+- Extracts embedded printable strings
+- Provides `UsseVm` placeholder state and ordinal-19 execution hook
+
+Current limitation:
+- This is a parser/VM scaffold, not full PowerVR MBX USSE semantics yet. It creates the concrete execution object needed for incremental opcode implementation.
+
 ### Experiment 14: Rserver Data Structure Analysis
 **Method:** Full memory dump of rserver data region (0x10012038) at frame 10
 
