@@ -639,6 +639,16 @@ impl Eapp {
             usse_program: None,
             usse_vm: UsseVm::default(),
         };
+        if eapp.metadata.title == "1B200"
+            && std::env::var_os("CLICKY_EAPP_LOST_PATCH_RENDER_CALL").is_some()
+        {
+            // Experimental Lost patch: main loop BL at 0x1803B924 normally
+            // targets 0x18007260 (a trivial branch to OpenGLES:13). The full
+            // render submission helper begins at 0x18007264 and calls
+            // OpenGLES:19. Change EBFF2E4D -> EBFF2E4E to target +4.
+            let _ = eapp.write_guest_u32(0x1803_b924, 0xEBFF_2E4E);
+            info!(target: "EAPP_GL", "lost_patch_render_call: patched 0x1803b924 BL target 0x18007260 -> 0x18007264");
+        }
         eapp.bus.watch = Self::parse_watch_env();
         Ok(eapp)
     }

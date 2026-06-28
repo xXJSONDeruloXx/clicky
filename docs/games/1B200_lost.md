@@ -278,6 +278,28 @@ What it does now:
 Current limitation:
 - This is a parser/VM scaffold, not full PowerVR MBX USSE semantics yet. It creates the concrete execution object needed for incremental opcode implementation.
 
+### Experiment 17: Main Loop Render-Call Patch
+**Implementation:** Added env-gated `CLICKY_EAPP_LOST_PATCH_RENDER_CALL=1`.
+
+Patch:
+- At load time, replace instruction at `0x1803B924`
+- Original: `0xEBFF2E4D` (`BL 0x18007260`, trivial wrapper to OpenGLES:13)
+- Patched: `0xEBFF2E4E` (`BL 0x18007264`, full render submission helper that calls OpenGLES:19)
+
+Result:
+
+```text
+lost_patch_render_call: patched 0x1803b924 BL target 0x18007260 -> 0x18007264
+OpenGLES:19 pc=0x1f000260 lr=0x180072f8 r0=0x00000000 r1=0x00000000 r2=0x00000000 r3=0x3f800000
+ordinal_19: render_dispatch ... usse_pc=64 executed=64 ...
+```
+
+Conclusion:
+- This confirms the hidden render submission path can be reached from the main loop.
+- The game now repeatedly calls OpenGLES:19 under the patch.
+- Still 0 rasterized draws because ordinal 19 currently only advances the placeholder USSE VM.
+- Next target: implement ordinal 19 as the render-server draw/dispatch operation, using the CAFEBABE descriptor blocks and the parsed USSE program state.
+
 ### Experiment 16: Runtime Rserver Block Scanner
 **Implementation:** Added `UsseProgram::scan_runtime_blocks()` and wired it into `miscTBD:6 cmd=2`, where Lost passes the initialized rserver data pointer (`0x10012038`).
 
