@@ -241,6 +241,24 @@ Key discoveries:
 
 **Conclusion:** The root cause is architectural — the game separates "display management" (main loop) from "scene rendering" (render function). The scene system needs the rserver to create render contexts. Without a working rserver, no scenes are active, so the render function is never called, so ordinal 19 is never called, so no draws happen.
 
+### Experiment 14: Rserver Data Structure Analysis
+**Method:** Full memory dump of rserver data region (0x10012038) at frame 10
+
+Key findings in the 59 non-zero words:
+- `+0x0048=0x00066000` — buffer/memory size
+- `+0x0070=0x1001F520` — pointer into rserver ROM area
+- `+0x0164=0x10080F88` — pointer into work RAM (allocated buffer)
+- `+0x02D8=0x656e5553` = "USne" (locale string for US English)
+- **`+0x0734=0xCAFEBABE`** — Java-style magic structure marker
+- `+0x0738=0x5C` — structure length = 92 bytes
+- `+0x0750=0x00130010` — PowerVR shader format descriptor
+- `+0x076C=0x00010018` — shader program metadata
+- **Three CAFEBABE-tagged blocks** contain shader/render state descriptors
+- Next-level pointers: `0x100127E4`, `0x10012824`, `0x10012864` (all within rserver ROM)
+- `+0x0708=0x1001F4B4` — pointer to GL context state
+
+**Conclusion:** The rserver data region IS partially initialized by the game (59 words). The CAFEBABE markers indicate structured shader/render state objects. But the critical dispatch table (function pointers for rendering) is missing — it would be populated by the iPod's GL driver during shader compilation (ordinal 164).
+
 ### Experiment 15: USSE Parser Scaffold
 **Implementation:** Added `clicky-core/src/sys/eapp/usse.rs` and wired OpenGLES:164 to parse/cache the loaded `rserver.bin`.
 
@@ -260,23 +278,26 @@ What it does now:
 Current limitation:
 - This is a parser/VM scaffold, not full PowerVR MBX USSE semantics yet. It creates the concrete execution object needed for incremental opcode implementation.
 
-### Experiment 14: Rserver Data Structure Analysis
-**Method:** Full memory dump of rserver data region (0x10012038) at frame 10
+### Experiment 16: Runtime Rserver Block Scanner
+**Implementation:** Added `UsseProgram::scan_runtime_blocks()` and wired it into `miscTBD:6 cmd=2`, where Lost passes the initialized rserver data pointer (`0x10012038`).
 
-Key findings in the 59 non-zero words:
-- `+0x0048=0x00066000` — buffer/memory size
-- `+0x0070=0x1001F520` — pointer into rserver ROM area
-- `+0x0164=0x10080F88` — pointer into work RAM (allocated buffer)
-- `+0x02D8=0x656e5553` = "USne" (locale string for US English)
-- **`+0x0734=0xCAFEBABE`** — Java-style magic structure marker
-- `+0x0738=0x5C` — structure length = 92 bytes
-- `+0x0750=0x00130010` — PowerVR shader format descriptor
-- `+0x076C=0x00010018` — shader program metadata
-- **Three CAFEBABE-tagged blocks** contain shader/render state descriptors
-- Next-level pointers: `0x100127E4`, `0x10012824`, `0x10012864` (all within rserver ROM)
-- `+0x0708=0x1001F4B4` — pointer to GL context state
+Observed runtime blocks:
 
-**Conclusion:** The rserver data region IS partially initialized by the game (59 words). The CAFEBABE markers indicate structured shader/render state objects. But the critical dispatch table (function pointers for rendering) is missing — it would be populated by the iPod's GL driver during shader compilation (ordinal 164).
+```text
+rserver_blocks:
+  addr=0x1001276c off=0x0734 len_words=92 preview=[0xcafebabe,0x0000005c,0x00000000,0x00000000,0x00000140,0x000000f0,0x08080008,0x00130010]
+  addr=0x100127c8 off=0x0790 len_words=20 preview=[0xcafebabe,0x00000014,0x100127e4,0x10012824,0x10012864,0xcafebabe,0x00000040,0x00000000]
+  addr=0x100127dc off=0x07a4 len_words=64 preview=[0xcafebabe,0x00000040,0x00000000,0x00000000,...]
+  addr=0x1001281c off=0x07e4 len_words=64 preview=[0xcafebabe,0x00000040,0x00000000,0x00000000,...]
+  addr=0x1001285c off=0x0824 len_words=64 preview=[0xcafebabe,0x00000040,0x00000000,0x00000000,...]
+  addr=0x1001289c off=0x0864 len_words=51208 preview=[0xcafebabe,0x0000c808,0x00000000,0x00000000,...]
+```
+
+Important interpretation:
+- Block 0 contains screen dimensions `0x140` × `0x0f0` (320×240)
+- Block 0 also contains descriptor words `0x08080008` and `0x00130010`
+- Block 1 appears to be a pointer table to three subsequent blocks
+- The very large final block (`0xC808`) is likely a command/data buffer, not a word count in the same sense as the smaller descriptor blocks
 
 ---
 

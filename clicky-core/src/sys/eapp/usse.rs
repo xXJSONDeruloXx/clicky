@@ -29,6 +29,14 @@ pub struct UsseString {
 }
 
 #[derive(Clone, Debug)]
+pub struct RserverBlock {
+    pub addr: u32,
+    pub offset: usize,
+    pub len_words: u32,
+    pub words: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct UsseProgram {
     pub base_addr: u32,
     pub byte_len: usize,
@@ -46,6 +54,22 @@ pub struct UsseVm {
     pub predicate: bool,
     pub halted: bool,
     pub executed_words: usize,
+}
+
+impl RserverBlock {
+    pub fn summary(&self) -> String {
+        let preview = self
+            .words
+            .iter()
+            .take(8)
+            .map(|w| format!("{:#010x}", w))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "addr={:#010x} off=0x{:04x} len_words={} preview=[{}]",
+            self.addr, self.offset, self.len_words, preview
+        )
+    }
 }
 
 impl UsseProgram {
@@ -117,6 +141,47 @@ impl UsseProgram {
         )
     }
 
+    pub fn scan_runtime_blocks(base_addr: u32, bytes: &[u8]) -> Vec<RserverBlock> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= bytes.len() {
+            let word = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+            if word == 0xCAFEBABE {
+                let len_words = u32::from_le_bytes([
+                    bytes[off + 4],
+                    bytes[off + 5],
+                    bytes[off + 6],
+                    bytes[off + 7],
+                ]);
+                // Treat absurd lengths as a marker-only block and cap previews.
+                let max_words = len_words.min(0x100) as usize;
+                let mut words = Vec::new();
+                for i in 0..max_words {
+                    let woff = off + i * 4;
+                    if woff + 4 > bytes.len() {
+                        break;
+                    }
+                    words.push(u32::from_le_bytes([
+                        bytes[woff],
+                        bytes[woff + 1],
+                        bytes[woff + 2],
+                        bytes[woff + 3],
+                    ]));
+                }
+                out.push(RserverBlock {
+                    addr: base_addr.wrapping_add(off as u32),
+                    offset: off,
+                    len_words,
+                    words,
+                });
+                off += 8;
+            } else {
+                off += 4;
+            }
+        }
+        out
+    }
+
     /// Execute up to `budget` placeholder words. This currently advances the
     /// VM deterministically and records instruction count. Opcode semantics will
     /// be filled in as USSE encodings are identified.
@@ -176,5 +241,18 @@ mod tests {
         assert_eq!(p.code_start, 0x200);
         assert!(p.words.iter().any(|w| w.raw == 0x1234_5678));
         assert_eq!(p.render_server_version.as_deref(), Some("RenderServerVersion:RELEASE:2704"));
+    }
+
+    #[test]
+    fn scans_cafebabe_blocks() {
+        let mut bytes = vec![0u8; 0x40];
+        bytes[0x10..0x14].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        bytes[0x14..0x18].copy_from_slice(&4u32.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&0x12345678u32.to_le_bytes());
+        let blocks = UsseProgram::scan_runtime_blocks(0x1001_2038, &bytes);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].addr, 0x1001_2048);
+        assert_eq!(blocks[0].len_words, 4);
+        assert_eq!(blocks[0].words[2], 0x12345678);
     }
 }

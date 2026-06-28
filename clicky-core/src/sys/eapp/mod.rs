@@ -4780,6 +4780,19 @@ impl Eapp {
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(0);
                 info!(target: "EAPP_IMPORT", "miscTBD:6 cmd={:#x} data_ptr={:#010x} r2={:#010x} r3={:#010x} ret={:#x}", args[0], args[1], args[2], args[3], ret);
+                if args[0] == 2 && args[1] != 0 {
+                    if let Some(bytes) = self.read_guest_bytes(args[1], 0x1000) {
+                        let blocks = UsseProgram::scan_runtime_blocks(args[1], &bytes);
+                        if !blocks.is_empty() {
+                            let summary = blocks
+                                .iter()
+                                .map(|b| b.summary())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            info!(target: "EAPP_GL", "rserver_blocks: {}", summary);
+                        }
+                    }
+                }
                 ret
             }
             12 => self.handle_misc12_local_time(args),
